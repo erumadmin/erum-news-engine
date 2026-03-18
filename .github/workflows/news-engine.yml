@@ -2,7 +2,7 @@ name: News Engine
 
 on:
   schedule:
-    - cron: '0 0,2,4,6,8,10,12 * * *'  # KST 9~21시, 2시간 간격 (UTC 기준)
+    - cron: '0 0-12 * * *'  # KST 9~21시, 1시간 간격 (UTC 기준)
   workflow_dispatch: # 수동 실행 지원
 
 jobs:
