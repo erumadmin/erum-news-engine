@@ -269,8 +269,7 @@ def validate_content_quality(title, body):
     # 포맷 오염
     if "**" in body or "##" in body:
         return False, "마크다운(**, ##) 잔재 발견"
-    if re.search(r'<[a-zA-Z]', body):
-        return False, "HTML 태그 잔재 발견"
+    # HTML 태그 검사 제거: clean_body_html()이 의도적으로 <p>/<strong>/<h3> 등을 생성하므로 오탐
 
     # 미완성 기사
     if "..." in body or "…" in body:
