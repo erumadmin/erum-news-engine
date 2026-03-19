@@ -275,8 +275,9 @@ def validate_content_quality(title, body):
     if "..." in body or "…" in body:
         return False, "말줄임표(미완성 의심) 발견"
     stripped = body.rstrip()
-    if stripped and stripped[-1] not in ("다", ".", "!", "?", '"', "'", "〉", "》"):
-        return False, f"본문 마지막 문자 비정상({stripped[-1]!r})"
+    plain_for_check = re.sub(r'<[^>]+>', '', stripped).strip()
+    if plain_for_check and plain_for_check[-1] not in ("다", ".", "!", "?", '"', "'", "〉", "》"):
+        return False, f"본문 마지막 문자 비정상({plain_for_check[-1]!r})"
 
     # 사고 과정 노출
     for pat in ["Step 1", "Step 2", "Phase 1", "분석:", "생각:", "검토:", "THINK"]:
