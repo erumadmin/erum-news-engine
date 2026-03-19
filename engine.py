@@ -658,10 +658,9 @@ def extract_image_with_caption(url: str) -> Tuple[Optional[str], Optional[str]]:
 def find_best_image(article):
     rss_img = article.get("image", "").strip()
     rss_body = article.get("body", "")
-    # 1순위: RSS media_content 이미지 — 명시적 저작권 문구 없을 때만 사용
+    # 1순위: RSS media_content 이미지 — URL 패턴 체크만 (이미지 alt/캡션 저작권 체크는 2·3순위에서 처리)
     if rss_img and not any(b in rss_img for b in BLOCKED_IMAGE_PATTERNS):
-        if "무단전재" not in rss_body and "재배포" not in rss_body:
-            return fix_newswire_url(rss_img), None
+        return fix_newswire_url(rss_img), None
     # 2순위: RSS summary/body HTML에 포함된 <img> 태그 (캡션 copyright 체크 포함)
     if rss_body and "<img" in rss_body.lower():
         hi, hc = extract_image_from_html(rss_body, article.get("url", ""))
