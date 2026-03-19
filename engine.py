@@ -65,7 +65,7 @@ WP_CFG = {
 
 # [모델 설정]
 GEMINI_MODEL = "gemini-2.5-pro"
-GEMINI_MODEL_QA = "gemini-3.0-flash"
+GEMINI_MODEL_QA = "gemini-3.1-flash-lite-preview"
 
 DAILY_PUBLISH_LIMIT = 50
 MIN_MEDIA_LIMIT = 1000
