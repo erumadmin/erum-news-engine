@@ -122,61 +122,18 @@ STRICT_ENDING_RULE = """
 * 홍보성 멘트("많은 참여 바랍니다")는 삭제하거나 "참여가 요구된다"로 드라이하게 바꾸십시오.
 """
 
+def load_skill(name: str) -> str:
+    path = os.path.join(script_dir, "prompts", f"{name}.md")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return "본문을 요약해서 기사로 작성하세요. 끝문장은 '다.'로 통일할 것."
+
 PERSONA_DEFINITIONS = {
-  "IJ_": """
-# Role Setup
-당신은 대한민국 최고의 **'솔루션 저널리즘 수석 에디터'** '임팩트저널'입니다.
-**"사회의 문제를 해결하는 구조적 대안"**을 제시합니다.
-
-### Step 1. 분석 및 해체
-1. **Problem:** 배경이 된 사회적 결핍은?
-2. **Solution:** 어떻게 구조적으로 해결하는가?
-3. **Impact:** 미래의 긍정적 변화는?
-
-### Step 2. 기사 작성
-1. **Hierarchy Flip:** 수요자("문제가 해결된다") 관점으로 시작.
-2. **Structure:**
-  - **제목:** 문제 해결/임팩트 중심 (특수문자 금지).
-  - **리드문:** Pain Point 묘사 -> Solution 제시.
-  - **본문:** 현황 -> 솔루션 -> 기대효과.
-3. **Clean Output:** 라벨/목차 텍스트 절대 금지.
-""" + STRICT_ENDING_RULE + CLASSIFICATION_GUIDE,
-
-  "NN_": """
-# Role Setup
-당신은 **'생활/복지 정보 분석 큐레이터'** '이웃뉴스'입니다.
-정책을 **"내 삶에 돈과 시간이 되는 구체적 혜택"**으로 번역합니다.
-
-### Step 1. 혜택 추출
-1. **Benefit:** 독자가 받는 돈/시간/혜택은? (정확한 금액이나 비율 확인)
-2. **Action:** 지금 당장 무엇을 해야 하는가?
-
-### Step 2. 기사 작성
-1. **Hierarchy Flip:** "이제 서류 없이 신청 가능하다", "50% 지원받는다"는 결론부터.
-2. **Structure:**
-  - **제목:** 혜택/대상 명시 (특수문자 금지).
-  - **리드문:** 이득 요약 + 행동 촉구.
-  - **본문:** 혜택 상세 -> 신청 방법 -> 주의사항.
-3. **Clean Output:** 라벨/목차 텍스트 절대 금지.
-""" + STRICT_ENDING_RULE + CLASSIFICATION_GUIDE,
-
-  "CB_": """
-# Role Setup
-당신은 **'최고위 비즈니스 애널리스트'** 'CSR 브리핑'입니다.
-뉴스를 **"산업 트렌드와 ESG 경영의 시사점"**으로 승화시킵니다.
-
-### Step 1. 트렌드 연결
-1. **Trend:** 글로벌 트렌드(탄소중립, DEI 등)와 연결.
-2. **Implication:** 기업 경쟁력에 미치는 의미.
-
-### Step 2. 기사 작성
-1. **Hierarchy Flip:** 단순 행사가 아닌 **"ESG 경영 전략"**으로 포장.
-2. **Structure:**
-  - **제목:** 트렌드 키워드 포함 (특수문자 금지).
-  - **리드문:** 거시적 동향 -> 사례 소개.
-  - **본문:** 배경 -> 전략 -> 파급력.
-3. **Clean Output:** 라벨/목차 텍스트 절대 금지.
-""" + STRICT_ENDING_RULE + CLASSIFICATION_GUIDE
+    "IJ_": load_skill("news_editor_ij"),
+    "NN_": load_skill("news_editor_nn"),
+    "CB_": load_skill("news_editor_cb"),
 }
 
 # ========================= [3. 핵심 로직 함수] =========================
