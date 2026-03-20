@@ -55,7 +55,7 @@ GMAIL_CONFIG = {
 # 사이트 설정
 _wp_app_pw = os.environ["WP_APP_PASSWORD"]
 WP_CFG = {
-    "IJ_": {"base": "https://api.impactjournal.kr",  "user": "rkwkgkgk", "app_pw": _wp_app_pw, "name": "임팩트저널", "prefix": "IJ_"},
+    "IJ_": {"base": "https://api.impactjournal.kr",  "user": "erumadmin", "app_pw": os.environ["WP_IJ_APP_PW"], "name": "임팩트저널", "prefix": "IJ_"},
     "NN_": {"base": "https://neighbornews.kr",   "user": "rkwkgkgk", "app_pw": _wp_app_pw, "name": "이웃뉴스",   "prefix": "NN_"},
     "CB_": {"base": "https://csrbriefing.kr",    "user": "rkwkgkgk", "app_pw": _wp_app_pw, "name": "CSR브리핑",  "prefix": "CB_"},
 }
