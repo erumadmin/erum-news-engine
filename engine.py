@@ -69,6 +69,7 @@ GEMINI_MODEL = "gemini-2.5-pro"
 GEMINI_MODEL_QA = "gemini-3.1-flash-lite-preview"
 
 DAILY_PUBLISH_LIMIT = 50
+RETRY_DAYS = int(os.environ.get('RETRY_DAYS', '0'))  # 0=당일만, N=N일 전까지 재시도
 MIN_MEDIA_LIMIT = 1000
 MEDIA_PREFIXES = ["IJ_", "NN_", "CB_"]
 
@@ -741,7 +742,14 @@ def collect_articles(ex_ids: set, ex_titles: set, limit: int) -> list:
                 if not is_mainly_korean(e.title, threshold=0.5): continue
                 if is_semantic_duplicate(e.title, ex_titles, threshold=0.9): continue
                 dt = e.get('published_parsed') or e.get('updated_parsed')
-                if not dt or datetime.fromtimestamp(calendar.timegm(dt)).date() != today: continue
+                if not dt: continue
+                article_date = datetime.fromtimestamp(calendar.timegm(dt)).date()
+                if RETRY_DAYS > 0:
+                    from datetime import timedelta
+                    if article_date < today - timedelta(days=RETRY_DAYS) or article_date > today:
+                        continue
+                else:
+                    if article_date != today: continue
                 if is_newswire and not re.search('[가-힣]', e.title): continue
 
                 img_link = ""
@@ -848,12 +856,19 @@ def process_article(article: dict, upload_counts: dict) -> bool:
     # 이미지 미리 다운로드 (원본 서버 접속 문제 방지)
     print(f"   📥 이미지 다운로드 중...", end="", flush=True)
     try:
-        img_resp = fetch_with_retry(best_img, timeout=20)
+        is_korea_kr = 'korea.kr/newsWeb/resources/attaches' in best_img
+        if is_korea_kr:
+            # korea.kr: GitHub Actions IP 차단 우회 — Referer 헤더 추가
+            kr_headers = dict(REQUEST_HEADERS)
+            kr_headers['Referer'] = 'https://www.korea.kr/'
+            img_resp = requests.get(best_img, headers=kr_headers, timeout=20)
+        else:
+            img_resp = fetch_with_retry(best_img, timeout=20)
         if not img_resp or img_resp.status_code != 200:
             print(" 실패. Skip.")
             return False
         img_bytes = img_resp.content
-        if len(img_bytes) < MIN_IMAGE_BYTES:
+        if not is_korea_kr and len(img_bytes) < MIN_IMAGE_BYTES:
             print(f" 건너뜀 (크기 {len(img_bytes)//1024}KB < {MIN_IMAGE_BYTES//1024}KB). Skip.")
             return False
         img_content_type = img_resp.headers.get("content-type", "image/jpeg")
