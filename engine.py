@@ -630,6 +630,12 @@ def extract_image_with_caption(url: str) -> Tuple[Optional[str], Optional[str]]:
                     cap_text = img.get('alt') or (cap_tag.get_text(strip=True) if cap_tag else "")
                     candidates.append((img, cap_text))
 
+        if 'korea.kr' in url:
+            for img in soup.select('img'):
+                src = img.get('src', '')
+                if 'newsWeb/resources/attaches' in src:
+                    candidates.append((img, img.get('alt', '')))
+
         article = soup.select_one('.view_cont') or soup.select_one('.article-content') or soup.select_one('#articleBody') or soup.select_one('article')
         if article:
             for img in article.select('img'):
@@ -660,19 +666,30 @@ def find_best_image(article):
     rss_img = article.get("image", "").strip()
     rss_body = article.get("body", "")
     # 1순위: RSS media_content 이미지 — URL 패턴 체크만 (이미지 alt/캡션 저작권 체크는 2·3순위에서 처리)
-    if rss_img and not any(b in rss_img for b in BLOCKED_IMAGE_PATTERNS):
-        return fix_newswire_url(rss_img), None
+    if rss_img:
+        if not any(b in rss_img for b in BLOCKED_IMAGE_PATTERNS):
+            return fix_newswire_url(rss_img), None
+        else:
+            print(f" [1순위 블록:{rss_img[:50]}]", end="")
+    else:
+        print(f" [1순위:RSS이미지없음]", end="")
     # 2순위: RSS summary/body HTML에 포함된 <img> 태그 (캡션 copyright 체크 포함)
     if rss_body and "<img" in rss_body.lower():
         hi, hc = extract_image_from_html(rss_body, article.get("url", ""))
         if hi and not any(b in hi for b in BLOCKED_IMAGE_PATTERNS):
             return hi, hc
+        else:
+            print(f" [2순위 실패]", end="")
+    else:
+        print(f" [2순위:body img없음]", end="")
     # 3순위: 기사 페이지 직접 접속하여 이미지 추출
     link = article.get("url", "").strip()
     if link:
         li, lc = extract_image_with_caption(link)
         if li and not any(b in li for b in BLOCKED_IMAGE_PATTERNS):
             return li, lc
+        else:
+            print(f" [3순위 실패:{str(li)[:50]}]", end="")
     return None, None
 
 # ========================= [8. 메인 파이프라인] =========================
