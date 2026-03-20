@@ -1,0 +1,53 @@
+name: Category Reclassify (NN/CB)
+
+on:
+  workflow_dispatch:
+    inputs:
+      site:
+        description: '대상 사이트'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - NN
+          - CB
+          - all
+      stage:
+        description: '실행 단계'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - stage1
+          - stage2
+          - all
+      dry_run:
+        description: 'Dry run'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  reclassify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests google-generativeai
+      - name: Run
+        run: |
+          ARGS="--site ${{ inputs.site }} --stage ${{ inputs.stage }}"
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          python category_reclassify_rest.py $ARGS
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
+          WP_NN_APP_PW: ${{ secrets.WP_NN_APP_PW }}
+          WP_CB_APP_PW: ${{ secrets.WP_CB_APP_PW }}
