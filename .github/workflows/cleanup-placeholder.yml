@@ -1,0 +1,21 @@
+name: Cleanup Placeholder Posts
+
+on:
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install requests
+      - name: Run cleanup script
+        run: python cleanup_placeholder_posts.py
+        env:
+          WP_IJ_APP_PW: ${{ secrets.WP_IJ_APP_PW }}
+          WP_NN_APP_PW: ${{ secrets.WP_NN_APP_PW }}
+          WP_CB_APP_PW: ${{ secrets.WP_CB_APP_PW }}
