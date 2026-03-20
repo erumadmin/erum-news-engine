@@ -243,8 +243,7 @@ def parse_response(text):
     if title_m:
         title = title_m.group(1).strip()
     else:
-        title = text.split('
-')[0].strip()
+        title = text.split('\n')[0].strip()
     title = re.sub(r"[#\*\[\]]", "", title).strip().strip('"')
     
     # 3. 카테고리/태그 추출
