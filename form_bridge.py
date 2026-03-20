@@ -44,7 +44,7 @@ SHEET_ID = "1XpVRROsX2jBzJ4j-PbA1kgO18iYXng9tuRAOvUihPU4"
 
 # Google Gemini 설정
 GOOGLE_API_KEY = os.environ["GOOGLE_API_KEY"]
-GEMINI_MODEL = "gemini-3-flash"
+GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
 
 # Gmail 발송 설정
 GMAIL_CONFIG = {
@@ -243,7 +243,8 @@ def parse_response(text):
     if title_m:
         title = title_m.group(1).strip()
     else:
-        title = text.split('\n')[0].strip()
+        title = text.split('
+')[0].strip()
     title = re.sub(r"[#\*\[\]]", "", title).strip().strip('"')
     
     # 3. 카테고리/태그 추출
@@ -254,7 +255,8 @@ def parse_response(text):
     tags = [t.strip() for t in tag_m.group(1).split(',')] if tag_m else []
 
     # 4. 본문 추출
-    body_m = re.search(r"(?:본문|Body|내용)[:\s]\s*(.*?)(?:\n(?:카테고리|태그|Category|Tags):|$)", text, re.DOTALL | re.IGNORECASE)
+    body_m = re.search(r"(?:본문|Body|내용)[:\s]\s*(.*?)(?:
+(?:카테고리|태그|Category|Tags):|$)", text, re.DOTALL | re.IGNORECASE)
     
     if body_m:
         body = body_m.group(1).strip()
@@ -289,7 +291,8 @@ def create_final_body(text, img_html=""):
     text = re.sub(r'^##\s+(.*?)$', r'<p><strong>\1</strong></p>', text, flags=re.MULTILINE)
     text = re.sub(r'(카테고리|태그|Category|Tags)[:\s].*', '', text, flags=re.IGNORECASE)
     
-    pars = [f"<p>{p.strip()}</p>" for p in text.split('\n') if p.strip()]
+    pars = [f"<p>{p.strip()}</p>" for p in text.split('
+') if p.strip()]
     return f"{img_html}{''.join(pars)}"
 
 class WPSite:
@@ -368,11 +371,14 @@ class WPSite:
     def post_article(self, title, body, img_url, cat_str, caption, company, do_rewrite):
         try:
             final_title = title
-            final_body_html = body.replace("\n", "<br>") # 기본값 (재작성 안 할 경우)
+            final_body_html = body.replace("
+", "<br>") # 기본값 (재작성 안 할 경우)
             
             if do_rewrite:
                 print(f"   🔹 [{self.name}] 🤖 Gemini 재작성 시작...", end="", flush=True)
-                full_text = f"제목: {title}\n\n{body}"
+                full_text = f"제목: {title}
+
+{body}"
                 try:
                     res_text = ask_gemini(PERSONA_DEFINITIONS[self.prefix], full_text)
                     parsed = parse_response(res_text)
@@ -418,7 +424,8 @@ class WPSite:
 
 def run_bridge():
     now_str = datetime.now().strftime('%H:%M:%S')
-    print(f"\n⏳ [{now_str}] 구글 시트 탭 검색 중...", end="", flush=True)
+    print(f"
+⏳ [{now_str}] 구글 시트 탭 검색 중...", end="", flush=True)
     
     try:
         gc = gspread.service_account(filename=SA_JSON_PATH)
@@ -439,7 +446,9 @@ def run_bridge():
             except: continue
 
         if not target_ws:
-            print(f"\n\n❌ [파일 오류] '{COL_STATUS}' 컬럼이 있는 탭을 찾을 수 없습니다.")
+            print(f"
+
+❌ [파일 오류] '{COL_STATUS}' 컬럼이 있는 탭을 찾을 수 없습니다.")
             return
 
         all_rows = target_ws.get_all_records()
@@ -459,7 +468,8 @@ def run_bridge():
             current_status = str(get_val(COL_STATUS)).strip()
             if current_status: continue
             
-            print(f"\n▶ [신규 요청 발견] Row {row_num}")
+            print(f"
+▶ [신규 요청 발견] Row {row_num}")
             
             title = get_val(COL_TITLE)
             body = get_val(COL_BODY)
@@ -502,7 +512,9 @@ def run_bridge():
         if processed_count == 0: pass 
 
     except Exception as e:
-        print("\n\n❌ [상세 에러 내용]")
+        print("
+
+❌ [상세 에러 내용]")
         traceback.print_exc()
 
 if __name__ == "__main__":
