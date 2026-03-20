@@ -113,7 +113,7 @@ BLOCKED_IMAGE_PATTERNS = [
 ]
 
 # 이미지 최소 파일 크기 (bytes) — 이 이하는 로고/아이콘으로 간주하여 스킵
-MIN_IMAGE_BYTES = 50_000
+MIN_IMAGE_BYTES = 20_000
 
 CONTACT_ALT_RE = re.compile(r'\d{2,3}-\d{3,4}-\d{4}|담당\s*부서|책임자.*과\s*장|사무관.*주무관')
 
@@ -596,24 +596,30 @@ def extract_image_from_html(html: str, base_url: str = "") -> Tuple[Optional[str
                 if CONTACT_ALT_RE.search(alt): continue
                 if "무단전재" in alt or "재배포" in alt: src = ""
             if not src: continue
-            # 이미지 주변 캡션(figcaption, 다음 형제 태그)에서 copyright 체크
+            # figcaption 탐색: img → 부모 최대 3단계까지 올라가며 figure 내 figcaption 탐색
             caption_text = ""
-            parent = img.parent
-            if parent:
-                fig = parent.find('figcaption')
-                if fig:
-                    caption_text = fig.get_text(strip=True)
-                else:
-                    for sib in img.next_siblings:
-                        if hasattr(sib, 'get_text'):
-                            caption_text = sib.get_text(strip=True)[:200]
-                        elif isinstance(sib, str) and sib.strip():
-                            caption_text = sib.strip()[:200]
-                        if caption_text: break
+            node = img.parent
+            fig = None
+            for _ in range(3):
+                if not node: break
+                fig = node.find('figcaption')
+                if fig: break
+                node = node.parent
+            if fig:
+                caption_text = fig.get_text(strip=True)
+            else:
+                for sib in img.next_siblings:
+                    if hasattr(sib, 'get_text'):
+                        caption_text = sib.get_text(strip=True)[:200]
+                    elif isinstance(sib, str) and sib.strip():
+                        caption_text = sib.strip()[:200]
+                    if caption_text: break
             if "무단전재" in caption_text or "재배포" in caption_text:
                 continue
             full_url = urljoin(base_url, src) if base_url else src
-            return fix_newswire_url(full_url), alt or caption_text or None
+            # figcaption 우선, 없으면 alt
+            final_cap = caption_text or alt or None
+            return fix_newswire_url(full_url), final_cap
     except:
         pass
     return None, None
@@ -637,7 +643,17 @@ def extract_image_with_caption(url: str) -> Tuple[Optional[str], Optional[str]]:
             for img in soup.select('img'):
                 src = img.get('src', '')
                 if 'newsWeb/resources/attaches' in src:
-                    candidates.append((img, img.get('alt', '')))
+                    # figcaption 탐색: img → 최대 3단계 위까지
+                    fig_cap = ""
+                    node = img.parent
+                    for _ in range(3):
+                        if not node: break
+                        fig = node.find('figcaption')
+                        if fig:
+                            fig_cap = fig.get_text(strip=True)
+                            break
+                        node = node.parent
+                    candidates.append((img, fig_cap or img.get('alt', '')))
 
         article = soup.select_one('.view_cont') or soup.select_one('.article-content') or soup.select_one('#articleBody') or soup.select_one('article')
         if article:
