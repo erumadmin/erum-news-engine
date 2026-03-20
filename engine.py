@@ -650,12 +650,10 @@ def extract_image_with_caption(url: str) -> Tuple[Optional[str], Optional[str]]:
             is_risky = False
             if cap:
                 if CONTACT_ALT_RE.search(cap): continue
-                clean_cap = re.sub(r'\(사진=[^)]*\)', '', cap)   # (사진=...) 제거 — 중첩괄호 오작동 수정
-                clean_cap = re.sub(r'\[사진=[^\]]*\]', '', clean_cap)  # [사진=...] 제거
-                clean_cap = re.sub(r'\s*\d{4}\.\d{1,2}\.\d{1,2}\s*', ' ', clean_cap)  # 날짜 제거
-                clean_cap = re.sub(r'\s{2,}', ' ', clean_cap).strip()   # 공백 정리
-                if "무단전재" in clean_cap or "재배포" in clean_cap: continue
-                if len(clean_cap) < 8:   # 너무 짧거나 의미없는 캡션 제거
+                if "무단전재" in cap or "재배포" in cap: continue
+                clean_cap = re.sub(r'\s*\d{4}\.\d{1,2}\.\d{1,2}\s*', ' ', cap)  # 날짜만 제거, 출처(사진=...) 유지
+                clean_cap = re.sub(r'\s{2,}', ' ', clean_cap).strip()
+                if len(clean_cap) < 8:
                     clean_cap = None
             else:
                 clean_cap = None
