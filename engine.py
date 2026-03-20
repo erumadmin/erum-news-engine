@@ -855,28 +855,64 @@ def process_article(article: dict, upload_counts: dict) -> bool:
 
     # 이미지 미리 다운로드 (원본 서버 접속 문제 방지)
     print(f"   📥 이미지 다운로드 중...", end="", flush=True)
-    try:
-        is_korea_kr = 'korea.kr/newsWeb/resources/attaches' in best_img
-        if is_korea_kr:
-            # korea.kr: GitHub Actions IP 차단 우회 — Referer 헤더 추가
-            kr_headers = dict(REQUEST_HEADERS)
-            kr_headers['Referer'] = 'https://www.korea.kr/'
-            img_resp = requests.get(best_img, headers=kr_headers, timeout=20)
-        else:
-            img_resp = fetch_with_retry(best_img, timeout=20)
-        if not img_resp or img_resp.status_code != 200:
-            print(" 실패. Skip.")
-            return False
-        img_bytes = img_resp.content
-        if not is_korea_kr and len(img_bytes) < MIN_IMAGE_BYTES:
-            print(f" 건너뜀 (크기 {len(img_bytes)//1024}KB < {MIN_IMAGE_BYTES//1024}KB). Skip.")
-            return False
-        img_content_type = img_resp.headers.get("content-type", "image/jpeg")
-        fn = re.sub(r'[^\w\.-]', '', best_img.split("/")[-1].split("?")[0])[-50:]
-        if not fn: fn = "image.jpg"
-        print(f" 완료 ({len(img_bytes)//1024}KB).")
-    except Exception as e:
-        print(f" 실패({str(e)[:80]}). Skip.")
+    img_bytes = None
+    img_content_type = "image/jpeg"
+    fn = "image.jpg"
+
+    # 이미지 후보 목록: best_img 먼저, 실패 시 fallback
+    img_candidates = [best_img]
+    # korea.kr 이미지인 경우 og:image를 fallback으로 추가
+    if 'korea.kr' in best_img:
+        try:
+            og_r = fetch_with_retry(article.get("link", ""), timeout=10)
+            if og_r and og_r.status_code == 200:
+                og_soup = BeautifulSoup(og_r.text, 'html.parser')
+                og_tag = og_soup.select_one('meta[property="og:image"]')
+                if og_tag and og_tag.get('content'):
+                    og_url = og_tag['content']
+                    if og_url != best_img and not any(x in og_url.lower() for x in BLOCKED_IMAGE_PATTERNS):
+                        img_candidates.append(og_url)
+                        print(f" [fallback 준비]", end="")
+        except:
+            pass
+
+    for img_url in img_candidates:
+        try:
+            is_korea_kr = 'korea.kr/newsWeb/resources/attaches' in img_url
+            if is_korea_kr:
+                kr_headers = dict(REQUEST_HEADERS)
+                kr_headers['Referer'] = 'https://www.korea.kr/'
+                img_resp = requests.get(img_url, headers=kr_headers, timeout=20)
+            else:
+                img_resp = fetch_with_retry(img_url, timeout=20)
+            if not img_resp or img_resp.status_code != 200:
+                print(f" [HTTP실패]", end="")
+                continue
+
+            # Content-Type 검증
+            ct = img_resp.headers.get("content-type", "")
+            if 'image' not in ct.lower() and 'octet-stream' not in ct.lower():
+                print(f" [비이미지 응답: {ct[:30]}]", end="")
+                continue
+
+            candidate_bytes = img_resp.content
+            # 크기 검증 (korea.kr 포함 모든 소스에 적용)
+            if len(candidate_bytes) < MIN_IMAGE_BYTES:
+                print(f" [크기미달 {len(candidate_bytes)//1024}KB]", end="")
+                continue
+
+            img_bytes = candidate_bytes
+            img_content_type = ct if 'image' in ct.lower() else "image/jpeg"
+            fn = re.sub(r'[^\w\.-]', '', img_url.split("/")[-1].split("?")[0])[-50:]
+            if not fn: fn = f"img_{hash(img_url) & 0xFFFFFF:06x}.jpg"
+            print(f" 완료 ({len(img_bytes)//1024}KB).")
+            break
+        except Exception as e:
+            print(f" [에러:{str(e)[:40]}]", end="")
+            continue
+
+    if not img_bytes:
+        print(" 모든 소스 실패. Skip.")
         return False
 
     # WP 발행
