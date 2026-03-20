@@ -564,6 +564,9 @@ def fetch_with_retry(url, max_retries=2, timeout=15, stream=False):
 
 def is_valid_image(url):
     if not url: return False
+    # korea.kr 공식 첨부 이미지는 GitHub Actions IP에서 접속 차단됨 → URL 패턴으로 신뢰
+    if 'korea.kr/newsWeb/resources/attaches' in url:
+        return True
     try:
         r = fetch_with_retry(url, timeout=10, stream=True)
         if not (r and r.status_code == 200): return False
