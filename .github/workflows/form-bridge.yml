@@ -13,18 +13,16 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: 패키지 설치
         run: pip install gspread google-generativeai requests beautifulsoup4
-
       - name: 브릿지 실행
         run: python form_bridge.py
         env:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
+          WP_IJ_APP_PW: ${{ secrets.WP_IJ_APP_PW }}
           SA_JSON_CONTENT: ${{ secrets.SA_JSON_CONTENT }}
