@@ -18,6 +18,7 @@ import json
 import os
 import difflib
 import calendar
+import html
 from datetime import datetime, date
 from typing import Dict, List, Optional, Tuple, Any
 from urllib.parse import urljoin, urlparse, parse_qs
@@ -352,6 +353,7 @@ def parse_gemini_response(text):
     title = re.sub(r"[#\*\[\]]", "", title).strip().strip('"')
     excerpt_m = re.search(r"(?:리드문|Excerpt|요약)[:\s]\s*(.*)", text, re.IGNORECASE)
     excerpt = re.sub(r"[#\*\[\]]", "", excerpt_m.group(1).strip()).strip() if excerpt_m else ""
+    excerpt = html.unescape(excerpt) if excerpt else ""
     cat_m = re.search(r"(?:카테고리|Category)[:\s]\s*(.*)", text, re.IGNORECASE)
     tag_m = re.search(r"(?:태그|Tags)[:\s]\s*(.*)", text, re.IGNORECASE)
     cat = cat_m.group(1).strip() if cat_m else ""
@@ -374,6 +376,7 @@ def parse_gemini_response(text):
         plain = re.sub(r'\s+', ' ', plain)
         sentences = re.split(r'(?<=[다요])\. *', plain)
         excerpt = '. '.join(s.strip() for s in sentences[:2] if s.strip())
+        excerpt = html.unescape(excerpt) if excerpt else ""
         if len(excerpt) > 160:
             excerpt = excerpt[:157] + '...'
     return {"title": title, "excerpt": excerpt, "body": final_body, "cat": cat, "tags": tags}
@@ -647,8 +650,13 @@ def extract_image_with_caption(url: str) -> Tuple[Optional[str], Optional[str]]:
             is_risky = False
             if cap:
                 if CONTACT_ALT_RE.search(cap): continue
-                clean_cap = re.sub(r'[\(\[]사진=.*?[\)\]]', '', cap).strip()
+                clean_cap = re.sub(r'\(사진=[^)]*\)', '', cap)   # (사진=...) 제거 — 중첩괄호 오작동 수정
+                clean_cap = re.sub(r'\[사진=[^\]]*\]', '', clean_cap)  # [사진=...] 제거
+                clean_cap = re.sub(r'\s*\d{4}\.\d{1,2}\.\d{1,2}\s*', ' ', clean_cap)  # 날짜 제거
+                clean_cap = re.sub(r'\s{2,}', ' ', clean_cap).strip()   # 공백 정리
                 if "무단전재" in clean_cap or "재배포" in clean_cap: continue
+                if len(clean_cap) < 8:   # 너무 짧거나 의미없는 캡션 제거
+                    clean_cap = None
             else:
                 clean_cap = None
             if src: return fix_newswire_url(urljoin(url, src)), clean_cap
