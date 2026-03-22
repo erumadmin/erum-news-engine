@@ -350,16 +350,14 @@ def run_stage2(wp, dry_run, log):
         time.sleep(0.5)
 
     # 카테고리별 분포 계산
-    log.info("
-=== 재분류 완료 ===")
+    log.info("\n=== 재분류 완료 ===")
     log.info(f"총 기사:  {total:,}")
     log.info(f"변경:     {changed:,}")
     log.info(f"스킵:     {skipped:,}")
     log.info(f"에러:     {errors:,}")
 
     updated_cats = wp.get_categories()
-    log.info("
-카테고리별 분포:")
+    log.info("\n카테고리별 분포:")
     for c in sorted(updated_cats, key=lambda x: x["count"], reverse=True):
         if c["name"] in STANDARD_CATEGORIES:
             pct = c["count"] / total * 100 if total > 0 else 0
@@ -385,8 +383,7 @@ def main():
         if args.stage in ("stage1", "all"): run_stage1(wp, args.dry_run, log)
         if args.stage in ("stage2", "all"): run_stage2(wp, args.dry_run, log)
 
-    print("
-모든 작업 완료.")
+    print("\n모든 작업 완료.")
 
 if __name__ == "__main__":
     main()
