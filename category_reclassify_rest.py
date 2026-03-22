@@ -65,6 +65,27 @@ def setup_logger(site_key):
         logger.addHandler(ch)
     return logger
 
+# ── Gemini REST API 직접 호출 (google-generativeai 의존성 제거) ──
+def gemini_generate(prompt, api_key):
+    """Gemini REST API 직접 호출 (google-generativeai 의존성 제거)"""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.1}
+    }
+    for attempt in range(5):
+        try:
+            r = requests.post(url, json=payload, timeout=60)
+            if r.status_code == 429 or r.status_code >= 500:
+                time.sleep(2 ** attempt * 5)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        except Exception as e:
+            time.sleep(2 ** attempt * 2)
+    return None
+
 # ── WP REST API 클라이언트 ──
 class WPClient:
     def __init__(self, base, user, app_pw, dry_run, logger):
@@ -245,9 +266,7 @@ def run_stage2(wp, dry_run, log):
     log.info("Stage 2: Gemini 재분류")
     log.info("=" * 50)
 
-    import google.generativeai as genai
-    genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
-    model = genai.GenerativeModel(GEMINI_MODEL)
+    api_key = os.environ["GOOGLE_API_KEY"]
 
     all_cats = wp.get_categories()
     std_ids = {}
@@ -291,8 +310,10 @@ def run_stage2(wp, dry_run, log):
         result_map = {}
         for attempt in range(5):
             try:
-                resp = model.generate_content(prompt)
-                raw = resp.text.strip()
+                raw = gemini_generate(prompt, api_key)
+                if raw is None:
+                    raise Exception("Gemini API 응답 없음")
+                raw = raw.strip()
                 if raw.startswith("```"):
                     raw = raw.split("```")[1]
                     if raw.startswith("json"): raw = raw[4:]
@@ -329,14 +350,16 @@ def run_stage2(wp, dry_run, log):
         time.sleep(0.5)
 
     # 카테고리별 분포 계산
-    log.info("\n=== 재분류 완료 ===")
+    log.info("
+=== 재분류 완료 ===")
     log.info(f"총 기사:  {total:,}")
     log.info(f"변경:     {changed:,}")
     log.info(f"스킵:     {skipped:,}")
     log.info(f"에러:     {errors:,}")
 
     updated_cats = wp.get_categories()
-    log.info("\n카테고리별 분포:")
+    log.info("
+카테고리별 분포:")
     for c in sorted(updated_cats, key=lambda x: x["count"], reverse=True):
         if c["name"] in STANDARD_CATEGORIES:
             pct = c["count"] / total * 100 if total > 0 else 0
@@ -362,7 +385,8 @@ def main():
         if args.stage in ("stage1", "all"): run_stage1(wp, args.dry_run, log)
         if args.stage in ("stage2", "all"): run_stage2(wp, args.dry_run, log)
 
-    print("\n모든 작업 완료.")
+    print("
+모든 작업 완료.")
 
 if __name__ == "__main__":
     main()
