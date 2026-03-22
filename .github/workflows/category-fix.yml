@@ -34,20 +34,30 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Install
-        run: pip install requests
-      - name: Run
+
+      - name: Install sshpass
+        run: sudo apt-get install -y sshpass
+
+      - name: Upload script to Vultr
+        run: |
+          sshpass -p '${{ secrets.VULTR_ROOT_PW }}' scp \
+            -o StrictHostKeyChecking=no \
+            category_reclassify_rest.py \
+            root@64.176.227.225:/root/category_reclassify_rest.py
+
+      - name: Run on Vultr
         run: |
           ARGS="--site ${{ inputs.site }} --stage ${{ inputs.stage }}"
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             ARGS="$ARGS --dry-run"
           fi
-          python category_reclassify_rest.py $ARGS
-        env:
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
-          WP_NN_APP_PW: ${{ secrets.WP_NN_APP_PW }}
-          WP_CB_APP_PW: ${{ secrets.WP_CB_APP_PW }}
+
+          sshpass -p '${{ secrets.VULTR_ROOT_PW }}' ssh \
+            -o StrictHostKeyChecking=no \
+            root@64.176.227.225 \
+            "pip3 install -q requests && \
+             WP_NN_APP_PW='${{ secrets.WP_NN_APP_PW }}' \
+             WP_CB_APP_PW='${{ secrets.WP_CB_APP_PW }}' \
+             WP_APP_PASSWORD='${{ secrets.WP_APP_PASSWORD }}' \
+             GOOGLE_API_KEY='${{ secrets.GOOGLE_API_KEY }}' \
+             python3 /root/category_reclassify_rest.py $ARGS"
