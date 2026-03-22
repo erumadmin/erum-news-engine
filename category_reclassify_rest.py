@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""NN/CB 카테고리 통합 + Gemini 재분류 (WP REST API)"""
+"""NN/CB 카테고리 통합 + Gemini 재분류 (WP REST API) — concurrent.futures로 동시 10개 PUT"""
 
 import argparse, base64, json, logging, os, sys, time
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ── 사이트 설정 (환경변수) ──
 SITES = {
@@ -52,6 +53,7 @@ KEEP_CATEGORIES = {"미분류", "건강/과학"}
 
 GEMINI_MODEL = "gemini-2.5-flash-lite"
 GEMINI_BATCH_SIZE = 20
+MAX_WORKERS = 10  # 동시 PUT 요청 수
 
 # ── 로거 ──
 def setup_logger(site_key):
@@ -65,9 +67,8 @@ def setup_logger(site_key):
         logger.addHandler(ch)
     return logger
 
-# ── Gemini REST API 직접 호출 (google-generativeai 의존성 제거) ──
+# ── Gemini REST API 직접 호출 ──
 def gemini_generate(prompt, api_key):
-    """Gemini REST API 직접 호출 (google-generativeai 의존성 제거)"""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -158,6 +159,24 @@ class WPClient:
         r = self._req("PUT", f"/wp-json/wp/v2/posts/{post_id}", json={"categories": cat_ids})
         return r is not None
 
+    def update_post_cat_bulk(self, tasks):
+        """tasks: list of (post_id, cat_ids) — ThreadPoolExecutor로 동시 PUT"""
+        if self.dry_run:
+            for post_id, cat_ids in tasks:
+                self.log.debug(f"[DRY-RUN] 기사 {post_id} → {cat_ids}")
+            return len(tasks), 0
+
+        success, fail = 0, 0
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = {ex.submit(self.update_post_cat, pid, cids): pid
+                       for pid, cids in tasks}
+            for fut in as_completed(futures):
+                if fut.result():
+                    success += 1
+                else:
+                    fail += 1
+        return success, fail
+
     def delete_category(self, cat_id):
         if self.dry_run:
             self.log.info(f"[DRY-RUN] 카테고리 {cat_id} 삭제")
@@ -204,7 +223,7 @@ def run_stage1(wp, dry_run, log):
                 std_ids[name] = r["id"]
                 log.info(f"  [생성] {name} (id={r['id']})")
 
-    # 중복 병합
+    # 중복 병합 — bulk PUT 적용
     log.info("중복 카테고리 병합 중...")
     state = Progress("stage1", wp.base.split("//")[1].split(".")[0])
     cats_to_delete = []
@@ -222,15 +241,18 @@ def run_stage1(wp, dry_run, log):
                 continue
             posts = wp.get_posts_by_cat(dup["id"])
             log.info(f"  [{dup_name}] id={dup['id']} → [{std_name}] {len(posts)}건")
+            tasks = []
             for p in posts:
                 new_cats = [c for c in p["categories"] if c != dup["id"]]
                 if std_id not in new_cats: new_cats.append(std_id)
-                wp.update_post_cat(p["id"], new_cats)
-                time.sleep(0.1)
+                tasks.append((p["id"], new_cats))
+            if tasks:
+                ok, fail = wp.update_post_cat_bulk(tasks)
+                log.info(f"    PUT 완료: {ok}건 성공, {fail}건 실패")
             state.mark_done(key)
             cats_to_delete.append(dup["id"])
 
-    # 같은 이름 다른 ID 병합 (표준 카테고리명과 동일하지만 ID가 다른 것)
+    # 같은 이름 다른 ID 병합
     for std_name, std_id in std_ids.items():
         cands = by_name.get(std_name, [])
         for c in cands:
@@ -241,11 +263,14 @@ def run_stage1(wp, dry_run, log):
                 continue
             posts = wp.get_posts_by_cat(c["id"])
             log.info(f"  [{std_name}] 중복 id={c['id']} → id={std_id} {len(posts)}건")
+            tasks = []
             for p in posts:
                 new_cats = [cc for cc in p["categories"] if cc != c["id"]]
                 if std_id not in new_cats: new_cats.append(std_id)
-                wp.update_post_cat(p["id"], new_cats)
-                time.sleep(0.1)
+                tasks.append((p["id"], new_cats))
+            if tasks:
+                ok, fail = wp.update_post_cat_bulk(tasks)
+                log.info(f"    PUT 완료: {ok}건 성공, {fail}건 실패")
             state.mark_done(key)
             cats_to_delete.append(c["id"])
 
@@ -328,28 +353,36 @@ def run_stage2(wp, dry_run, log):
             errors += len(batch)
             continue
 
+        # 배치 내 PUT 태스크 수집 후 bulk 실행
+        put_tasks = []
+        batch_skipped = 0
+        batch_errors = 0
         for i, p in enumerate(batch, 1):
             cat_name = result_map.get(str(i), "").strip()
             if cat_name not in std_ids:
-                errors += 1
+                batch_errors += 1
                 continue
             new_id = std_ids[cat_name]
             cur = p.get("categories", [])
             cur_std = [c for c in cur if c in std_ids.values()]
             if len(cur_std) == 1 and cur_std[0] == new_id:
-                skipped += 1
+                batch_skipped += 1
                 continue
-            ok = wp.update_post_cat(p["id"], [new_id])
-            if ok: changed += 1
-            else: errors += 1
-            time.sleep(0.15)
+            put_tasks.append((p["id"], [new_id]))
+
+        if put_tasks:
+            ok, fail = wp.update_post_cat_bulk(put_tasks)
+            changed += ok
+            errors += fail
+        skipped += batch_skipped
+        errors += batch_errors
 
         state.mark_done(bkey)
         done = batch_start + len(batch)
         log.info(f"진행: {done}/{total} | 변경: {changed} | 스킵: {skipped} | 에러: {errors}")
-        time.sleep(0.5)
+        time.sleep(0.3)
 
-    # 카테고리별 분포 계산
+    # 결과 요약
     log.info("\n=== 재분류 완료 ===")
     log.info(f"총 기사:  {total:,}")
     log.info(f"변경:     {changed:,}")
