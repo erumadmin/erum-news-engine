@@ -38,7 +38,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install
-        run: pip install requests google-generativeai
+        run: pip install requests
       - name: Run
         run: |
           ARGS="--site ${{ inputs.site }} --stage ${{ inputs.stage }}"
