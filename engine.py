@@ -220,6 +220,24 @@ def db_get_today_count() -> int:
     finally:
         conn.close()
 
+def db_ensure_table():
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS published_articles (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    url_id VARCHAR(512) NOT NULL,
+                    title VARCHAR(1000),
+                    media VARCHAR(50),
+                    published_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE KEY uq_url_id (url_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+
 # ========================= [4. 텍스트 처리 / QA] =========================
 
 def is_mainly_korean(text, threshold=0.5):
@@ -943,6 +961,9 @@ def process_article(article: dict, upload_counts: dict) -> bool:
 
 def run():
     print(f"\n🚀 AI 뉴스 엔진 (v24.0-GitHub_Actions) 가동: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # 테이블 자동 생성 (없을 경우)
+    db_ensure_table()
 
     # 오늘 발행 건수 확인
     today_count = db_get_today_count()
