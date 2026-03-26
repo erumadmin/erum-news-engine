@@ -69,6 +69,7 @@ GEMINI_MODEL = "gemini-2.5-pro"
 GEMINI_MODEL_QA = "gemini-3.1-flash-lite-preview"
 
 DAILY_PUBLISH_LIMIT = 50
+PER_RUN_LIMIT = 15  # 1회 실행당 최대 발행 수
 RETRY_DAYS = int(os.environ.get('RETRY_DAYS', '0'))  # 0=당일만, N=N일 전까지 재시도
 MIN_MEDIA_LIMIT = 1000
 MEDIA_PREFIXES = ["IJ_", "NN_", "CB_"]
@@ -967,7 +968,7 @@ def run():
 
     # 오늘 발행 건수 확인
     today_count = db_get_today_count()
-    remaining = DAILY_PUBLISH_LIMIT - today_count
+    remaining = min(DAILY_PUBLISH_LIMIT - today_count, PER_RUN_LIMIT)
     print(f"📊 금일 발행 현황: {today_count}/{DAILY_PUBLISH_LIMIT}건 (잔여: {remaining}건)")
 
     if remaining <= 0:
