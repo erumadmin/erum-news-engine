@@ -48,20 +48,14 @@ WP_CFG = {
         "gsc_site": "sc-domain:impactjournal.kr",
         "sitemap": "https://impactjournal.kr/sitemap-news.xml",
     },
-    "NN_": {
-        "base": "https://neighbornews.kr",
-        "user": "rkwkgkgk",
-        "app_pw": os.environ["WP_NN_APP_PW"],
-        "gsc_site": "sc-domain:neighbornews.kr",
-        "sitemap": "https://neighbornews.kr/sitemap-news.xml",
-    },
-    "CB_": {
-        "base": "https://csrbriefing.kr",
-        "user": "rkwkgkgk",
-        "app_pw": os.environ["WP_CB_APP_PW"],
-        "gsc_site": "sc-domain:csrbriefing.kr",
-        "sitemap": "https://csrbriefing.kr/sitemap-news.xml",
-    },
+}
+
+# NN/CB는 erum-one.com API로 발행 (WordPress 제거)
+ERUM_API_BASE = "https://erum-one.com"
+ERUM_API_KEY = os.environ.get("ERUM_API_KEY", "eRuM@AdminKey2026!")
+ERUM_CFG = {
+    "NN_": {"site": "NN", "gsc_site": "sc-domain:neighbornews.kr", "sitemap": "https://neighbornews.kr/sitemap-news.xml"},
+    "CB_": {"site": "CB", "gsc_site": "sc-domain:csrbriefing.kr", "sitemap": "https://csrbriefing.kr/sitemap-news.xml"},
 }
 
 # [모델 설정]
@@ -520,12 +514,54 @@ class Site:
                 break
         print(" 완료.")
 
-SITES = {k: Site(v['base'], v['user'], v['app_pw']) for k, v in WP_CFG.items()}
+class ErumSite:
+    """erum-one.com REST API를 통해 NN/CB 기사를 발행"""
+    def __init__(self, site_code: str):
+        self.site_code = site_code
+        self.api_base = ERUM_API_BASE
+        self.headers = {"x-api-key": ERUM_API_KEY, "Content-Type": "application/json"}
+
+    def get_cat_id(self, name: str) -> Optional[int]:
+        if not name: return None
+        clean = re.sub(r'[^\w\s가-힣]', '', name).strip()[:30]
+        if not clean: return None
+        try:
+            r = requests.post(f"{self.api_base}/api/categories",
+                              json={"site": self.site_code, "name": clean},
+                              headers=self.headers, timeout=10)
+            r.raise_for_status()
+            return r.json()["category"]["id"]
+        except: return None
+
+    def get_tag_ids(self, tags): return []
+
+    def create_post(self, title, body, cat_id, tag_ids, img_url=None, excerpt="", author=None):
+        payload = {
+            "site": self.site_code,
+            "title": title,
+            "content": body,
+            "excerpt": excerpt or "",
+            "status": "PUBLISHED",
+            "categoryId": cat_id,
+            "featuredImageUrl": img_url,
+            "publishedAt": datetime.now().isoformat(),
+        }
+        r = requests.post(f"{self.api_base}/api/articles",
+                          json=payload, headers=self.headers, timeout=30)
+        r.raise_for_status()
+        return r.json()["article"]["id"]
+
+    def get_total_media_count(self) -> int: return 0
+    def delete_oldest_media(self, count): pass
+
+SITES: dict = {k: Site(v['base'], v['user'], v['app_pw']) for k, v in WP_CFG.items()}
+for _prefix, _cfg in ERUM_CFG.items():
+    SITES[_prefix] = ErumSite(_cfg["site"])
 
 # ========================= [6. GSC 사이트맵 제출] =========================
 
 def submit_sitemap_to_gsc(prefix):
-    cfg = WP_CFG.get(prefix)
+    cfg = WP_CFG.get(prefix) or ERUM_CFG.get(prefix)
     if not cfg or not cfg.get("gsc_site"): return
 
     gsc_json_b64 = os.environ.get("GSC_SERVICE_ACCOUNT_JSON")
@@ -941,12 +977,16 @@ def process_article(article: dict, upload_counts: dict) -> bool:
         if not rw:
             all_success = False
             continue
-        print(f"      🚀 [{prefix}] 워드프레스 발행 중...", end="", flush=True)
+        is_erum = prefix in ERUM_CFG
+        print(f"      🚀 [{prefix}] {'erum API' if is_erum else '워드프레스'} 발행 중...", end="", flush=True)
         try:
             site = SITES[prefix]
-            mid, _ = site.upload_image_bytes(img_bytes, fn, img_content_type, rw["title"], best_cap)
-            if not mid:
-                raise Exception("Img Upload Fail")
+            if is_erum:
+                mid = best_img  # URL 직접 사용, 업로드 불필요
+            else:
+                mid, _ = site.upload_image_bytes(img_bytes, fn, img_content_type, rw["title"], best_cap)
+                if not mid:
+                    raise Exception("Img Upload Fail")
             author_id = IJ_CATEGORY_AUTHOR.get(rw["cat"]) if prefix == "IJ_" else None
             pid = site.create_post(rw["title"], rw["body"], site.get_cat_id(rw["cat"]), site.get_tag_ids(rw["tags"]), mid, excerpt=rw.get("excerpt", ""), author=author_id)
             upload_counts[prefix] += 1
