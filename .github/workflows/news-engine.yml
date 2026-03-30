@@ -29,7 +29,6 @@ jobs:
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           DB_NAME: ${{ secrets.DB_NAME }}
           WP_IJ_APP_PW: ${{ secrets.WP_IJ_APP_PW }}
-          WP_NN_APP_PW: ${{ secrets.WP_NN_APP_PW }}
-          WP_CB_APP_PW: ${{ secrets.WP_CB_APP_PW }}
+          ERUM_API_KEY: ${{ secrets.ERUM_API_KEY }}
           GSC_SERVICE_ACCOUNT_JSON: ${{ secrets.GSC_SERVICE_ACCOUNT_JSON }}
         run: python engine.py
