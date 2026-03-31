@@ -67,8 +67,8 @@ R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "https://pub-dd677a54d7cf4d8cabd
 R2_RETENTION_DAYS = 90
 
 # [모델 설정]
-GEMINI_MODEL = "gemini-2.5-pro"
-GEMINI_MODEL_QA = "gemini-3.1-flash-lite-preview"
+GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL_QA = "gemini-2.0-flash-lite"
 
 DAILY_PUBLISH_LIMIT = 50
 PER_RUN_LIMIT = 15  # 1회 실행당 최대 발행 수
