@@ -52,7 +52,7 @@ WP_CFG = {
 
 # NN/CB는 erum-one.com API로 발행 (WordPress 제거)
 ERUM_API_BASE = "https://erum-one.com"
-ERUM_API_KEY = os.environ.get("ERUM_API_KEY", "eRuM@AdminKey2026!")
+ERUM_API_KEY = os.environ["ERUM_API_KEY"]
 ERUM_CFG = {
     "NN_": {"site": "NN", "gsc_site": "sc-domain:neighbornews.kr", "sitemap": "https://neighbornews.kr/sitemap-news.xml"},
     "CB_": {"site": "CB", "gsc_site": "sc-domain:csrbriefing.kr", "sitemap": "https://csrbriefing.kr/sitemap-news.xml"},
@@ -611,7 +611,7 @@ class ErumSite:
         r = requests.post(f"{self.api_base}/api/articles",
                           json=payload, headers=self.headers, timeout=30)
         r.raise_for_status()
-        return r.json()["article"]["id"]
+        return r.json()["id"]
 
     def get_total_media_count(self) -> int: return 0
     def delete_oldest_media(self, count): pass
