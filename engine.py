@@ -40,20 +40,13 @@ DB_USER = os.environ["DB_USER"]
 DB_PASSWORD = os.environ["DB_PASSWORD"]
 DB_NAME = os.environ["DB_NAME"]
 
-WP_CFG = {
-    "IJ_": {
-        "base": "https://api.impactjournal.kr",
-        "user": "erumadmin",
-        "app_pw": os.environ["WP_IJ_APP_PW"],
-        "gsc_site": "sc-domain:impactjournal.kr",
-        "sitemap": "https://impactjournal.kr/sitemap-news.xml",
-    },
-}
+WP_CFG = {}  # WP 발행 완전 폐기 — 전 사이트 erum-one.com API 사용
 
-# NN/CB는 erum-one.com API로 발행 (WordPress 제거)
+# 전 사이트 erum-one.com API로 발행
 ERUM_API_BASE = "https://erum-one.com"
 ERUM_API_KEY = os.environ["ERUM_API_KEY"]
 ERUM_CFG = {
+    "IJ_": {"site": "IJ", "gsc_site": "sc-domain:impactjournal.kr", "sitemap": "https://impactjournal.kr/sitemap-news.xml"},
     "NN_": {"site": "NN", "gsc_site": "sc-domain:neighbornews.kr", "sitemap": "https://neighbornews.kr/sitemap-news.xml"},
     "CB_": {"site": "CB", "gsc_site": "sc-domain:csrbriefing.kr", "sitemap": "https://csrbriefing.kr/sitemap-news.xml"},
 }
@@ -1051,8 +1044,7 @@ def process_article(article: dict, upload_counts: dict) -> bool:
                 mid, _ = site.upload_image_bytes(img_bytes, fn, img_content_type, rw["title"], best_cap)
                 if not mid:
                     raise Exception("Img Upload Fail")
-            author_id = IJ_CATEGORY_AUTHOR.get(rw["cat"]) if prefix == "IJ_" else None
-            pid = site.create_post(rw["title"], rw["body"], site.get_cat_id(rw["cat"]), site.get_tag_ids(rw["tags"]), mid, excerpt=rw.get("excerpt", ""), author=author_id)
+            pid = site.create_post(rw["title"], rw["body"], site.get_cat_id(rw["cat"]), site.get_tag_ids(rw["tags"]), mid, excerpt=rw.get("excerpt", ""))
             upload_counts[prefix] += 1
             print(f" 성공 (ID:{pid}).")
             submit_sitemap_to_gsc(prefix)
