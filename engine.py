@@ -58,6 +58,14 @@ ERUM_CFG = {
     "CB_": {"site": "CB", "gsc_site": "sc-domain:csrbriefing.kr", "sitemap": "https://csrbriefing.kr/sitemap-news.xml"},
 }
 
+# Cloudflare R2
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
+R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "erum-news-images")
+R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "https://pub-dd677a54d7cf4d8cabd2c3238f4558c9.r2.dev")
+R2_RETENTION_DAYS = 90
+
 # [모델 설정]
 GEMINI_MODEL = "gemini-2.5-pro"
 GEMINI_MODEL_QA = "gemini-3.1-flash-lite-preview"
@@ -513,6 +521,60 @@ class Site:
             except:
                 break
         print(" 완료.")
+
+
+def upload_to_r2(img_bytes: bytes, filename: str, content_type: str) -> Optional[str]:
+    """이미지를 Cloudflare R2에 업로드하고 퍼블릭 URL 반환. 실패 시 None."""
+    if not R2_ACCESS_KEY_ID or not R2_SECRET_ACCESS_KEY:
+        return None
+    try:
+        import boto3
+        from botocore.config import Config
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+            aws_access_key_id=R2_ACCESS_KEY_ID,
+            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+            config=Config(signature_version="s3v4"),
+            region_name="auto",
+        )
+        key = f"news/{datetime.now().strftime('%Y/%m')}/{filename}"
+        s3.put_object(Bucket=R2_BUCKET_NAME, Key=key, Body=img_bytes, ContentType=content_type)
+        return f"{R2_PUBLIC_URL}/{key}"
+    except Exception as e:
+        print(f"\n      ⚠️ [R2 업로드 실패]: {str(e)[:100]}")
+        return None
+
+
+def cleanup_old_r2_images():
+    """90일 이상 된 R2 이미지 삭제"""
+    if not R2_ACCESS_KEY_ID or not R2_SECRET_ACCESS_KEY:
+        return
+    try:
+        import boto3
+        from botocore.config import Config
+        from datetime import timezone, timedelta
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+            aws_access_key_id=R2_ACCESS_KEY_ID,
+            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+            config=Config(signature_version="s3v4"),
+            region_name="auto",
+        )
+        cutoff = datetime.now(timezone.utc) - timedelta(days=R2_RETENTION_DAYS)
+        paginator = s3.get_paginator("list_objects_v2")
+        to_delete = []
+        for page in paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix="news/"):
+            for obj in page.get("Contents", []):
+                if obj["LastModified"] < cutoff:
+                    to_delete.append({"Key": obj["Key"]})
+        if to_delete:
+            s3.delete_objects(Bucket=R2_BUCKET_NAME, Delete={"Objects": to_delete})
+            print(f"🧹 [R2] {len(to_delete)}개 이미지 삭제 완료 ({R2_RETENTION_DAYS}일 초과)")
+    except Exception as e:
+        print(f"⚠️ [R2 정리 실패]: {str(e)[:100]}")
+
 
 class ErumSite:
     """erum-one.com REST API를 통해 NN/CB 기사를 발행"""
@@ -982,7 +1044,9 @@ def process_article(article: dict, upload_counts: dict) -> bool:
         try:
             site = SITES[prefix]
             if is_erum:
-                mid = best_img  # URL 직접 사용, 업로드 불필요
+                # R2에 업로드 후 CF URL 사용, 실패 시 원본 URL fallback
+                r2_url = upload_to_r2(img_bytes, fn, img_content_type)
+                mid = r2_url if r2_url else best_img
             else:
                 mid, _ = site.upload_image_bytes(img_bytes, fn, img_content_type, rw["title"], best_cap)
                 if not mid:
@@ -1042,6 +1106,8 @@ def run():
             db_record_published(article["url_id"], article["title"], "ALL")
             published += 1
             print(f"   🎉 발행 완료! (금일 누적: {today_count + published}건)")
+
+    cleanup_old_r2_images()
 
     # Zero-Sum Clean (이미지 정리)
     print("\n🧹 [Zero-Sum Clean] 구형 이미지 정리")
