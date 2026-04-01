@@ -57,8 +57,6 @@ R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "erum-news-images")
 R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "https://pub-dd677a54d7cf4d8cabd2c3238f4558c9.r2.dev")
-R2_RETENTION_DAYS = 90
-
 # [모델 설정]
 GEMINI_MODEL = "gemini-3-flash-preview"
 GEMINI_MODEL_QA = "gemini-3-flash-preview"
@@ -66,7 +64,6 @@ GEMINI_MODEL_QA = "gemini-3-flash-preview"
 DAILY_PUBLISH_LIMIT = 50
 PER_RUN_LIMIT = 15  # 1회 실행당 최대 발행 수
 RETRY_DAYS = int(os.environ.get('RETRY_DAYS', '0'))  # 0=당일만, N=N일 전까지 재시도
-MIN_MEDIA_LIMIT = 1000
 MEDIA_PREFIXES = ["IJ_", "NN_", "CB_"]
 
 RSS_FEEDS = [
@@ -481,45 +478,29 @@ class Site:
         r.raise_for_status()
         return self._safe_json(r)["id"]
 
-    def get_total_media_count(self) -> int:
-        try:
-            r = self.sess.head(f"{self.base}/wp-json/wp/v2/media", params={"per_page": 1}, timeout=5)
-            if r.status_code == 200: return int(r.headers.get('X-WP-Total', 0))
-            r = self.sess.get(f"{self.base}/wp-json/wp/v2/media", params={"per_page": 1}, timeout=5)
-            return int(r.headers.get('X-WP-Total', 0))
-        except:
-            return 0
-
-    def delete_oldest_media(self, count):
-        if count <= 0: return
-        print(f"   - [{self.base}] 구형 이미지 {count}개 삭제 시작...", end="", flush=True)
-        remain = count
-        while remain > 0:
-            batch_size = min(50, remain)
-            try:
-                r = self.sess.get(f"{self.base}/wp-json/wp/v2/media",
-                                  params={"per_page": batch_size, "orderby": "date", "order": "asc", "fields": "id"}, timeout=20)
-                if not r.ok: break
-                items = self._safe_json(r)
-                if not items: break
-                deleted_in_batch = 0
-                for item in items:
-                    try:
-                        del_res = self.sess.delete(f"{self.base}/wp-json/wp/v2/media/{item['id']}", params={"force": True}, timeout=10)
-                        if del_res.ok: deleted_in_batch += 1
-                    except:
-                        pass
-                remain -= deleted_in_batch
-                if deleted_in_batch == 0: break
-            except:
-                break
-        print(" 완료.")
 
 
 def upload_to_r2(img_bytes: bytes, filename: str, content_type: str) -> Optional[str]:
-    """이미지를 Cloudflare R2에 업로드하고 퍼블릭 URL 반환. 실패 시 None."""
+    """이미지를 WebP로 변환 후 Cloudflare R2에 업로드하고 퍼블릭 URL 반환. 실패 시 None."""
     if not R2_ACCESS_KEY_ID or not R2_SECRET_ACCESS_KEY:
         return None
+    # WebP 변환 (1200px 이하 리사이즈, quality 82)
+    try:
+        from PIL import Image
+        import io as _io
+        img = Image.open(_io.BytesIO(img_bytes))
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGB")
+        if img.width > 1200:
+            ratio = 1200 / img.width
+            img = img.resize((1200, int(img.height * ratio)), Image.LANCZOS)
+        buf = _io.BytesIO()
+        img.save(buf, format="WEBP", quality=82)
+        img_bytes = buf.getvalue()
+        content_type = "image/webp"
+        filename = filename.rsplit(".", 1)[0] + ".webp"
+    except Exception:
+        pass  # 변환 실패 시 원본 사용
     try:
         import boto3
         from botocore.config import Config
@@ -537,36 +518,6 @@ def upload_to_r2(img_bytes: bytes, filename: str, content_type: str) -> Optional
     except Exception as e:
         print(f"\n      ⚠️ [R2 업로드 실패]: {str(e)[:100]}")
         return None
-
-
-def cleanup_old_r2_images():
-    """90일 이상 된 R2 이미지 삭제"""
-    if not R2_ACCESS_KEY_ID or not R2_SECRET_ACCESS_KEY:
-        return
-    try:
-        import boto3
-        from botocore.config import Config
-        from datetime import timezone, timedelta
-        s3 = boto3.client(
-            "s3",
-            endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
-            aws_access_key_id=R2_ACCESS_KEY_ID,
-            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-            config=Config(signature_version="s3v4"),
-            region_name="auto",
-        )
-        cutoff = datetime.now(timezone.utc) - timedelta(days=R2_RETENTION_DAYS)
-        paginator = s3.get_paginator("list_objects_v2")
-        to_delete = []
-        for page in paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix="news/"):
-            for obj in page.get("Contents", []):
-                if obj["LastModified"] < cutoff:
-                    to_delete.append({"Key": obj["Key"]})
-        if to_delete:
-            s3.delete_objects(Bucket=R2_BUCKET_NAME, Delete={"Objects": to_delete})
-            print(f"🧹 [R2] {len(to_delete)}개 이미지 삭제 완료 ({R2_RETENTION_DAYS}일 초과)")
-    except Exception as e:
-        print(f"⚠️ [R2 정리 실패]: {str(e)[:100]}")
 
 
 class ErumSite:
@@ -605,9 +556,6 @@ class ErumSite:
                           json=payload, headers=self.headers, timeout=30)
         r.raise_for_status()
         return r.json()["id"]
-
-    def get_total_media_count(self) -> int: return 0
-    def delete_oldest_media(self, count): pass
 
 SITES: dict = {k: Site(v['base'], v['user'], v['app_pw']) for k, v in WP_CFG.items()}
 for _prefix, _cfg in ERUM_CFG.items():
@@ -1098,19 +1046,6 @@ def run():
             db_record_published(article["url_id"], article["title"], "ALL")
             published += 1
             print(f"   🎉 발행 완료! (금일 누적: {today_count + published}건)")
-
-    cleanup_old_r2_images()
-
-    # Zero-Sum Clean (이미지 정리)
-    print("\n🧹 [Zero-Sum Clean] 구형 이미지 정리")
-    for prefix, count in upload_counts.items():
-        if count > 0:
-            site = SITES[prefix]
-            total = site.get_total_media_count()
-            if total < MIN_MEDIA_LIMIT:
-                print(f"   - [{prefix}] 현재 {total}개 (목표 미달) → 유지.")
-            else:
-                site.delete_oldest_media(count)
 
     # 결과 요약
     print(f"\n--- 실행 완료: {time.strftime('%H:%M:%S')} ---")
