@@ -316,7 +316,10 @@ def ai_quality_check(title: str, body: str, media_prefix: str) -> Tuple[bool, Li
     try:
         media_tone = MEDIA_TONE_DESC.get(media_prefix, "일반 뉴스")
         system_prompt = QA_SYSTEM_PROMPT.format(media_tone=media_tone)
-        article_text = f"제목: {title}\n\n본문:\n{body}"
+        # HTML 태그 제거 후 검수 — qa_checker는 HTML 태그를 포맷 오염으로 즉시 탈락 처리함
+        plain_body = re.sub(r'<[^>]+>', ' ', body).strip()
+        plain_body = re.sub(r'\s+', ' ', plain_body)
+        article_text = f"제목: {title}\n\n본문:\n{plain_body}"
         raw = ask_gemini(system_prompt, article_text, model=GEMINI_MODEL_QA)
         parts = raw.split("---", 1)
         json_part = parts[0]
@@ -867,14 +870,8 @@ def process_article(article: dict, upload_counts: dict) -> bool:
         return False
     print(f" 찾음.")
 
-    if not is_valid_image(best_img):
-        if "/data/" in best_img:
-            best_img = best_img.replace("/data/", "/thumb_")
-        if not is_valid_image(best_img):
-            print("   ❌ 이미지 URL 접속 실패. Skip.")
-            return False
-
     # 이미지 다운로드 + 크기검증 (Gemini 호출 전에 수행하여 불필요한 API 비용 방지)
+    # is_valid_image 별도 호출 제거 — 아래 다운로드 루프에서 크기/타입 검증을 이미 수행
     print(f"   📥 이미지 다운로드 중...", end="", flush=True)
     img_bytes = None
     img_content_type = "image/jpeg"
@@ -885,7 +882,7 @@ def process_article(article: dict, upload_counts: dict) -> bool:
     # korea.kr 이미지인 경우 og:image를 fallback으로 추가
     if 'korea.kr' in best_img:
         try:
-            og_r = fetch_with_retry(article.get("link", ""), timeout=10)
+            og_r = fetch_with_retry(article.get("url", ""), timeout=10)
             if og_r and og_r.status_code == 200:
                 og_soup = BeautifulSoup(og_r.text, 'html.parser')
                 og_tag = og_soup.select_one('meta[property="og:image"]')
@@ -1046,6 +1043,10 @@ def run():
             db_record_published(article["url_id"], article["title"], "ALL")
             published += 1
             print(f"   🎉 발행 완료! (금일 누적: {today_count + published}건)")
+        else:
+            # 발행 실패해도 DB에 기록하여 다음 실행에서 동일 기사 Gemini 재호출 방지
+            # (API 키 만료·네트워크 오류 등 시스템 장애 시 무한 반복 비용 방지)
+            db_record_published(article["url_id"], article["title"], "FAILED")
 
     # 결과 요약
     print(f"\n--- 실행 완료: {time.strftime('%H:%M:%S')} ---")
