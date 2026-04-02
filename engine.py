@@ -74,13 +74,14 @@ UPSTAGE_API_URL = os.environ.get("UPSTAGE_API_URL", f"{UPSTAGE_API_BASE.rstrip('
 UPSTAGE_MODEL = os.environ.get("UPSTAGE_MODEL", "solar-pro3")
 UPSTAGE_MODEL_REWRITE = os.environ.get("UPSTAGE_MODEL_REWRITE", UPSTAGE_MODEL)
 UPSTAGE_MODEL_QA = os.environ.get("UPSTAGE_MODEL_QA", UPSTAGE_MODEL)
-UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS", "1800"))
-UPSTAGE_QA_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_QA_MAX_OUTPUT_TOKENS", "1200"))
-REWRITE_SOURCE_MAX_CHARS = int(os.environ.get("REWRITE_SOURCE_MAX_CHARS", "8000"))
+UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS", "1500"))
+UPSTAGE_QA_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_QA_MAX_OUTPUT_TOKENS", "900"))
+REWRITE_SOURCE_MAX_CHARS = int(os.environ.get("REWRITE_SOURCE_MAX_CHARS", "4000"))
 MIN_REWRITTEN_BODY_CHARS = int(os.environ.get("MIN_REWRITTEN_BODY_CHARS", "300"))
 SOFT_REWRITTEN_BODY_CHARS = int(os.environ.get("SOFT_REWRITTEN_BODY_CHARS", "4500"))
 HARD_REWRITTEN_BODY_CHARS = int(os.environ.get("HARD_REWRITTEN_BODY_CHARS", "6500"))
-QA_INPUT_MAX_CHARS = int(os.environ.get("QA_INPUT_MAX_CHARS", "3500"))
+QA_INPUT_MAX_CHARS = int(os.environ.get("QA_INPUT_MAX_CHARS", "2400"))
+LLM_RESPONSE_MAX_CHARS = int(os.environ.get("LLM_RESPONSE_MAX_CHARS", "12000"))
 MAX_REWRITTEN_BODY_CHARS = SOFT_REWRITTEN_BODY_CHARS  # backward compatibility for older helper code
 MAX_ARTICLE_RETRY_ATTEMPTS = 2
 BASE_RETRY_DELAY_MINUTES = 60
@@ -103,6 +104,11 @@ PER_RUN_LIMIT = 15  # 1회 실행당 최대 발행 수
 RETRY_DAYS = int(os.environ.get('RETRY_DAYS', '0'))  # 0=당일만, N=N일 전까지 재시도
 MEDIA_PREFIXES = ["IJ_", "NN_", "CB_"]
 KST = ZoneInfo("Asia/Seoul")
+TARGET_URL_IDS = {
+    x.strip()
+    for x in os.environ.get("TARGET_URL_IDS", "").split(",")
+    if x.strip()
+}
 
 
 def now_kst() -> datetime:
@@ -249,8 +255,7 @@ IJ_CATEGORY_AUTHOR = {
 
 # ========================= [2. Upstage / 프롬프트] =========================
 
-PROMPT_USER_TEMPLATE = """
-# [원문 자료]:
+PROMPT_USER_TEMPLATE = """원문 자료:
 {original_text}
 """
 
@@ -264,10 +269,11 @@ def load_skill(skill_name: str) -> str:
     except Exception:
         return "본문을 요약해서 기사로 작성하세요. 끝문장은 '다.'로 통일할 것."
 
+EDITOR_COMMON_PROMPT = load_skill("news_editor_common")
 PERSONA_DEFINITIONS = {
-    "IJ_": load_skill("news_editor_ij"),
-    "NN_": load_skill("news_editor_nn"),
-    "CB_": load_skill("news_editor_cb"),
+    "IJ_": f"{EDITOR_COMMON_PROMPT}\n\n{load_skill('news_editor_ij')}",
+    "NN_": f"{EDITOR_COMMON_PROMPT}\n\n{load_skill('news_editor_nn')}",
+    "CB_": f"{EDITOR_COMMON_PROMPT}\n\n{load_skill('news_editor_cb')}",
 }
 
 def _llm_failure(stage: str, exc: Exception) -> PipelineFailure:
@@ -783,6 +789,8 @@ def clean_body_html(text):
 
 def parse_llm_response(text):
     text = _strip_model_fences(text)
+    if len(text) > LLM_RESPONSE_MAX_CHARS:
+        text = text[:LLM_RESPONSE_MAX_CHARS].rstrip()
     lines = [line.rstrip() for line in text.splitlines()]
     title = ""
     excerpt = ""
@@ -834,7 +842,7 @@ def parse_llm_response(text):
     title = re.sub(r"[#\*\[\]`]", "", title).strip().strip('"')
     excerpt = re.sub(r"[#\*\[\]`]", "", excerpt).strip()
     excerpt = html.unescape(excerpt) if excerpt else ""
-    body_raw = limit_rewritten_body_text("\n".join(body_lines).strip())
+    body_raw = limit_rewritten_body_text("\n".join(body_lines).strip(), HARD_REWRITTEN_BODY_CHARS)
     final_body = clean_body_html(body_raw)
     # 리드문이 비어 있으면 본문 첫 2문장으로 자동 생성
     if not excerpt and final_body:
@@ -1453,6 +1461,8 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, 
                 if not hasattr(e, 'link'): continue
                 curr_id = extract_unique_id(e.link)
                 if curr_id in ex_ids: continue
+                if TARGET_URL_IDS and curr_id not in TARGET_URL_IDS:
+                    continue
                 if not is_mainly_korean(e.title, threshold=0.5): continue
                 title_hash = hash_title_for_rule(e.title)
                 source_url_key = normalize_url_for_rule(e.link)
@@ -1640,6 +1650,8 @@ def process_article(article: dict, upload_counts: dict) -> str:
 
 def run():
     print(f"\n🚀 AI 뉴스 엔진 (v25.1-Upstage_SolarPro3_KST) 가동: {now_kst().strftime('%Y-%m-%d %H:%M:%S')}")
+    if TARGET_URL_IDS:
+        print(f"🎯 대상 URL 필터 활성화: {len(TARGET_URL_IDS)}건")
 
     # 테이블 자동 생성 (없을 경우)
     db_ensure_table()
