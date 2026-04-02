@@ -20,9 +20,10 @@ import difflib
 import calendar
 import html
 from dataclasses import dataclass
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from typing import Dict, List, Optional, Tuple, Any
 from urllib.parse import urljoin, urlparse, parse_qs
+from zoneinfo import ZoneInfo
 
 import requests
 import feedparser
@@ -100,6 +101,42 @@ DAILY_PUBLISH_LIMIT = 50
 PER_RUN_LIMIT = 15  # 1회 실행당 최대 발행 수
 RETRY_DAYS = int(os.environ.get('RETRY_DAYS', '0'))  # 0=당일만, N=N일 전까지 재시도
 MEDIA_PREFIXES = ["IJ_", "NN_", "CB_"]
+KST = ZoneInfo("Asia/Seoul")
+
+
+def now_kst() -> datetime:
+    return datetime.now(tz=KST)
+
+
+def to_kst(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(KST)
+
+
+def to_kst_naive(dt: Optional[datetime]) -> Optional[datetime]:
+    converted = to_kst(dt)
+    return converted.replace(tzinfo=None) if converted else None
+
+
+def to_kst_iso(dt: Optional[datetime]) -> Optional[str]:
+    converted = to_kst(dt)
+    return converted.isoformat(timespec="seconds") if converted else None
+
+
+def to_utc_iso(dt: Optional[datetime]) -> Optional[str]:
+    converted = to_kst(dt)
+    if not converted:
+        return None
+    return converted.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def feed_time_to_kst(dt: Optional[time.struct_time]) -> Optional[datetime]:
+    if not dt:
+        return None
+    return datetime.fromtimestamp(calendar.timegm(dt), tz=timezone.utc).astimezone(KST)
 
 RSS_FEEDS = [
     "https://www.korea.kr/rss/policy.xml",
@@ -300,14 +337,16 @@ def db_get_existing_ids_and_titles() -> Tuple[set, set]:
 def db_get_retry_blocked_ids() -> set:
     conn = get_db_connection()
     try:
+        blocked_now = to_kst_naive(now_kst())
         with conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT url_id
                 FROM article_attempts
                 WHERE status IN ('PERMANENT', 'SYSTEM')
-                   OR (status = 'RETRYABLE' AND next_retry_at IS NOT NULL AND next_retry_at > NOW())
-                """
+                   OR (status = 'RETRYABLE' AND next_retry_at IS NOT NULL AND next_retry_at > %s)
+                """,
+                (blocked_now,),
             )
             rows = cur.fetchall()
         return {r["url_id"] for r in rows}
@@ -318,7 +357,10 @@ def db_get_today_count() -> int:
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) AS cnt FROM published_articles WHERE DATE(published_at) = CURDATE() AND COALESCE(media, '') <> 'FAILED'")
+            cur.execute(
+                "SELECT COUNT(*) AS cnt FROM published_articles WHERE DATE(published_at) = %s AND COALESCE(media, '') <> 'FAILED'",
+                (now_kst().date(),),
+            )
             return cur.fetchone()["cnt"]
     finally:
         conn.close()
@@ -343,19 +385,23 @@ def db_store_attempt_state(
     retry_count: int = 0,
     next_retry_at: Optional[datetime] = None,
     partial_success: bool = False,
+    source_published_at: Optional[datetime] = None,
 ):
     conn = get_db_connection()
     try:
+        attempt_at = to_kst_naive(now_kst())
+        retry_at = to_kst_naive(next_retry_at)
         with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO article_attempts
-                    (url_id, title, media, status, fail_stage, fail_code, fail_message, retry_count, next_retry_at, partial_success, last_attempt_at)
+                    (url_id, title, media, source_published_at, status, fail_stage, fail_code, fail_message, retry_count, next_retry_at, partial_success, last_attempt_at, updated_at)
                 VALUES
-                    (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
                     title = VALUES(title),
                     media = VALUES(media),
+                    source_published_at = VALUES(source_published_at),
                     status = VALUES(status),
                     fail_stage = VALUES(fail_stage),
                     fail_code = VALUES(fail_code),
@@ -363,40 +409,45 @@ def db_store_attempt_state(
                     retry_count = VALUES(retry_count),
                     next_retry_at = VALUES(next_retry_at),
                     partial_success = VALUES(partial_success),
-                    last_attempt_at = NOW(),
-                    updated_at = NOW()
+                    last_attempt_at = VALUES(last_attempt_at),
+                    updated_at = VALUES(updated_at)
                 """,
                 (
                     url_id,
                     title[:1000],
                     media[:50],
+                    to_kst_naive(source_published_at),
                     status,
                     stage[:50] if stage else None,
                     code[:50] if code else None,
                     message[:1000],
                     retry_count,
-                    next_retry_at,
+                    retry_at,
                     1 if partial_success else 0,
+                    attempt_at,
+                    attempt_at,
                 ),
             )
         conn.commit()
     finally:
         conn.close()
 
-def db_record_success(url_id: str, title: str, media: str):
+def db_record_success(url_id: str, title: str, media: str, source_published_at: Optional[datetime] = None, published_at: Optional[datetime] = None):
     conn = get_db_connection()
     try:
+        published_kst = to_kst_naive(published_at or now_kst())
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO published_articles (url_id, title, media, published_at)
-                VALUES (%s, %s, %s, NOW())
+                INSERT INTO published_articles (url_id, title, media, source_published_at, published_at)
+                VALUES (%s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
                     title = VALUES(title),
                     media = VALUES(media),
+                    source_published_at = VALUES(source_published_at),
                     published_at = VALUES(published_at)
                 """,
-                (url_id, title[:1000], media),
+                (url_id, title[:1000], media, to_kst_naive(source_published_at), published_kst),
             )
         conn.commit()
     finally:
@@ -412,6 +463,7 @@ def db_ensure_table():
                     url_id VARCHAR(512) NOT NULL,
                     title VARCHAR(1000),
                     media VARCHAR(50),
+                    source_published_at DATETIME DEFAULT NULL,
                     published_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE KEY uq_url_id (url_id)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
@@ -422,6 +474,7 @@ def db_ensure_table():
                     url_id VARCHAR(512) NOT NULL,
                     title VARCHAR(1000),
                     media VARCHAR(50),
+                    source_published_at DATETIME DEFAULT NULL,
                     status VARCHAR(32) NOT NULL,
                     fail_stage VARCHAR(50),
                     fail_code VARCHAR(50),
@@ -435,6 +488,21 @@ def db_ensure_table():
                     KEY idx_attempt_status_retry (status, next_retry_at)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
+            # 기존 테이블에는 새 컬럼이 없을 수 있으므로, 안전하게 보강한다.
+            for table_name, column_name, column_def in [
+                ("published_articles", "source_published_at", "DATETIME DEFAULT NULL"),
+                ("article_attempts", "source_published_at", "DATETIME DEFAULT NULL"),
+            ]:
+                cur.execute(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s
+                    """,
+                    (DB_NAME, table_name, column_name),
+                )
+                if not cur.fetchone()["cnt"]:
+                    cur.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")
         conn.commit()
     finally:
         conn.close()
@@ -766,8 +834,17 @@ class Site:
                 raise PipelineFailure("publish", f"IMAGE_UPLOAD_HTTP_{status}", err_msg[:200], retryable=True)
             raise PipelineFailure("publish", "IMAGE_UPLOAD_ERROR", err_msg[:200], retryable=True)
 
-    def create_post(self, title, body, cat, tags, mid=None, excerpt="", author=None):
-        d = {"title": title, "content": body, "status": "publish", "categories": [cat] if cat else [], "tags": tags}
+    def create_post(self, title, body, cat, tags, mid=None, excerpt="", author=None, published_at: Optional[datetime] = None, source_published_at: Optional[datetime] = None):
+        publish_dt = to_kst(published_at) or now_kst()
+        d = {
+            "title": title,
+            "content": body,
+            "status": "publish",
+            "categories": [cat] if cat else [],
+            "tags": tags,
+            "date": to_kst_iso(publish_dt),
+            "date_gmt": to_utc_iso(publish_dt),
+        }
         if mid: d["featured_media"] = mid
         if excerpt: d["excerpt"] = excerpt
         if author: d["author"] = author
@@ -809,7 +886,7 @@ def upload_to_r2(img_bytes: bytes, filename: str, content_type: str) -> Optional
             config=Config(signature_version="s3v4"),
             region_name="auto",
         )
-        key = f"news/{datetime.now().strftime('%Y/%m')}/{filename}"
+        key = f"news/{now_kst().strftime('%Y/%m')}/{filename}"
         s3.put_object(Bucket=R2_BUCKET_NAME, Key=key, Body=img_bytes, ContentType=content_type)
         return f"{R2_PUBLIC_URL}/{key}"
     except Exception as e:
@@ -838,7 +915,8 @@ class ErumSite:
 
     def get_tag_ids(self, tags): return []
 
-    def create_post(self, title, body, cat_id, tag_ids, img_url=None, excerpt="", author=None):
+    def create_post(self, title, body, cat_id, tag_ids, img_url=None, excerpt="", author=None, published_at: Optional[datetime] = None, source_published_at: Optional[datetime] = None):
+        publish_dt = to_kst(published_at) or now_kst()
         payload = {
             "site": self.site_code,
             "title": title,
@@ -847,8 +925,11 @@ class ErumSite:
             "status": "PUBLISHED",
             "categoryId": cat_id,
             "featuredImageUrl": img_url,
-            "publishedAt": datetime.now().isoformat(),
+            "publishedAt": to_kst_iso(publish_dt),
+            "sourcePublishedAt": to_kst_iso(source_published_at) if source_published_at else None,
         }
+        if payload["sourcePublishedAt"] is None:
+            payload.pop("sourcePublishedAt")
         r = requests.post(f"{self.api_base}/api/articles",
                           json=payload, headers=self.headers, timeout=30)
         r.raise_for_status()
@@ -1243,7 +1324,7 @@ def classify_attempt_state(failure: PipelineFailure, prior_state: Optional[dict]
         if retry_count >= MAX_ARTICLE_RETRY_ATTEMPTS:
             return "PERMANENT", retry_count, None
         delay_minutes = min(MAX_RETRY_DELAY_MINUTES, BASE_RETRY_DELAY_MINUTES * (2 ** (retry_count - 1)))
-        return "RETRYABLE", retry_count, datetime.now() + timedelta(minutes=delay_minutes)
+        return "RETRYABLE", retry_count, now_kst() + timedelta(minutes=delay_minutes)
 
     return "PERMANENT", retry_count, None
 
@@ -1251,8 +1332,9 @@ def classify_attempt_state(failure: PipelineFailure, prior_state: Optional[dict]
 
 def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int) -> list:
     """RSS에서 기사를 수집하여 리스트로 반환 (시트 없이 메모리에서 직접 처리)"""
-    today = datetime.now().date()
-    current_hour = datetime.now().hour
+    current_kst = now_kst()
+    today = current_kst.date()
+    current_hour = current_kst.hour
     articles = []
 
     def fetch_feed(url, source_name, feed_limit, is_newswire=False):
@@ -1275,10 +1357,10 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int) 
                 if not is_mainly_korean(e.title, threshold=0.5): continue
                 if is_semantic_duplicate(e.title, ex_titles, threshold=0.9): continue
                 dt = e.get('published_parsed') or e.get('updated_parsed')
-                if not dt: continue
-                article_date = datetime.fromtimestamp(calendar.timegm(dt)).date()
+                source_published_at = feed_time_to_kst(dt)
+                if not source_published_at: continue
+                article_date = source_published_at.date()
                 if RETRY_DAYS > 0:
-                    from datetime import timedelta
                     if article_date < today - timedelta(days=RETRY_DAYS) or article_date > today:
                         continue
                 else:
@@ -1296,6 +1378,7 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int) 
                     "title": e.title[:1000],
                     "body": e.get('summary', '')[:30000],
                     "image": img_link,
+                    "source_published_at": source_published_at,
                 })
                 ex_ids.add(curr_id)
                 ex_titles.add(e.title[:1000])
@@ -1333,6 +1416,8 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int) 
 def process_article(article: dict, upload_counts: dict) -> str:
     """기사 1건을 3개 매체에 재작성 + 발행."""
     print(f"\n▶ 기사 처리 시작: {article['title'][:40]}...")
+    source_published_at = article.get("source_published_at")
+    published_at = now_kst()
 
     # 이미지 확인
     print(f"   🔎 이미지 탐색 중...", end="", flush=True)
@@ -1408,7 +1493,16 @@ def process_article(article: dict, upload_counts: dict) -> str:
                 mid, _ = site.upload_image_bytes(img_bytes, fn, img_content_type, rw["title"], best_cap)
                 if not mid:
                     raise PipelineFailure("publish", "IMAGE_UPLOAD_FAIL", "이미지 업로드 실패", retryable=True)
-            pid = site.create_post(rw["title"], rw["body"], site.get_cat_id(rw["cat"]), site.get_tag_ids(rw["tags"]), mid, excerpt=rw.get("excerpt", ""))
+            pid = site.create_post(
+                rw["title"],
+                rw["body"],
+                site.get_cat_id(rw["cat"]),
+                site.get_tag_ids(rw["tags"]),
+                mid,
+                excerpt=rw.get("excerpt", ""),
+                published_at=published_at,
+                source_published_at=source_published_at,
+            )
             upload_counts[prefix] += 1
             published_prefixes += 1
             print(f" 성공 (ID:{pid}).")
@@ -1430,7 +1524,7 @@ def process_article(article: dict, upload_counts: dict) -> str:
 
 
 def run():
-    print(f"\n🚀 AI 뉴스 엔진 (v25.0-Upstage_SolarPro3) 가동: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"\n🚀 AI 뉴스 엔진 (v25.1-Upstage_SolarPro3_KST) 가동: {now_kst().strftime('%Y-%m-%d %H:%M:%S')}")
 
     # 테이블 자동 생성 (없을 경우)
     db_ensure_table()
@@ -1469,13 +1563,20 @@ def run():
         try:
             result = process_article(article, upload_counts)
             if result == 'success':
-                db_record_success(article["url_id"], article["title"], "ALL")
+                db_record_success(
+                    article["url_id"],
+                    article["title"],
+                    "ALL",
+                    source_published_at=article.get("source_published_at"),
+                    published_at=now_kst(),
+                )
                 db_store_attempt_state(
                     article["url_id"],
                     article["title"],
                     "ALL",
                     "SUCCESS",
                     retry_count=0,
+                    source_published_at=article.get("source_published_at"),
                 )
                 published += 1
                 print(f"   🎉 발행 완료! (금일 누적: {today_count + published}건)")
@@ -1492,6 +1593,7 @@ def run():
                 retry_count=retry_count,
                 next_retry_at=next_retry_at,
                 partial_success=failure.partial_success,
+                source_published_at=article.get("source_published_at"),
             )
             if failure.abort_run:
                 raise
@@ -1509,10 +1611,11 @@ def run():
                 retry_count=retry_count,
                 next_retry_at=next_retry_at,
                 partial_success=False,
+                source_published_at=article.get("source_published_at"),
             )
 
     # 결과 요약
-    print(f"\n--- 실행 완료: {time.strftime('%H:%M:%S')} ---")
+    print(f"\n--- 실행 완료(KST): {now_kst().strftime('%H:%M:%S')} ---")
     print(f"📊 [작업 요약]")
     for p, c in upload_counts.items():
         print(f"   - {p} 발행 성공: {c}건")
