@@ -1,8 +1,6 @@
 name: News Engine
 
 on:
-  schedule:
-    - cron: '0 0-12 * * *'  # KST 9~21시, 1시간 간격 (UTC 기준)
   workflow_dispatch: # 수동 실행 지원
 
 jobs:
