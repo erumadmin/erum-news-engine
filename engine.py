@@ -13,6 +13,7 @@ from __future__ import annotations
 import sys
 import time
 import re
+import hashlib
 import base64
 import json
 import os
@@ -137,6 +138,21 @@ def feed_time_to_kst(dt: Optional[time.struct_time]) -> Optional[datetime]:
     if not dt:
         return None
     return datetime.fromtimestamp(calendar.timegm(dt), tz=timezone.utc).astimezone(KST)
+
+
+def normalize_rule_text(text: str) -> str:
+    return re.sub(r"\s+", "", re.sub(r"[^\w가-힣]", "", (text or "").lower())).strip()
+
+
+def hash_title_for_rule(text: str) -> str:
+    normalized = normalize_rule_text(text)
+    if not normalized:
+        return ""
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def normalize_url_for_rule(url: str) -> str:
+    return (url or "").strip().split("#", 1)[0].rstrip("/")
 
 RSS_FEEDS = [
     "https://www.korea.kr/rss/policy.xml",
@@ -374,6 +390,53 @@ def db_get_attempt_state(url_id: str) -> Optional[dict]:
     finally:
         conn.close()
 
+
+def db_get_active_article_rules() -> dict:
+    conn = get_db_connection()
+    try:
+        active_now = to_kst_naive(now_kst())
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT url_id, source_url, title_hash, rule_type
+                FROM article_rules
+                WHERE expires_at IS NULL OR expires_at > %s
+                """,
+                (active_now,),
+            )
+            rows = cur.fetchall()
+        blocked_ids, blocked_title_hashes, blocked_source_urls = set(), set(), set()
+        allowed_ids, allowed_title_hashes, allowed_source_urls = set(), set(), set()
+        for row in rows:
+            rule_type = (row.get("rule_type") or "").upper()
+            url_id = row.get("url_id")
+            title_hash = (row.get("title_hash") or "").lower()
+            source_url = normalize_url_for_rule(row.get("source_url") or "")
+            if rule_type == "BLOCK":
+                if url_id:
+                    blocked_ids.add(url_id)
+                if title_hash:
+                    blocked_title_hashes.add(title_hash)
+                if source_url:
+                    blocked_source_urls.add(source_url)
+            elif rule_type in {"ALLOW", "OVERRIDE"}:
+                if url_id:
+                    allowed_ids.add(url_id)
+                if title_hash:
+                    allowed_title_hashes.add(title_hash)
+                if source_url:
+                    allowed_source_urls.add(source_url)
+        return {
+            "blocked_ids": blocked_ids,
+            "blocked_title_hashes": blocked_title_hashes,
+            "blocked_source_urls": blocked_source_urls,
+            "allowed_ids": allowed_ids,
+            "allowed_title_hashes": allowed_title_hashes,
+            "allowed_source_urls": allowed_source_urls,
+        }
+    finally:
+        conn.close()
+
 def db_store_attempt_state(
     url_id: str,
     title: str,
@@ -486,6 +549,37 @@ def db_ensure_table():
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     UNIQUE KEY uq_attempt_url_id (url_id),
                     KEY idx_attempt_status_retry (status, next_retry_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS article_rules (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    url_id VARCHAR(512) DEFAULT NULL,
+                    source_url VARCHAR(2048) DEFAULT NULL,
+                    title_hash CHAR(64) DEFAULT NULL,
+                    rule_type VARCHAR(20) NOT NULL,
+                    expires_at DATETIME DEFAULT NULL,
+                    note TEXT,
+                    created_by VARCHAR(100) DEFAULT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    KEY idx_article_rules_url_id (url_id),
+                    KEY idx_article_rules_title_hash (title_hash),
+                    KEY idx_article_rules_type_expires (rule_type, expires_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS audit_logs (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    actor VARCHAR(100) NOT NULL,
+                    action VARCHAR(100) NOT NULL,
+                    target_url_id VARCHAR(512) DEFAULT NULL,
+                    before_state LONGTEXT DEFAULT NULL,
+                    after_state LONGTEXT DEFAULT NULL,
+                    note TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    KEY idx_audit_logs_target_url_id (target_url_id),
+                    KEY idx_audit_logs_created_at (created_at)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
             # 기존 테이블에는 새 컬럼이 없을 수 있으므로, 안전하게 보강한다.
@@ -1330,12 +1424,18 @@ def classify_attempt_state(failure: PipelineFailure, prior_state: Optional[dict]
 
 # ========================= [8. 메인 파이프라인] =========================
 
-def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int) -> list:
+def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, rules: Optional[dict] = None) -> list:
     """RSS에서 기사를 수집하여 리스트로 반환 (시트 없이 메모리에서 직접 처리)"""
     current_kst = now_kst()
     today = current_kst.date()
     current_hour = current_kst.hour
     articles = []
+    rule_blocked_ids = (rules or {}).get("blocked_ids", set())
+    rule_blocked_title_hashes = (rules or {}).get("blocked_title_hashes", set())
+    rule_blocked_source_urls = (rules or {}).get("blocked_source_urls", set())
+    rule_allowed_ids = (rules or {}).get("allowed_ids", set())
+    rule_allowed_title_hashes = (rules or {}).get("allowed_title_hashes", set())
+    rule_allowed_source_urls = (rules or {}).get("allowed_source_urls", set())
 
     def fetch_feed(url, source_name, feed_limit, is_newswire=False):
         if feed_limit <= 0: return 0
@@ -1353,8 +1453,23 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int) 
                 if not hasattr(e, 'link'): continue
                 curr_id = extract_unique_id(e.link)
                 if curr_id in ex_ids: continue
-                if curr_id in blocked_ids: continue
                 if not is_mainly_korean(e.title, threshold=0.5): continue
+                title_hash = hash_title_for_rule(e.title)
+                source_url_key = normalize_url_for_rule(e.link)
+                rule_allowed = (
+                    curr_id in rule_allowed_ids
+                    or title_hash in rule_allowed_title_hashes
+                    or source_url_key in rule_allowed_source_urls
+                )
+                if (
+                    curr_id in rule_blocked_ids
+                    or title_hash in rule_blocked_title_hashes
+                    or source_url_key in rule_blocked_source_urls
+                ):
+                    if not rule_allowed:
+                        continue
+                if not rule_allowed and curr_id in blocked_ids:
+                    continue
                 if is_semantic_duplicate(e.title, ex_titles, threshold=0.9): continue
                 dt = e.get('published_parsed') or e.get('updated_parsed')
                 source_published_at = feed_time_to_kst(dt)
@@ -1546,7 +1661,8 @@ def run():
     # RSS 수집
     print("   ⬇️ 신규 기사 수집(RSS) 시작...")
     blocked_ids = db_get_retry_blocked_ids()
-    articles = collect_articles(ex_ids, ex_titles, blocked_ids, remaining)
+    article_rules = db_get_active_article_rules()
+    articles = collect_articles(ex_ids, ex_titles, blocked_ids, remaining, article_rules)
 
     if not articles:
         print("👍 신규 기사 없음. 종료.")
