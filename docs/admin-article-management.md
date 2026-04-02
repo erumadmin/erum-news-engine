@@ -117,4 +117,5 @@
 - 재시도 가능 여부는 `article_attempts.status`로 판단한다.
 - 일시 장애는 `RETRYABLE`, 구조적 실패는 `PERMANENT`, 시스템 오류는 `SYSTEM`으로 분리한다.
 - 관리자 화면에서 삭제보다 상태 변경을 우선한다.
-
+- `BLOCK`은 `url_id`, `source_url`, `title_hash` 중 하나로 매칭될 수 있다.
+- `ALLOW`와 `OVERRIDE`는 엔진의 재시도 차단만 완화하고, 성공 발행 기록을 자동으로 다시 쓰지 않는다.
