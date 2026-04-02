@@ -874,44 +874,7 @@ def process_article(article: dict, upload_counts: dict) -> bool:
             print("   ❌ 이미지 URL 접속 실패. Skip.")
             return False
 
-    # 매체별 재작성 + 발행
-    rewritten = {}
-    for prefix in MEDIA_PREFIXES:
-        print(f"      ✍️ [{prefix}] Gemini 기사 작성 중...", end="", flush=True)
-        try:
-            res = ask_gemini(PERSONA_DEFINITIONS[prefix], strip_html_tags(article["body"])[:10000])
-            p = parse_gemini_response(res)
-            is_valid, msg = validate_content_quality(p['title'], p['body'])
-            if not is_valid:
-                raise Exception(f"QA탈락: {msg}")
-
-            # AI 품질검수+보완 (Flash 1회)
-            print(" 작성완료.", flush=True)
-            print(f"      🔍 [{prefix}] Flash 품질검수 중...", end="", flush=True)
-            passed, fails, score, fixed = ai_quality_check(p['title'], p['body'], prefix)
-
-            if not passed:
-                print(f" {score}점(미달).", flush=True)
-                if fixed:
-                    print(f"      🔧 [{prefix}] 자동보완 적용...", end="", flush=True)
-                    is_valid, msg = validate_content_quality(fixed['title'], fixed['body'])
-                    if not is_valid:
-                        raise Exception(f"보완 후 룰QA탈락: {msg}")
-                    p = fixed
-                    print(f" 완료.")
-                else:
-                    raise Exception(f"AI검수 최종미달(점수:{score})")
-            else:
-                print(f" {score}점 통과.")
-
-            cat, tags = get_hybrid_meta(p['title'], p['body'], p['cat'], p['tags'])
-            rewritten[prefix] = {"title": p['title'], "excerpt": p.get('excerpt', ''), "body": p['body'], "cat": cat, "tags": tags}
-
-        except Exception as e:
-            print(f" 실패({str(e)[:100]}).")
-            rewritten[prefix] = None
-
-    # 이미지 미리 다운로드 (원본 서버 접속 문제 방지)
+    # 이미지 다운로드 + 크기검증 (Gemini 호출 전에 수행하여 불필요한 API 비용 방지)
     print(f"   📥 이미지 다운로드 중...", end="", flush=True)
     img_bytes = None
     img_content_type = "image/jpeg"
@@ -972,6 +935,43 @@ def process_article(article: dict, upload_counts: dict) -> bool:
     if not img_bytes:
         print(" 모든 소스 실패. Skip.")
         return False
+
+    # 매체별 재작성 + 발행
+    rewritten = {}
+    for prefix in MEDIA_PREFIXES:
+        print(f"      ✍️ [{prefix}] Gemini 기사 작성 중...", end="", flush=True)
+        try:
+            res = ask_gemini(PERSONA_DEFINITIONS[prefix], strip_html_tags(article["body"])[:10000])
+            p = parse_gemini_response(res)
+            is_valid, msg = validate_content_quality(p['title'], p['body'])
+            if not is_valid:
+                raise Exception(f"QA탈락: {msg}")
+
+            # AI 품질검수+보완 (Flash 1회)
+            print(" 작성완료.", flush=True)
+            print(f"      🔍 [{prefix}] Flash 품질검수 중...", end="", flush=True)
+            passed, fails, score, fixed = ai_quality_check(p['title'], p['body'], prefix)
+
+            if not passed:
+                print(f" {score}점(미달).", flush=True)
+                if fixed:
+                    print(f"      🔧 [{prefix}] 자동보완 적용...", end="", flush=True)
+                    is_valid, msg = validate_content_quality(fixed['title'], fixed['body'])
+                    if not is_valid:
+                        raise Exception(f"보완 후 룰QA탈락: {msg}")
+                    p = fixed
+                    print(f" 완료.")
+                else:
+                    raise Exception(f"AI검수 최종미달(점수:{score})")
+            else:
+                print(f" {score}점 통과.")
+
+            cat, tags = get_hybrid_meta(p['title'], p['body'], p['cat'], p['tags'])
+            rewritten[prefix] = {"title": p['title'], "excerpt": p.get('excerpt', ''), "body": p['body'], "cat": cat, "tags": tags}
+
+        except Exception as e:
+            print(f" 실패({str(e)[:100]}).")
+            rewritten[prefix] = None
 
     # WP 발행
     all_success = True
