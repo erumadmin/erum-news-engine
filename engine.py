@@ -858,8 +858,10 @@ def collect_articles(ex_ids: set, ex_titles: set, limit: int) -> list:
     return articles
 
 
-def process_article(article: dict, upload_counts: dict) -> bool:
-    """기사 1건을 3개 매체에 재작성 + WP 발행. 성공 시 True"""
+def process_article(article: dict, upload_counts: dict) -> str:
+    """기사 1건을 3개 매체에 재작성 + WP 발행.
+    반환값: 'success' | 'skip' (이미지·QA 실패 등 재시도 가능) | 'failed' (Gemini 후 발행 실패)
+    """
     print(f"\n▶ 기사 처리 시작: {article['title'][:40]}...")
 
     # 이미지 확인
@@ -867,7 +869,7 @@ def process_article(article: dict, upload_counts: dict) -> bool:
     best_img, best_cap = find_best_image(article)
     if not best_img:
         print(" 실패 (이미지 없음/저작권). Skip.")
-        return False
+        return 'skip'
     print(f" 찾음.")
 
     # 이미지 다운로드 + 크기검증 (Gemini 호출 전에 수행하여 불필요한 API 비용 방지)
@@ -931,7 +933,7 @@ def process_article(article: dict, upload_counts: dict) -> bool:
 
     if not img_bytes:
         print(" 모든 소스 실패. Skip.")
-        return False
+        return 'skip'
 
     # 매체별 재작성 + 발행
     rewritten = {}
@@ -998,7 +1000,7 @@ def process_article(article: dict, upload_counts: dict) -> bool:
             print(f" 실패({str(e)[:100]}).")
             all_success = False
 
-    return all_success
+    return 'success' if all_success else 'failed'
 
 
 def run():
@@ -1038,15 +1040,15 @@ def run():
     for article in articles:
         if published >= remaining:
             break
-        success = process_article(article, upload_counts)
-        if success:
+        result = process_article(article, upload_counts)
+        if result == 'success':
             db_record_published(article["url_id"], article["title"], "ALL")
             published += 1
             print(f"   🎉 발행 완료! (금일 누적: {today_count + published}건)")
-        else:
-            # 발행 실패해도 DB에 기록하여 다음 실행에서 동일 기사 Gemini 재호출 방지
-            # (API 키 만료·네트워크 오류 등 시스템 장애 시 무한 반복 비용 방지)
+        elif result == 'failed':
+            # Gemini 호출 후 발행만 실패한 경우 → DB 기록으로 재호출 방지
             db_record_published(article["url_id"], article["title"], "FAILED")
+        # 'skip' (이미지·네트워크 일시 오류) → DB 미기록, 다음 실행에서 재시도
 
     # 결과 요약
     print(f"\n--- 실행 완료: {time.strftime('%H:%M:%S')} ---")
