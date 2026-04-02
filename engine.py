@@ -1045,10 +1045,9 @@ def run():
             db_record_published(article["url_id"], article["title"], "ALL")
             published += 1
             print(f"   🎉 발행 완료! (금일 누적: {today_count + published}건)")
-        elif result == 'failed':
-            # Gemini 호출 후 발행만 실패한 경우 → DB 기록으로 재호출 방지
+        else:
+            # 이미지 실패·발행 실패 모두 DB 기록 → 같은 날 동일 기사 반복 처리 방지
             db_record_published(article["url_id"], article["title"], "FAILED")
-        # 'skip' (이미지·네트워크 일시 오류) → DB 미기록, 다음 실행에서 재시도
 
     # 결과 요약
     print(f"\n--- 실행 완료: {time.strftime('%H:%M:%S')} ---")
