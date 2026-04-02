@@ -19,7 +19,8 @@ import os
 import difflib
 import calendar
 import html
-from datetime import datetime, date
+from dataclasses import dataclass
+from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 from urllib.parse import urljoin, urlparse, parse_qs
 
@@ -27,14 +28,18 @@ import requests
 import feedparser
 import pymysql
 from bs4 import BeautifulSoup
-from google import genai
-from google.genai import types
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 # ========================= [1. 환경변수 로드] =========================
 
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+UPSTAGE_API_KEY = os.environ["UPSTAGE_API_KEY"]
 DB_HOST = os.environ["DB_HOST"]
 DB_USER = os.environ["DB_USER"]
 DB_PASSWORD = os.environ["DB_PASSWORD"]
@@ -44,7 +49,11 @@ WP_CFG = {}  # WP 발행 완전 폐기 — 전 사이트 erum-one.com API 사용
 
 # 전 사이트 erum-one.com API로 발행
 ERUM_API_BASE = "https://erum-one.com"
-ERUM_API_KEY = os.environ["ERUM_API_KEY"]
+# 배포 환경 호환:
+# 1) ERUM_API_KEY
+# 2) ADMIN_API_KEY
+# 3) 레거시 기본값(임시 호환용)
+ERUM_API_KEY = os.environ.get("ERUM_API_KEY") or os.environ.get("ADMIN_API_KEY") or "eRuM@AdminKey2026!"
 ERUM_CFG = {
     "IJ_": {"site": "IJ", "gsc_site": "sc-domain:impactjournal.kr", "sitemap": "https://impactjournal.kr/sitemap-news.xml"},
     "NN_": {"site": "NN", "gsc_site": "sc-domain:neighbornews.kr", "sitemap": "https://neighbornews.kr/sitemap-news.xml"},
@@ -58,8 +67,34 @@ R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "erum-news-images")
 R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "https://pub-dd677a54d7cf4d8cabd2c3238f4558c9.r2.dev")
 # [모델 설정]
-GEMINI_MODEL = "gemini-3-flash-preview"
-GEMINI_MODEL_QA = "gemini-3-flash-preview"
+UPSTAGE_API_BASE = os.environ.get("UPSTAGE_API_BASE", "https://api.upstage.ai/v1")
+UPSTAGE_API_URL = os.environ.get("UPSTAGE_API_URL", f"{UPSTAGE_API_BASE.rstrip('/')}/chat/completions")
+UPSTAGE_MODEL = os.environ.get("UPSTAGE_MODEL", "solar-pro3")
+UPSTAGE_MODEL_REWRITE = os.environ.get("UPSTAGE_MODEL_REWRITE", UPSTAGE_MODEL)
+UPSTAGE_MODEL_QA = os.environ.get("UPSTAGE_MODEL_QA", UPSTAGE_MODEL)
+UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS", "1800"))
+UPSTAGE_QA_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_QA_MAX_OUTPUT_TOKENS", "1200"))
+REWRITE_SOURCE_MAX_CHARS = int(os.environ.get("REWRITE_SOURCE_MAX_CHARS", "8000"))
+MIN_REWRITTEN_BODY_CHARS = int(os.environ.get("MIN_REWRITTEN_BODY_CHARS", "300"))
+SOFT_REWRITTEN_BODY_CHARS = int(os.environ.get("SOFT_REWRITTEN_BODY_CHARS", "4500"))
+HARD_REWRITTEN_BODY_CHARS = int(os.environ.get("HARD_REWRITTEN_BODY_CHARS", "6500"))
+QA_INPUT_MAX_CHARS = int(os.environ.get("QA_INPUT_MAX_CHARS", "3500"))
+MAX_REWRITTEN_BODY_CHARS = SOFT_REWRITTEN_BODY_CHARS  # backward compatibility for older helper code
+MAX_ARTICLE_RETRY_ATTEMPTS = 2
+BASE_RETRY_DELAY_MINUTES = 60
+MAX_RETRY_DELAY_MINUTES = 240
+SYSTEM_FAILURE_CODES = {"AUTH_401", "AUTH_403", "CONFIG_MISSING"}
+RETRYABLE_FAILURE_CODES = {
+    "SOURCE_FETCH_TIMEOUT",
+    "SOURCE_FETCH_HTTP_5XX",
+    "IMAGE_FETCH_TIMEOUT",
+    "IMAGE_FETCH_HTTP_5XX",
+    "IMAGE_UPLOAD_TIMEOUT",
+    "IMAGE_UPLOAD_HTTP_5XX",
+    "REWRITE_API_ERROR",
+    "QA_API_ERROR",
+    "PUBLISH_API_ERROR",
+}
 
 DAILY_PUBLISH_LIMIT = 50
 PER_RUN_LIMIT = 15  # 1회 실행당 최대 발행 수
@@ -127,6 +162,27 @@ KEYWORD_CATEGORIES_FALLBACK = {
 }
 DEFAULT_CATEGORY = "사회"
 
+
+@dataclass
+class PipelineFailure(Exception):
+    stage: str
+    code: str
+    message: str
+    retryable: bool = False
+    abort_run: bool = False
+    partial_success: bool = False
+
+    def __post_init__(self):
+        super().__init__(self.message)
+
+
+@dataclass
+class ImageCandidate:
+    url: str
+    caption: Optional[str]
+    source: str
+    score: int = 0
+
 # IJ 카테고리별 기자 매핑 (WP user ID)
 IJ_CATEGORY_AUTHOR = {
     "사회":      2,  # 김민서
@@ -138,9 +194,7 @@ IJ_CATEGORY_AUTHOR = {
     "정치":      8,  # 강현우
 }
 
-# ========================= [2. Gemini / 프롬프트] =========================
-
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+# ========================= [2. Upstage / 프롬프트] =========================
 
 PROMPT_USER_TEMPLATE = """
 # [원문 자료]:
@@ -163,15 +217,66 @@ PERSONA_DEFINITIONS = {
     "CB_": load_skill("news_editor_cb"),
 }
 
-def ask_gemini(persona, text, model=None):
-    use_model = model or GEMINI_MODEL
+def _llm_failure(stage: str, exc: Exception) -> PipelineFailure:
+    status = getattr(exc, "status_code", None)
+    response = getattr(exc, "response", None)
+    if response is not None and not status:
+        status = getattr(response, "status_code", None)
+    message = str(exc)
+    if response is not None:
+        try:
+            message = response.text or message
+        except Exception:
+            pass
+    lowered = message.lower()
+    if status in (401, 403):
+        return PipelineFailure(stage, f"{stage.upper()}_AUTH_{status}", message[:500], retryable=False, abort_run=True)
+    if status in (429, 500, 502, 503, 504) or "rate limit" in lowered or "spending cap" in lowered:
+        return PipelineFailure(stage, f"{stage.upper()}_API_ERROR", message[:500], retryable=True)
+    if "timeout" in lowered or "connection" in lowered or "temporarily unavailable" in lowered:
+        return PipelineFailure(stage, f"{stage.upper()}_API_ERROR", message[:500], retryable=True)
+    return PipelineFailure(stage, f"{stage.upper()}_API_ERROR", message[:500], retryable=False)
+
+def ask_llm(persona, text, model=None, max_output_tokens=None, stage="rewrite"):
+    use_model = model or (UPSTAGE_MODEL_QA if stage == "qa" else UPSTAGE_MODEL_REWRITE)
     user_msg = PROMPT_USER_TEMPLATE.format(original_text=text)
-    response = gemini_client.models.generate_content(
-        model=use_model,
-        contents=user_msg,
-        config=types.GenerateContentConfig(system_instruction=persona),
-    )
-    return response.text.strip()
+    output_tokens = max_output_tokens or (UPSTAGE_QA_MAX_OUTPUT_TOKENS if stage == "qa" else UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS)
+    try:
+        response = requests.post(
+            UPSTAGE_API_URL,
+            headers={
+                "Authorization": f"Bearer {UPSTAGE_API_KEY}",
+                "Content-Type": "application/json",
+                "User-Agent": "erum-news-engine/1.0",
+            },
+            json={
+                "model": use_model,
+                "messages": [
+                    {"role": "system", "content": persona},
+                    {"role": "user", "content": user_msg},
+                ],
+                "temperature": 0.2,
+                "max_tokens": output_tokens,
+            },
+            timeout=120,
+        )
+        response.raise_for_status()
+        data = response.json()
+        choices = data.get("choices") or []
+        if not choices:
+            raise ValueError("Upstage 응답에 choices가 없음")
+        message = choices[0].get("message") or {}
+        content = message.get("content", "")
+        if isinstance(content, list):
+            content = "".join(
+                part.get("text", "") if isinstance(part, dict) else str(part)
+                for part in content
+            )
+        return (content or "").strip()
+    except PipelineFailure:
+        raise
+    except Exception as e:
+        raise _llm_failure(stage, e)
 
 # ========================= [3. DB 연동 (Vultr MariaDB)] =========================
 
@@ -186,21 +291,26 @@ def db_get_existing_ids_and_titles() -> Tuple[set, set]:
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT url_id, title FROM published_articles")
+            cur.execute("SELECT url_id, title FROM published_articles WHERE COALESCE(media, '') <> 'FAILED'")
             rows = cur.fetchall()
         return {r["url_id"] for r in rows}, {r["title"] for r in rows if r["title"]}
     finally:
         conn.close()
 
-def db_record_published(url_id: str, title: str, media: str):
+def db_get_retry_blocked_ids() -> set:
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT IGNORE INTO published_articles (url_id, title, media) VALUES (%s, %s, %s)",
-                (url_id, title[:1000], media),
+                """
+                SELECT url_id
+                FROM article_attempts
+                WHERE status IN ('PERMANENT', 'SYSTEM')
+                   OR (status = 'RETRYABLE' AND next_retry_at IS NOT NULL AND next_retry_at > NOW())
+                """
             )
-        conn.commit()
+            rows = cur.fetchall()
+        return {r["url_id"] for r in rows}
     finally:
         conn.close()
 
@@ -208,8 +318,87 @@ def db_get_today_count() -> int:
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) AS cnt FROM published_articles WHERE DATE(published_at) = CURDATE()")
+            cur.execute("SELECT COUNT(*) AS cnt FROM published_articles WHERE DATE(published_at) = CURDATE() AND COALESCE(media, '') <> 'FAILED'")
             return cur.fetchone()["cnt"]
+    finally:
+        conn.close()
+
+def db_get_attempt_state(url_id: str) -> Optional[dict]:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM article_attempts WHERE url_id = %s", (url_id,))
+            return cur.fetchone()
+    finally:
+        conn.close()
+
+def db_store_attempt_state(
+    url_id: str,
+    title: str,
+    media: str,
+    status: str,
+    stage: Optional[str] = None,
+    code: Optional[str] = None,
+    message: str = "",
+    retry_count: int = 0,
+    next_retry_at: Optional[datetime] = None,
+    partial_success: bool = False,
+):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO article_attempts
+                    (url_id, title, media, status, fail_stage, fail_code, fail_message, retry_count, next_retry_at, partial_success, last_attempt_at)
+                VALUES
+                    (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON DUPLICATE KEY UPDATE
+                    title = VALUES(title),
+                    media = VALUES(media),
+                    status = VALUES(status),
+                    fail_stage = VALUES(fail_stage),
+                    fail_code = VALUES(fail_code),
+                    fail_message = VALUES(fail_message),
+                    retry_count = VALUES(retry_count),
+                    next_retry_at = VALUES(next_retry_at),
+                    partial_success = VALUES(partial_success),
+                    last_attempt_at = NOW(),
+                    updated_at = NOW()
+                """,
+                (
+                    url_id,
+                    title[:1000],
+                    media[:50],
+                    status,
+                    stage[:50] if stage else None,
+                    code[:50] if code else None,
+                    message[:1000],
+                    retry_count,
+                    next_retry_at,
+                    1 if partial_success else 0,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+def db_record_success(url_id: str, title: str, media: str):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO published_articles (url_id, title, media, published_at)
+                VALUES (%s, %s, %s, NOW())
+                ON DUPLICATE KEY UPDATE
+                    title = VALUES(title),
+                    media = VALUES(media),
+                    published_at = VALUES(published_at)
+                """,
+                (url_id, title[:1000], media),
+            )
+        conn.commit()
     finally:
         conn.close()
 
@@ -225,6 +414,25 @@ def db_ensure_table():
                     media VARCHAR(50),
                     published_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE KEY uq_url_id (url_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS article_attempts (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    url_id VARCHAR(512) NOT NULL,
+                    title VARCHAR(1000),
+                    media VARCHAR(50),
+                    status VARCHAR(32) NOT NULL,
+                    fail_stage VARCHAR(50),
+                    fail_code VARCHAR(50),
+                    fail_message TEXT,
+                    retry_count INT NOT NULL DEFAULT 0,
+                    next_retry_at DATETIME DEFAULT NULL,
+                    partial_success TINYINT(1) NOT NULL DEFAULT 0,
+                    last_attempt_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY uq_attempt_url_id (url_id),
+                    KEY idx_attempt_status_retry (status, next_retry_at)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
         conn.commit()
@@ -271,8 +479,10 @@ def validate_content_quality(title, body):
         return False, "제목 누락 또는 너무 짧음"
 
     # 본문 길이
-    if len(body) < 300:
+    if len(body) < MIN_REWRITTEN_BODY_CHARS:
         return False, f"본문 너무 짧음({len(body)}자)"
+    if len(body) > HARD_REWRITTEN_BODY_CHARS:
+        return False, f"본문 너무 김({len(body)}자)"
 
     # 라벨 잔재
     for label in ["제목:", "본문:", "내용:", "카테고리:", "태그:", "Title:", "Body:"]:
@@ -313,14 +523,15 @@ MEDIA_TONE_DESC = {
 QA_SYSTEM_PROMPT = load_skill("qa_checker")
 
 def ai_quality_check(title: str, body: str, media_prefix: str) -> Tuple[bool, List[str], int, Optional[dict]]:
+    media_tone = MEDIA_TONE_DESC.get(media_prefix, "일반 뉴스")
+    system_prompt = QA_SYSTEM_PROMPT.format(media_tone=media_tone)
+    # HTML 태그 제거 후 검수 — qa_checker는 HTML 태그를 포맷 오염으로 즉시 탈락 처리함
+    plain_body = re.sub(r'<[^>]+>', ' ', body).strip()
+    plain_body = re.sub(r'\s+', ' ', plain_body)
+    plain_body = limit_rewritten_body_text(plain_body, QA_INPUT_MAX_CHARS)
+    article_text = f"제목: {title}\n\n본문: {plain_body}"
+    raw = ask_llm(system_prompt, article_text, model=UPSTAGE_MODEL_QA, max_output_tokens=UPSTAGE_QA_MAX_OUTPUT_TOKENS, stage="qa")
     try:
-        media_tone = MEDIA_TONE_DESC.get(media_prefix, "일반 뉴스")
-        system_prompt = QA_SYSTEM_PROMPT.format(media_tone=media_tone)
-        # HTML 태그 제거 후 검수 — qa_checker는 HTML 태그를 포맷 오염으로 즉시 탈락 처리함
-        plain_body = re.sub(r'<[^>]+>', ' ', body).strip()
-        plain_body = re.sub(r'\s+', ' ', plain_body)
-        article_text = f"제목: {title}\n\n본문:\n{plain_body}"
-        raw = ask_gemini(system_prompt, article_text, model=GEMINI_MODEL_QA)
         parts = raw.split("---", 1)
         json_part = parts[0]
         clean = re.sub(r"```json\s*", "", json_part)
@@ -333,17 +544,67 @@ def ai_quality_check(title: str, body: str, media_prefix: str) -> Tuple[bool, Li
             fails = [f"총점 {total}점 미달"]
         fixed = None
         if not passed and len(parts) > 1:
-            fixed = parse_gemini_response(parts[1].strip())
+            fixed = parse_llm_response(parts[1].strip())
         return passed, fails, total, fixed
     except Exception as e:
-        print(f"      ⚠️ [AI검수] 파싱 실패({str(e)[:50]}), 통과 처리")
-        return True, [], 0, None
+        print(f"      ⚠️ [AI검수] 파싱 실패({str(e)[:50]}), 실패 처리")
+        return False, ["AI검수 파싱 실패"], 0, None
+
+def _strip_model_fences(text: str) -> str:
+    if not text:
+        return ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+def _trim_to_sentence_boundary(text: str, max_chars: int) -> str:
+    if not text or len(text) <= max_chars:
+        return text.strip()
+    cutoff = text[:max_chars].rstrip()
+    boundaries = [m.end() for m in re.finditer(r'(?<=[.!?다요])\s+', cutoff)]
+    if boundaries:
+        return cutoff[:boundaries[-1]].strip()
+    last_space = cutoff.rfind(" ")
+    if last_space > int(max_chars * 0.6):
+        return cutoff[:last_space].strip()
+    return cutoff.strip()
+
+def limit_rewritten_body_text(text: str, max_chars: int = SOFT_REWRITTEN_BODY_CHARS) -> str:
+    if not text:
+        return ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if len(text) <= max_chars:
+        return text
+
+    kept_lines = []
+    used = 0
+    for line in [line.strip() for line in text.splitlines()]:
+        if not line:
+            continue
+        if used + len(line) <= max_chars:
+            kept_lines.append(line)
+            used += len(line)
+            continue
+
+        remaining = max_chars - used
+        if remaining > 80:
+            trimmed = _trim_to_sentence_boundary(line, remaining)
+            if trimmed:
+                kept_lines.append(trimmed)
+        break
+
+    if not kept_lines:
+        return _trim_to_sentence_boundary(text, max_chars)
+    return "\n".join(kept_lines).strip()
 
 def clean_body_html(text):
     if not text: return ""
     text = text.replace("본문:", "").replace("본문 :", "").replace("내용:", "").replace("내용 :", "")
     text = text.replace("Body:", "").replace("Body :", "").replace("Title:", "").replace("제목:", "")
     text = re.sub(r'^(본문|Body|내용)[:\s-]*', '', text, flags=re.IGNORECASE).strip()
+    text = limit_rewritten_body_text(text)
     text = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', text)
     text = re.sub(r'^##\s+(.*?)$', r'<h3>\1</h3>', text, flags=re.MULTILINE)
     text = re.sub(r'^###\s+(.*?)$', r'<h4>\1</h4>', text, flags=re.MULTILINE)
@@ -358,32 +619,60 @@ def clean_body_html(text):
             formatted_lines.append(f"<p>{line}</p>")
     return "".join(formatted_lines)
 
-def parse_gemini_response(text):
-    text = re.sub(r"```.*?```", "", text, flags=re.DOTALL).strip()
-    title_m = re.search(r"(?:제목|Title|헤드라인)[:\s]\s*(.*)", text, re.IGNORECASE)
-    if title_m:
-        title = title_m.group(1).strip()
-    else:
-        title = text.split('\n')[0].strip()
-    title = re.sub(r"[#\*\[\]]", "", title).strip().strip('"')
-    excerpt_m = re.search(r"(?:리드문|Excerpt|요약)[:\s]\s*(.*)", text, re.IGNORECASE)
-    excerpt = re.sub(r"[#\*\[\]]", "", excerpt_m.group(1).strip()).strip() if excerpt_m else ""
+def parse_llm_response(text):
+    text = _strip_model_fences(text)
+    lines = [line.rstrip() for line in text.splitlines()]
+    title = ""
+    excerpt = ""
+    cat = ""
+    tags = []
+    body_lines: List[str] = []
+    current = None
+    label_re = re.compile(r'^(제목|Title|헤드라인|리드문|Excerpt|요약|본문|Body|내용|카테고리|Category|태그|Tags)\s*[:：]\s*(.*)$', re.IGNORECASE)
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        m = label_re.match(line)
+        if m:
+            label = m.group(1).lower()
+            value = m.group(2).strip()
+            if label in ("제목", "title", "헤드라인"):
+                title = value
+                current = "title"
+            elif label in ("리드문", "excerpt", "요약"):
+                excerpt = value
+                current = "excerpt"
+            elif label in ("본문", "body", "내용"):
+                current = "body"
+                if value:
+                    body_lines.append(value)
+            elif label in ("카테고리", "category"):
+                cat = value
+                current = "cat"
+            elif label in ("태그", "tags"):
+                current = "tags"
+                if value:
+                    tags = [t.strip() for t in re.split(r'[,/]', value) if t.strip()]
+            continue
+        if current == "body":
+            body_lines.append(line)
+        elif current == "title" and not title:
+            title = line
+        elif current == "excerpt" and not excerpt:
+            excerpt = line
+        elif current == "cat" and not cat:
+            cat = line
+        elif current == "tags" and not tags:
+            tags = [t.strip() for t in re.split(r'[,/]', line) if t.strip()]
+
+    if not title and lines:
+        title = lines[0].strip()
+    title = re.sub(r"[#\*\[\]`]", "", title).strip().strip('"')
+    excerpt = re.sub(r"[#\*\[\]`]", "", excerpt).strip()
     excerpt = html.unescape(excerpt) if excerpt else ""
-    cat_m = re.search(r"(?:카테고리|Category)[:\s]\s*(.*)", text, re.IGNORECASE)
-    tag_m = re.search(r"(?:태그|Tags)[:\s]\s*(.*)", text, re.IGNORECASE)
-    cat = cat_m.group(1).strip() if cat_m else ""
-    tags = [t.strip() for t in tag_m.group(1).split(',')] if tag_m else []
-    body_raw = text
-    if title_m:
-        body_raw = body_raw.replace(title_m.group(0), "", 1)
-    else:
-        body_raw = body_raw.replace(title, "", 1)
-    if excerpt_m:
-        body_raw = body_raw.replace(excerpt_m.group(0), "", 1)
-    if cat_m:
-        body_raw = body_raw.split(cat_m.group(0))[0]
-    elif tag_m:
-        body_raw = body_raw.split(tag_m.group(0))[0]
+    body_raw = limit_rewritten_body_text("\n".join(body_lines).strip())
     final_body = clean_body_html(body_raw)
     # 리드문이 비어 있으면 본문 첫 2문장으로 자동 생성
     if not excerpt and final_body:
@@ -467,10 +756,15 @@ class Site:
             return result.get("id"), result.get("source_url")
         except Exception as e:
             err_msg = str(e)
+            status = getattr(getattr(e, "response", None), "status_code", 0)
             if hasattr(e, 'response') and e.response is not None:
-                err_msg = e.response.text
+                err_msg = e.response.text or err_msg
             print(f"\n      ❌ [이미지 업로드 에러]: {err_msg[:200]}")
-            return None, None
+            if status in (401, 403):
+                raise PipelineFailure("publish", f"IMAGE_UPLOAD_HTTP_{status}", err_msg[:200], retryable=False, abort_run=True)
+            if status in (429, 500, 502, 503, 504):
+                raise PipelineFailure("publish", f"IMAGE_UPLOAD_HTTP_{status}", err_msg[:200], retryable=True)
+            raise PipelineFailure("publish", "IMAGE_UPLOAD_ERROR", err_msg[:200], retryable=True)
 
     def create_post(self, title, body, cat, tags, mid=None, excerpt="", author=None):
         d = {"title": title, "content": body, "status": "publish", "categories": [cat] if cat else [], "tags": tags}
@@ -612,17 +906,177 @@ REQUEST_HEADERS = {
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
-def fetch_with_retry(url, max_retries=2, timeout=15, stream=False):
+def fetch_with_retry(url, max_retries=2, timeout=15, stream=False, retry_statuses=(429, 500, 502, 503, 504)):
+    last_response = None
     for attempt in range(max_retries + 1):
         try:
             r = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout, stream=stream)
+            last_response = r
+            if r.status_code in retry_statuses and attempt < max_retries:
+                time.sleep(1 + attempt)
+                continue
             return r
         except (requests.exceptions.ConnectionError, ConnectionResetError):
             if attempt < max_retries:
                 time.sleep(1 + attempt)
                 continue
-            raise
-    return None
+            return None
+    return last_response
+
+def _is_blocked_image_url(url: str) -> bool:
+    if not url:
+        return True
+    lowered = url.lower()
+    return any(x in lowered for x in BLOCKED_IMAGE_PATTERNS)
+
+def _caption_from_img(img) -> str:
+    caption_text = ""
+    node = img.parent
+    for _ in range(3):
+        if not node:
+            break
+        fig = node.find("figcaption")
+        if fig:
+            caption_text = fig.get_text(strip=True)
+            break
+        node = node.parent
+
+    if not caption_text:
+        for sib in img.next_siblings:
+            if hasattr(sib, "get_text"):
+                caption_text = sib.get_text(strip=True)[:200]
+            elif isinstance(sib, str) and sib.strip():
+                caption_text = sib.strip()[:200]
+            if caption_text:
+                break
+
+    alt = img.get("alt", "") or ""
+    if CONTACT_ALT_RE.search(alt):
+        return caption_text
+    if alt and "무단전재" not in alt and "재배포" not in alt:
+        caption_text = caption_text or alt
+    if "무단전재" in caption_text or "재배포" in caption_text:
+        return ""
+    clean_cap = re.sub(r"\s*\d{4}\.\d{1,2}\.\d{1,2}\s*", " ", caption_text)
+    clean_cap = re.sub(r"\s{2,}", " ", clean_cap).strip()
+    return clean_cap if len(clean_cap) >= 8 else ""
+
+def _pick_best_srcset_url(srcset: str) -> Optional[str]:
+    if not srcset:
+        return None
+    best_url = None
+    best_score = -1
+    for chunk in srcset.split(","):
+        part = chunk.strip()
+        if not part:
+            continue
+        tokens = part.split()
+        url = tokens[0]
+        score = 0
+        if len(tokens) > 1:
+            m = re.match(r"(\d+)(w|x)?", tokens[1])
+            if m:
+                score = int(m.group(1))
+        if score >= best_score:
+            best_score = score
+            best_url = url
+    return best_url
+
+def _add_image_candidate(candidates: list, seen: set, url: str, caption: str, source: str, score: int, base_url: str = ""):
+    if not url:
+        return
+    full_url = urljoin(base_url, url) if base_url else url
+    full_url = fix_newswire_url(full_url)
+    if len(full_url) < 10 or _is_blocked_image_url(full_url):
+        return
+    key = full_url.split("?")[0]
+    if key in seen:
+        return
+    seen.add(key)
+    candidates.append(ImageCandidate(url=full_url, caption=caption or None, source=source, score=score))
+
+def _collect_candidates_from_img_tag(candidates: list, seen: set, img, base_url: str, source: str, base_score: int):
+    caption = _caption_from_img(img)
+    attr_urls = []
+    for attr in ("src", "data-src", "data-original", "data-lazy-src", "data-url"):
+        val = img.get(attr, "")
+        if val:
+            attr_urls.append(val)
+    for attr in ("srcset", "data-srcset"):
+        best = _pick_best_srcset_url(img.get(attr, ""))
+        if best:
+            attr_urls.append(best)
+    for idx, url in enumerate(attr_urls):
+        score = base_score - (idx * 4)
+        if caption:
+            score += 6
+        _add_image_candidate(candidates, seen, url, caption, source, score, base_url)
+
+def _extract_candidates_from_html(html: str, base_url: str, source: str) -> list:
+    candidates = []
+    seen = set()
+    if not html:
+        return candidates
+    try:
+        soup = BeautifulSoup(html, 'html.parser')
+        meta_selectors = [
+            ('meta[property="og:image"]', 95),
+            ('meta[property="og:image:secure_url"]', 94),
+            ('meta[name="twitter:image"]', 92),
+            ('meta[name="twitter:image:src"]', 92),
+            ('meta[itemprop="image"]', 90),
+        ]
+        for selector, score in meta_selectors:
+            tag = soup.select_one(selector)
+            if tag and tag.get('content'):
+                _add_image_candidate(candidates, seen, tag.get('content', ''), None, f"{source}:meta", score, base_url)
+
+        article_nodes = [
+            soup.select_one('.view_cont'),
+            soup.select_one('.article-content'),
+            soup.select_one('#articleBody'),
+            soup.select_one('article'),
+            soup.select_one('.article-body'),
+            soup.select_one('.news_view'),
+            soup.select_one('.content'),
+        ]
+        article_nodes = [node for node in article_nodes if node]
+        if not article_nodes:
+            article_nodes = [soup]
+
+        for node in article_nodes:
+            for img in node.select('img'):
+                _collect_candidates_from_img_tag(candidates, seen, img, base_url, f"{source}:img", 84)
+
+        for script in soup.select('script[type="application/ld+json"]'):
+            raw = script.get_text(strip=True)
+            if not raw:
+                continue
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                continue
+
+            def _walk(value):
+                if isinstance(value, dict):
+                    for k, v in value.items():
+                        if k == "image":
+                            if isinstance(v, str):
+                                _add_image_candidate(candidates, seen, v, None, f"{source}:jsonld", 88, base_url)
+                            elif isinstance(v, list):
+                                for item in v:
+                                    if isinstance(item, str):
+                                        _add_image_candidate(candidates, seen, item, None, f"{source}:jsonld", 88, base_url)
+                        else:
+                            _walk(v)
+                elif isinstance(value, list):
+                    for item in value:
+                        _walk(item)
+
+            _walk(payload)
+    except Exception:
+        pass
+    return candidates
 
 def is_valid_image(url):
     if not url: return False
@@ -649,139 +1103,153 @@ def fix_newswire_url(url: str) -> str:
 
 def extract_image_from_html(html: str, base_url: str = "") -> Tuple[Optional[str], Optional[str]]:
     """HTML 문자열에서 이미지를 추출 (RSS summary용)"""
-    if not html: return None, None
-    try:
-        soup = BeautifulSoup(html, 'html.parser')
-        for img in soup.select('img'):
-            src = img.get('src', '')
-            if len(src) < 10: continue
-            if any(x in src.lower() for x in BLOCKED_IMAGE_PATTERNS): continue
-            alt = img.get('alt', '')
-            if alt:
-                if CONTACT_ALT_RE.search(alt): continue
-                if "무단전재" in alt or "재배포" in alt: src = ""
-            if not src: continue
-            # figcaption 탐색: img → 부모 최대 3단계까지 올라가며 figure 내 figcaption 탐색
-            caption_text = ""
-            node = img.parent
-            fig = None
-            for _ in range(3):
-                if not node: break
-                fig = node.find('figcaption')
-                if fig: break
-                node = node.parent
-            if fig:
-                caption_text = fig.get_text(strip=True)
-            else:
-                for sib in img.next_siblings:
-                    if hasattr(sib, 'get_text'):
-                        caption_text = sib.get_text(strip=True)[:200]
-                    elif isinstance(sib, str) and sib.strip():
-                        caption_text = sib.strip()[:200]
-                    if caption_text: break
-            if "무단전재" in caption_text or "재배포" in caption_text:
-                continue
-            full_url = urljoin(base_url, src) if base_url else src
-            # figcaption 우선, 없으면 alt
-            final_cap = caption_text or alt or None
-            return fix_newswire_url(full_url), final_cap
-    except:
-        pass
-    return None, None
+    candidates = _extract_candidates_from_html(html, base_url, "rss")
+    if not candidates:
+        return None, None
+    best = max(candidates, key=lambda c: c.score)
+    return best.url, best.caption
 
 def extract_image_with_caption(url: str) -> Tuple[Optional[str], Optional[str]]:
     try:
         r = fetch_with_retry(url, timeout=15)
-        if not r or r.status_code != 200: return None, None
-        soup = BeautifulSoup(r.text, 'html.parser')
-        candidates = []
-        if 'newswire.co.kr' in url:
-            wrappers = soup.select('.image-wrap, .view_img, .news-photo')
-            for w in wrappers:
-                img = w.select_one('img')
-                if img:
-                    cap_tag = w.select_one('.caption') or w.select_one('p')
-                    cap_text = img.get('alt') or (cap_tag.get_text(strip=True) if cap_tag else "")
-                    candidates.append((img, cap_text))
-
-        if 'korea.kr' in url:
-            for img in soup.select('img'):
-                src = img.get('src', '')
-                if 'newsWeb/resources/attaches' in src:
-                    # figcaption 탐색: img → 최대 3단계 위까지
-                    fig_cap = ""
-                    node = img.parent
-                    for _ in range(3):
-                        if not node: break
-                        fig = node.find('figcaption')
-                        if fig:
-                            fig_cap = fig.get_text(strip=True)
-                            break
-                        node = node.parent
-                    candidates.append((img, fig_cap or img.get('alt', '')))
-
-        article = soup.select_one('.view_cont') or soup.select_one('.article-content') or soup.select_one('#articleBody') or soup.select_one('article')
-        if article:
-            for img in article.select('img'):
-                candidates.append((img, img.get('alt', '')))
-
-        for img, cap in candidates:
-            src = img.get('src', '')
-            if len(src) < 10 or any(x in src.lower() for x in BLOCKED_IMAGE_PATTERNS): continue
-            is_risky = False
-            if cap:
-                if CONTACT_ALT_RE.search(cap): continue
-                if "무단전재" in cap or "재배포" in cap: continue
-                clean_cap = re.sub(r'\s*\d{4}\.\d{1,2}\.\d{1,2}\s*', ' ', cap)  # 날짜만 제거, 출처(사진=...) 유지
-                clean_cap = re.sub(r'\s{2,}', ' ', clean_cap).strip()
-                if len(clean_cap) < 8:
-                    clean_cap = None
-            else:
-                clean_cap = None
-            if src: return fix_newswire_url(urljoin(url, src)), clean_cap
-
-        og = soup.select_one('meta[property="og:image"]')
-        if og and og.get('content'):
-            og_url = og.get('content')
-            if not any(x in og_url.lower() for x in BLOCKED_IMAGE_PATTERNS):
-                return fix_newswire_url(og_url), None
-        return None, None
+        if not r or r.status_code != 200:
+            return None, None
+        candidates = _extract_candidates_from_html(r.text, url, "page")
+        if not candidates:
+            return None, None
+        best = max(candidates, key=lambda c: c.score)
+        return best.url, best.caption
     except:
         return None, None
 
 def find_best_image(article):
     rss_img = article.get("image", "").strip()
     rss_body = article.get("body", "")
-    # 1순위: RSS media_content 이미지 — URL 패턴 체크만 (이미지 alt/캡션 저작권 체크는 2·3순위에서 처리)
-    if rss_img:
-        if not any(b in rss_img for b in BLOCKED_IMAGE_PATTERNS):
-            return fix_newswire_url(rss_img), None
-        else:
-            print(f" [1순위 블록:{rss_img[:50]}]", end="")
+    link = article.get("url", "").strip()
+    candidates: list[ImageCandidate] = []
+    seen = set()
+    page_retryable = False
+
+    # 1순위: RSS media_content 이미지
+    if rss_img and not _is_blocked_image_url(rss_img):
+        _add_image_candidate(candidates, seen, rss_img, None, "rss:media", 100, "")
+    elif rss_img:
+        print(f" [1순위 블록:{rss_img[:50]}]", end="")
     else:
         print(f" [1순위:RSS이미지없음]", end="")
-    # 2순위: RSS summary/body HTML에 포함된 <img> 태그 (캡션 copyright 체크 포함)
+
+    # 2순위: RSS summary/body HTML에 포함된 이미지 후보
     if rss_body and "<img" in rss_body.lower():
-        hi, hc = extract_image_from_html(rss_body, article.get("url", ""))
-        if hi and not any(b in hi for b in BLOCKED_IMAGE_PATTERNS):
-            return hi, hc
-        else:
-            print(f" [2순위 실패]", end="")
+        candidates.extend(_extract_candidates_from_html(rss_body, article.get("url", ""), "rss"))
     else:
         print(f" [2순위:body img없음]", end="")
-    # 3순위: 기사 페이지 직접 접속하여 이미지 추출
-    link = article.get("url", "").strip()
+
+    # 3순위: 기사 페이지 직접 접속하여 이미지 후보를 더 수집
     if link:
-        li, lc = extract_image_with_caption(link)
-        if li and not any(b in li for b in BLOCKED_IMAGE_PATTERNS):
-            return li, lc
-        else:
-            print(f" [3순위 실패:{str(li)[:50]}]", end="")
-    return None, None
+        try:
+            r = fetch_with_retry(link, timeout=15)
+            if r and r.status_code == 200:
+                candidates.extend(_extract_candidates_from_html(r.text, link, "page"))
+            elif not r:
+                page_retryable = True
+                print(f" [3순위 네트워크실패]", end="")
+            elif r and r.status_code in (401, 403):
+                print(f" [3순위 차단:{r.status_code}]", end="")
+            elif r and r.status_code in (429, 500, 502, 503, 504):
+                page_retryable = True
+                print(f" [3순위 서버오류:{r.status_code}]", end="")
+            else:
+                print(f" [3순위 실패:{getattr(r, 'status_code', 'none')}]", end="")
+        except Exception:
+            page_retryable = True
+            print(f" [3순위 예외]", end="")
+
+    if not candidates:
+        if page_retryable:
+            raise PipelineFailure("image", "SOURCE_FETCH_HTTP_5XX", "기사 본문 조회 실패", retryable=True)
+        return []
+
+    candidates = sorted(candidates, key=lambda c: c.score, reverse=True)
+    unique = []
+    seen_urls = set()
+    for cand in candidates:
+        key = cand.url.split("?")[0]
+        if key in seen_urls:
+            continue
+        seen_urls.add(key)
+        unique.append(cand)
+    return unique
+
+def download_best_image(candidates: list[ImageCandidate]) -> Tuple[bytes, str, str, Optional[str], str]:
+    retryable_seen = False
+    blocked_seen = False
+    for cand in candidates:
+        try:
+            if _is_blocked_image_url(cand.url):
+                blocked_seen = True
+                continue
+
+            is_korea_kr = 'korea.kr/newsWeb/resources/attaches' in cand.url
+            if is_korea_kr:
+                kr_headers = dict(REQUEST_HEADERS)
+                kr_headers['Referer'] = 'https://www.korea.kr/'
+                img_resp = requests.get(cand.url, headers=kr_headers, timeout=20)
+            else:
+                img_resp = fetch_with_retry(cand.url, timeout=20, stream=True)
+
+            if not img_resp:
+                retryable_seen = True
+                continue
+            if img_resp.status_code in (401, 403):
+                blocked_seen = True
+                continue
+            if img_resp.status_code in (429, 500, 502, 503, 504):
+                retryable_seen = True
+                continue
+            if img_resp.status_code != 200:
+                continue
+
+            ct = img_resp.headers.get("content-type", "")
+            if 'image' not in ct.lower() and 'octet-stream' not in ct.lower():
+                continue
+
+            candidate_bytes = img_resp.content
+            if len(candidate_bytes) < MIN_IMAGE_BYTES:
+                continue
+
+            filename = re.sub(r'[^\w\.-]', '', cand.url.split("/")[-1].split("?")[0])[-50:]
+            if not filename:
+                filename = f"img_{hash(cand.url) & 0xFFFFFF:06x}.jpg"
+            return candidate_bytes, ct if 'image' in ct.lower() else "image/jpeg", filename, cand.caption, cand.url
+        except Exception:
+            retryable_seen = True
+            continue
+
+    if retryable_seen:
+        raise PipelineFailure("image", "IMAGE_FETCH_HTTP_5XX", "이미지 다운로드 실패", retryable=True)
+    raise PipelineFailure("image", "NO_USABLE_IMAGE", "사용 가능한 이미지 없음", retryable=False)
+
+def classify_attempt_state(failure: PipelineFailure, prior_state: Optional[dict] = None) -> Tuple[str, int, Optional[datetime]]:
+    prior_retry_count = int((prior_state or {}).get("retry_count") or 0)
+    retry_count = prior_retry_count + 1
+
+    if failure.abort_run or failure.code in SYSTEM_FAILURE_CODES:
+        return "SYSTEM", retry_count, None
+
+    if failure.partial_success:
+        return "PERMANENT", retry_count, None
+
+    if failure.code in RETRYABLE_FAILURE_CODES or failure.retryable:
+        if retry_count >= MAX_ARTICLE_RETRY_ATTEMPTS:
+            return "PERMANENT", retry_count, None
+        delay_minutes = min(MAX_RETRY_DELAY_MINUTES, BASE_RETRY_DELAY_MINUTES * (2 ** (retry_count - 1)))
+        return "RETRYABLE", retry_count, datetime.now() + timedelta(minutes=delay_minutes)
+
+    return "PERMANENT", retry_count, None
 
 # ========================= [8. 메인 파이프라인] =========================
 
-def collect_articles(ex_ids: set, ex_titles: set, limit: int) -> list:
+def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int) -> list:
     """RSS에서 기사를 수집하여 리스트로 반환 (시트 없이 메모리에서 직접 처리)"""
     today = datetime.now().date()
     current_hour = datetime.now().hour
@@ -793,6 +1261,9 @@ def collect_articles(ex_ids: set, ex_titles: set, limit: int) -> list:
         count = 0
         try:
             resp = fetch_with_retry(url, timeout=20)
+            if not resp or resp.status_code != 200:
+                print(f" 오류(HTTP {getattr(resp, 'status_code', 'none')})")
+                return 0
             resp.encoding = 'utf-8'
             f = feedparser.parse(resp.text)
             for e in f.entries:
@@ -800,6 +1271,7 @@ def collect_articles(ex_ids: set, ex_titles: set, limit: int) -> list:
                 if not hasattr(e, 'link'): continue
                 curr_id = extract_unique_id(e.link)
                 if curr_id in ex_ids: continue
+                if curr_id in blocked_ids: continue
                 if not is_mainly_korean(e.title, threshold=0.5): continue
                 if is_semantic_duplicate(e.title, ex_titles, threshold=0.9): continue
                 dt = e.get('published_parsed') or e.get('updated_parsed')
@@ -859,96 +1331,41 @@ def collect_articles(ex_ids: set, ex_titles: set, limit: int) -> list:
 
 
 def process_article(article: dict, upload_counts: dict) -> str:
-    """기사 1건을 3개 매체에 재작성 + WP 발행.
-    반환값: 'success' | 'skip' (이미지·QA 실패 등 재시도 가능) | 'failed' (Gemini 후 발행 실패)
-    """
+    """기사 1건을 3개 매체에 재작성 + 발행."""
     print(f"\n▶ 기사 처리 시작: {article['title'][:40]}...")
 
     # 이미지 확인
     print(f"   🔎 이미지 탐색 중...", end="", flush=True)
-    best_img, best_cap = find_best_image(article)
-    if not best_img:
-        print(" 실패 (이미지 없음/저작권). Skip.")
-        return 'skip'
+    image_candidates = find_best_image(article)
+    if not image_candidates:
+        print(" 실패 (이미지 없음/저작권).")
+        raise PipelineFailure("image", "NO_USABLE_IMAGE", "이미지 후보 없음", retryable=False)
     print(f" 찾음.")
 
-    # 이미지 다운로드 + 크기검증 (Gemini 호출 전에 수행하여 불필요한 API 비용 방지)
-    # is_valid_image 별도 호출 제거 — 아래 다운로드 루프에서 크기/타입 검증을 이미 수행
     print(f"   📥 이미지 다운로드 중...", end="", flush=True)
-    img_bytes = None
-    img_content_type = "image/jpeg"
-    fn = "image.jpg"
+    img_bytes, img_content_type, fn, best_cap, best_img = download_best_image(image_candidates)
+    print(f" 완료 ({len(img_bytes)//1024}KB).")
 
-    # 이미지 후보 목록: best_img 먼저, 실패 시 fallback
-    img_candidates = [best_img]
-    # korea.kr 이미지인 경우 og:image를 fallback으로 추가
-    if 'korea.kr' in best_img:
-        try:
-            og_r = fetch_with_retry(article.get("url", ""), timeout=10)
-            if og_r and og_r.status_code == 200:
-                og_soup = BeautifulSoup(og_r.text, 'html.parser')
-                og_tag = og_soup.select_one('meta[property="og:image"]')
-                if og_tag and og_tag.get('content'):
-                    og_url = og_tag['content']
-                    if og_url != best_img and not any(x in og_url.lower() for x in BLOCKED_IMAGE_PATTERNS):
-                        img_candidates.append(og_url)
-                        print(f" [fallback 준비]", end="")
-        except:
-            pass
-
-    for img_url in img_candidates:
-        try:
-            is_korea_kr = 'korea.kr/newsWeb/resources/attaches' in img_url
-            if is_korea_kr:
-                kr_headers = dict(REQUEST_HEADERS)
-                kr_headers['Referer'] = 'https://www.korea.kr/'
-                img_resp = requests.get(img_url, headers=kr_headers, timeout=20)
-            else:
-                img_resp = fetch_with_retry(img_url, timeout=20)
-            if not img_resp or img_resp.status_code != 200:
-                print(f" [HTTP실패]", end="")
-                continue
-
-            # Content-Type 검증
-            ct = img_resp.headers.get("content-type", "")
-            if 'image' not in ct.lower() and 'octet-stream' not in ct.lower():
-                print(f" [비이미지 응답: {ct[:30]}]", end="")
-                continue
-
-            candidate_bytes = img_resp.content
-            # 크기 검증 (korea.kr 포함 모든 소스에 적용)
-            if len(candidate_bytes) < MIN_IMAGE_BYTES:
-                print(f" [크기미달 {len(candidate_bytes)//1024}KB]", end="")
-                continue
-
-            img_bytes = candidate_bytes
-            img_content_type = ct if 'image' in ct.lower() else "image/jpeg"
-            fn = re.sub(r'[^\w\.-]', '', img_url.split("/")[-1].split("?")[0])[-50:]
-            if not fn: fn = f"img_{hash(img_url) & 0xFFFFFF:06x}.jpg"
-            print(f" 완료 ({len(img_bytes)//1024}KB).")
-            break
-        except Exception as e:
-            print(f" [에러:{str(e)[:40]}]", end="")
-            continue
-
-    if not img_bytes:
-        print(" 모든 소스 실패. Skip.")
-        return 'skip'
-
-    # 매체별 재작성 + 발행
     rewritten = {}
     for prefix in MEDIA_PREFIXES:
-        print(f"      ✍️ [{prefix}] Gemini 기사 작성 중...", end="", flush=True)
+        print(f"      ✍️ [{prefix}] Solar Pro 3 기사 작성 중...", end="", flush=True)
         try:
-            res = ask_gemini(PERSONA_DEFINITIONS[prefix], strip_html_tags(article["body"])[:10000])
-            p = parse_gemini_response(res)
+            source_text = strip_html_tags(article["body"])[:REWRITE_SOURCE_MAX_CHARS]
+            res = ask_llm(
+                PERSONA_DEFINITIONS[prefix],
+                source_text,
+                model=UPSTAGE_MODEL_REWRITE,
+                max_output_tokens=UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS,
+                stage="rewrite",
+            )
+            p = parse_llm_response(res)
             is_valid, msg = validate_content_quality(p['title'], p['body'])
             if not is_valid:
-                raise Exception(f"QA탈락: {msg}")
+                raise PipelineFailure("rewrite", "REWRITE_VALIDATION_FAIL", msg, retryable=False)
 
-            # AI 품질검수+보완 (Flash 1회)
+            # AI 품질검수+보완 (Solar Pro 3 1회)
             print(" 작성완료.", flush=True)
-            print(f"      🔍 [{prefix}] Flash 품질검수 중...", end="", flush=True)
+            print(f"      🔍 [{prefix}] Solar Pro 3 품질검수 중...", end="", flush=True)
             passed, fails, score, fixed = ai_quality_check(p['title'], p['body'], prefix)
 
             if not passed:
@@ -957,28 +1374,28 @@ def process_article(article: dict, upload_counts: dict) -> str:
                     print(f"      🔧 [{prefix}] 자동보완 적용...", end="", flush=True)
                     is_valid, msg = validate_content_quality(fixed['title'], fixed['body'])
                     if not is_valid:
-                        raise Exception(f"보완 후 룰QA탈락: {msg}")
+                        raise PipelineFailure("qa", "QA_FIXED_VALIDATION_FAIL", msg, retryable=False)
                     p = fixed
                     print(f" 완료.")
                 else:
-                    raise Exception(f"AI검수 최종미달(점수:{score})")
+                    raise PipelineFailure("qa", "QA_HARD_FAIL", f"AI검수 최종미달(점수:{score})", retryable=False)
             else:
                 print(f" {score}점 통과.")
 
             cat, tags = get_hybrid_meta(p['title'], p['body'], p['cat'], p['tags'])
             rewritten[prefix] = {"title": p['title'], "excerpt": p.get('excerpt', ''), "body": p['body'], "cat": cat, "tags": tags}
 
+        except PipelineFailure:
+            raise
         except Exception as e:
-            print(f" 실패({str(e)[:100]}).")
-            rewritten[prefix] = None
+            raise PipelineFailure("rewrite", "REWRITE_API_ERROR", str(e), retryable=True)
 
-    # WP 발행
-    all_success = True
+    # 발행 단계: 한 매체라도 실패하면 더 진행하지 않고 즉시 실패 처리
+    published_prefixes = 0
     for prefix in MEDIA_PREFIXES:
         rw = rewritten.get(prefix)
         if not rw:
-            all_success = False
-            continue
+            raise PipelineFailure("publish", "PUBLISH_STATE_MISSING", f"{prefix} 재작성 결과 없음", retryable=False)
         is_erum = prefix in ERUM_CFG
         print(f"      🚀 [{prefix}] {'erum API' if is_erum else '워드프레스'} 발행 중...", end="", flush=True)
         try:
@@ -990,21 +1407,30 @@ def process_article(article: dict, upload_counts: dict) -> str:
             else:
                 mid, _ = site.upload_image_bytes(img_bytes, fn, img_content_type, rw["title"], best_cap)
                 if not mid:
-                    raise Exception("Img Upload Fail")
+                    raise PipelineFailure("publish", "IMAGE_UPLOAD_FAIL", "이미지 업로드 실패", retryable=True)
             pid = site.create_post(rw["title"], rw["body"], site.get_cat_id(rw["cat"]), site.get_tag_ids(rw["tags"]), mid, excerpt=rw.get("excerpt", ""))
             upload_counts[prefix] += 1
+            published_prefixes += 1
             print(f" 성공 (ID:{pid}).")
             submit_sitemap_to_gsc(prefix)
             time.sleep(1)
+        except PipelineFailure as e:
+            if published_prefixes > 0:
+                e.partial_success = True
+            raise
+        except requests.HTTPError as e:
+            status = getattr(getattr(e, "response", None), "status_code", 0)
+            abort_run = status in (401, 403)
+            retryable = status in (429, 500, 502, 503, 504)
+            raise PipelineFailure("publish", f"PUBLISH_HTTP_{status or 'ERROR'}", str(e), retryable=retryable, abort_run=abort_run, partial_success=published_prefixes > 0)
         except Exception as e:
-            print(f" 실패({str(e)[:100]}).")
-            all_success = False
+            raise PipelineFailure("publish", "PUBLISH_RUNTIME_ERROR", str(e), retryable=published_prefixes == 0, partial_success=published_prefixes > 0)
 
-    return 'success' if all_success else 'failed'
+    return 'success'
 
 
 def run():
-    print(f"\n🚀 AI 뉴스 엔진 (v24.0-GitHub_Actions) 가동: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"\n🚀 AI 뉴스 엔진 (v25.0-Upstage_SolarPro3) 가동: {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
     # 테이블 자동 생성 (없을 경우)
     db_ensure_table()
@@ -1025,7 +1451,8 @@ def run():
 
     # RSS 수집
     print("   ⬇️ 신규 기사 수집(RSS) 시작...")
-    articles = collect_articles(ex_ids, ex_titles, remaining)
+    blocked_ids = db_get_retry_blocked_ids()
+    articles = collect_articles(ex_ids, ex_titles, blocked_ids, remaining)
 
     if not articles:
         print("👍 신규 기사 없음. 종료.")
@@ -1036,18 +1463,53 @@ def run():
     # 기사 처리
     upload_counts = {p: 0 for p in MEDIA_PREFIXES}
     published = 0
-
     for article in articles:
         if published >= remaining:
             break
-        result = process_article(article, upload_counts)
-        if result == 'success':
-            db_record_published(article["url_id"], article["title"], "ALL")
-            published += 1
-            print(f"   🎉 발행 완료! (금일 누적: {today_count + published}건)")
-        else:
-            # 이미지 실패·발행 실패 모두 DB 기록 → 같은 날 동일 기사 반복 처리 방지
-            db_record_published(article["url_id"], article["title"], "FAILED")
+        try:
+            result = process_article(article, upload_counts)
+            if result == 'success':
+                db_record_success(article["url_id"], article["title"], "ALL")
+                db_store_attempt_state(
+                    article["url_id"],
+                    article["title"],
+                    "ALL",
+                    "SUCCESS",
+                    retry_count=0,
+                )
+                published += 1
+                print(f"   🎉 발행 완료! (금일 누적: {today_count + published}건)")
+        except PipelineFailure as failure:
+            status, retry_count, next_retry_at = classify_attempt_state(failure, db_get_attempt_state(article["url_id"]))
+            db_store_attempt_state(
+                article["url_id"],
+                article["title"],
+                "FAILED",
+                status,
+                stage=failure.stage,
+                code=failure.code,
+                message=failure.message,
+                retry_count=retry_count,
+                next_retry_at=next_retry_at,
+                partial_success=failure.partial_success,
+            )
+            if failure.abort_run:
+                raise
+        except Exception as e:
+            failure = PipelineFailure("run", "UNHANDLED_EXCEPTION", str(e), retryable=False)
+            status, retry_count, next_retry_at = classify_attempt_state(failure, db_get_attempt_state(article["url_id"]))
+            db_store_attempt_state(
+                article["url_id"],
+                article["title"],
+                "FAILED",
+                status,
+                stage=failure.stage,
+                code=failure.code,
+                message=failure.message,
+                retry_count=retry_count,
+                next_retry_at=next_retry_at,
+                partial_success=False,
+            )
 
     # 결과 요약
     print(f"\n--- 실행 완료: {time.strftime('%H:%M:%S')} ---")
@@ -1060,4 +1522,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-
