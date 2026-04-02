@@ -1557,6 +1557,8 @@ def process_article(article: dict, upload_counts: dict) -> str:
     print(f" 완료 ({len(img_bytes)//1024}KB).")
 
     rewritten = {}
+    published_prefixes = []
+    failures: List[PipelineFailure] = []
     for prefix in MEDIA_PREFIXES:
         print(f"      ✍️ [{prefix}] Solar Pro 3 기사 작성 중...", end="", flush=True)
         try:
@@ -1593,59 +1595,78 @@ def process_article(article: dict, upload_counts: dict) -> str:
                 print(f" {score}점 통과.")
 
             cat, tags = get_hybrid_meta(p['title'], p['body'], p['cat'], p['tags'])
-            rewritten[prefix] = {"title": p['title'], "excerpt": p.get('excerpt', ''), "body": p['body'], "cat": cat, "tags": tags}
+            rw = {"title": p['title'], "excerpt": p.get('excerpt', ''), "body": p['body'], "cat": cat, "tags": tags}
+            rewritten[prefix] = rw
 
-        except PipelineFailure:
-            raise
-        except Exception as e:
-            raise PipelineFailure("rewrite", "REWRITE_API_ERROR", str(e), retryable=True)
+            # 발행 단계: 매체별로 독립 실행
+            try:
+                is_erum = prefix in ERUM_CFG
+                print(f"      🚀 [{prefix}] {'erum API' if is_erum else '워드프레스'} 발행 중...", end="", flush=True)
+                site = SITES[prefix]
+                if is_erum:
+                    # R2에 업로드 후 CF URL 사용, 실패 시 원본 URL fallback
+                    r2_url = upload_to_r2(img_bytes, fn, img_content_type)
+                    mid = r2_url if r2_url else best_img
+                else:
+                    mid, _ = site.upload_image_bytes(img_bytes, fn, img_content_type, rw["title"], best_cap)
+                    if not mid:
+                        raise PipelineFailure("publish", "IMAGE_UPLOAD_FAIL", "이미지 업로드 실패", retryable=True)
+                pid = site.create_post(
+                    rw["title"],
+                    rw["body"],
+                    site.get_cat_id(rw["cat"]),
+                    site.get_tag_ids(rw["tags"]),
+                    mid,
+                    excerpt=rw.get("excerpt", ""),
+                    published_at=published_at,
+                    source_published_at=source_published_at,
+                )
+                upload_counts[prefix] += 1
+                published_prefixes.append(prefix)
+                print(f" 성공 (ID:{pid}).")
+                submit_sitemap_to_gsc(prefix)
+                time.sleep(1)
+            except requests.HTTPError as e:
+                status = getattr(getattr(e, "response", None), "status_code", 0)
+                retryable = status in (429, 500, 502, 503, 504)
+                failure = PipelineFailure("publish", f"PUBLISH_HTTP_{status or 'ERROR'}", str(e), retryable=retryable, abort_run=status in (401, 403))
+                print(f" 실패 ({failure.stage}/{failure.code}).")
+                failures.append(failure)
+                continue
 
-    # 발행 단계: 한 매체라도 실패하면 더 진행하지 않고 즉시 실패 처리
-    published_prefixes = 0
-    for prefix in MEDIA_PREFIXES:
-        rw = rewritten.get(prefix)
-        if not rw:
-            raise PipelineFailure("publish", "PUBLISH_STATE_MISSING", f"{prefix} 재작성 결과 없음", retryable=False)
-        is_erum = prefix in ERUM_CFG
-        print(f"      🚀 [{prefix}] {'erum API' if is_erum else '워드프레스'} 발행 중...", end="", flush=True)
-        try:
-            site = SITES[prefix]
-            if is_erum:
-                # R2에 업로드 후 CF URL 사용, 실패 시 원본 URL fallback
-                r2_url = upload_to_r2(img_bytes, fn, img_content_type)
-                mid = r2_url if r2_url else best_img
-            else:
-                mid, _ = site.upload_image_bytes(img_bytes, fn, img_content_type, rw["title"], best_cap)
-                if not mid:
-                    raise PipelineFailure("publish", "IMAGE_UPLOAD_FAIL", "이미지 업로드 실패", retryable=True)
-            pid = site.create_post(
-                rw["title"],
-                rw["body"],
-                site.get_cat_id(rw["cat"]),
-                site.get_tag_ids(rw["tags"]),
-                mid,
-                excerpt=rw.get("excerpt", ""),
-                published_at=published_at,
-                source_published_at=source_published_at,
-            )
-            upload_counts[prefix] += 1
-            published_prefixes += 1
-            print(f" 성공 (ID:{pid}).")
-            submit_sitemap_to_gsc(prefix)
-            time.sleep(1)
         except PipelineFailure as e:
-            if published_prefixes > 0:
-                e.partial_success = True
-            raise
-        except requests.HTTPError as e:
-            status = getattr(getattr(e, "response", None), "status_code", 0)
-            abort_run = status in (401, 403)
-            retryable = status in (429, 500, 502, 503, 504)
-            raise PipelineFailure("publish", f"PUBLISH_HTTP_{status or 'ERROR'}", str(e), retryable=retryable, abort_run=abort_run, partial_success=published_prefixes > 0)
+            if e.abort_run and e.stage in ("rewrite", "qa"):
+                raise
+            print(f" 실패 ({e.stage}/{e.code}).")
+            failures.append(e)
+            continue
         except Exception as e:
-            raise PipelineFailure("publish", "PUBLISH_RUNTIME_ERROR", str(e), retryable=published_prefixes == 0, partial_success=published_prefixes > 0)
+            failure = PipelineFailure("publish", "PUBLISH_RUNTIME_ERROR", str(e), retryable=True)
+            print(f" 실패 ({failure.stage}/{failure.code}).")
+            failures.append(failure)
+            continue
 
-    return 'success'
+    if published_prefixes:
+        return {
+            "success_media": [p.rstrip("_") for p in published_prefixes],
+            "partial_success": len(published_prefixes) < len(MEDIA_PREFIXES),
+            "failure_count": len(failures),
+        }
+
+    if failures:
+        retryable = any(f.retryable for f in failures)
+        abort_run = any(f.abort_run for f in failures)
+        primary = failures[0]
+        details = " | ".join(f"{f.stage}/{f.code}" for f in failures[:3])
+        raise PipelineFailure(
+            primary.stage,
+            primary.code,
+            f"모든 매체 실패: {details}",
+            retryable=retryable,
+            abort_run=abort_run,
+        )
+
+    raise PipelineFailure("run", "NO_MEDIA_PUBLISHED", "모든 매체 발행 실패", retryable=False)
 
 
 def run():
@@ -1690,20 +1711,23 @@ def run():
             break
         try:
             result = process_article(article, upload_counts)
-            if result == 'success':
+            if result:
+                success_media = result.get("success_media", [])
+                media_value = ",".join(success_media) if success_media else "ALL"
                 db_record_success(
                     article["url_id"],
                     article["title"],
-                    "ALL",
+                    media_value,
                     source_published_at=article.get("source_published_at"),
                     published_at=now_kst(),
                 )
                 db_store_attempt_state(
                     article["url_id"],
                     article["title"],
-                    "ALL",
+                    media_value,
                     "SUCCESS",
                     retry_count=0,
+                    partial_success=result.get("partial_success", False),
                     source_published_at=article.get("source_published_at"),
                 )
                 published += 1
