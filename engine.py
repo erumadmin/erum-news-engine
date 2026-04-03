@@ -33,15 +33,46 @@ from bs4 import BeautifulSoup
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
+def _load_env_file(path: str) -> None:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except Exception:
+        pass
+
 try:
     from dotenv import load_dotenv
-    load_dotenv()
 except Exception:
-    pass
+    load_dotenv = None
+else:
+    try:
+        load_dotenv()
+    except Exception:
+        pass
+    local_env_path = os.path.expanduser("~/.env.erum_infra")
+    if os.path.exists(local_env_path):
+        try:
+            load_dotenv(local_env_path, override=False)
+        except Exception:
+            _load_env_file(local_env_path)
+
+if load_dotenv is None:
+    local_env_path = os.path.expanduser("~/.env.erum_infra")
+    if os.path.exists(local_env_path):
+        _load_env_file(local_env_path)
 
 # ========================= [1. 환경변수 로드] =========================
 
-UPSTAGE_API_KEY = os.environ["UPSTAGE_API_KEY"]
+UPSTAGE_API_KEY = os.environ.get("UPSTAGE_API_KEY", "").strip()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 DB_HOST = os.environ["DB_HOST"]
 DB_USER = os.environ["DB_USER"]
 DB_PASSWORD = os.environ["DB_PASSWORD"]
@@ -76,6 +107,9 @@ UPSTAGE_MODEL_REWRITE = os.environ.get("UPSTAGE_MODEL_REWRITE", UPSTAGE_MODEL)
 UPSTAGE_MODEL_QA = os.environ.get("UPSTAGE_MODEL_QA", UPSTAGE_MODEL)
 UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS", "1500"))
 UPSTAGE_QA_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_QA_MAX_OUTPUT_TOKENS", "900"))
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-pro")
+GEMINI_MODEL_REWRITE = os.environ.get("GEMINI_MODEL_REWRITE", GEMINI_MODEL)
+GEMINI_MODEL_QA = os.environ.get("GEMINI_MODEL_QA", GEMINI_MODEL)
 REWRITE_SOURCE_MAX_CHARS = int(os.environ.get("REWRITE_SOURCE_MAX_CHARS", "4000"))
 MIN_REWRITTEN_BODY_CHARS = int(os.environ.get("MIN_REWRITTEN_BODY_CHARS", "300"))
 SOFT_REWRITTEN_BODY_CHARS = int(os.environ.get("SOFT_REWRITTEN_BODY_CHARS", "4500"))
@@ -102,6 +136,9 @@ RETRYABLE_FAILURE_CODES = {
 DAILY_PUBLISH_LIMIT = 50
 PER_RUN_LIMIT = 15  # 1회 실행당 최대 발행 수
 RETRY_DAYS = int(os.environ.get('RETRY_DAYS', '0'))  # 0=당일만, N=N일 전까지 재시도
+REVIEW_ONLY = os.environ.get("REVIEW_ONLY", "0") == "1"
+if not UPSTAGE_API_KEY and not (REVIEW_ONLY and GEMINI_API_KEY):
+    raise RuntimeError("UPSTAGE_API_KEY가 없습니다. 리뷰 전용 모드에서는 GEMINI_API_KEY가 필요합니다.")
 MEDIA_PREFIXES = ["IJ_", "NN_", "CB_"]
 KST = ZoneInfo("Asia/Seoul")
 TARGET_URL_IDS = {
@@ -109,6 +146,11 @@ TARGET_URL_IDS = {
     for x in os.environ.get("TARGET_URL_IDS", "").split(",")
     if x.strip()
 }
+TARGET_URL_ID_LIST = [
+    x.strip()
+    for x in os.environ.get("TARGET_URL_IDS", "").split(",")
+    if x.strip()
+]
 
 
 def now_kst() -> datetime:
@@ -296,7 +338,52 @@ def _llm_failure(stage: str, exc: Exception) -> PipelineFailure:
         return PipelineFailure(stage, f"{stage.upper()}_API_ERROR", message[:500], retryable=True)
     return PipelineFailure(stage, f"{stage.upper()}_API_ERROR", message[:500], retryable=False)
 
+def _ask_gemini_rest(persona, text, model=None, max_output_tokens=None, stage="rewrite"):
+    use_model = model if (model and str(model).startswith("gemini")) else (GEMINI_MODEL_QA if stage == "qa" else GEMINI_MODEL_REWRITE)
+    output_tokens = max_output_tokens or (UPSTAGE_QA_MAX_OUTPUT_TOKENS if stage == "qa" else UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS)
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{use_model}:generateContent"
+    try:
+        response = requests.post(
+            url,
+            params={"key": GEMINI_API_KEY},
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "erum-news-engine/1.0",
+            },
+            json={
+                "systemInstruction": {"parts": [{"text": persona}]},
+                "contents": [
+                    {"role": "user", "parts": [{"text": PROMPT_USER_TEMPLATE.format(original_text=text)}]}
+                ],
+                "generationConfig": {
+                    "temperature": 0.2,
+                    "maxOutputTokens": output_tokens,
+                },
+            },
+            timeout=120,
+        )
+        response.raise_for_status()
+        data = response.json()
+        candidates = data.get("candidates") or []
+        if not candidates:
+            raise ValueError("Gemini 응답에 candidates가 없음")
+        parts = ((candidates[0].get("content") or {}).get("parts") or [])
+        content = "".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in parts
+        )
+        return content.strip()
+    except PipelineFailure:
+        raise
+    except Exception as e:
+        raise _llm_failure(stage, e)
+
 def ask_llm(persona, text, model=None, max_output_tokens=None, stage="rewrite"):
+    provider = "upstage"
+    if REVIEW_ONLY and not UPSTAGE_API_KEY and GEMINI_API_KEY:
+        provider = "gemini"
+    if provider == "gemini":
+        return _ask_gemini_rest(persona, text, model=model, max_output_tokens=max_output_tokens, stage=stage)
     use_model = model or (UPSTAGE_MODEL_QA if stage == "qa" else UPSTAGE_MODEL_REWRITE)
     user_msg = PROMPT_USER_TEMPLATE.format(original_text=text)
     output_tokens = max_output_tokens or (UPSTAGE_QA_MAX_OUTPUT_TOKENS if stage == "qa" else UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS)
@@ -667,7 +754,7 @@ def validate_content_quality(title, body):
         return False, "말줄임표(미완성 의심) 발견"
     stripped = body.rstrip()
     plain_for_check = re.sub(r'<[^>]+>', '', stripped).strip()
-    if plain_for_check and plain_for_check[-1] not in ("다", ".", "!", "?", '"', "'", "〉", "》"):
+    if plain_for_check and plain_for_check[-1] not in ("다", ".", "!", "?", '"', "'", "〉", "》", ")", "]", "”", "’"):
         return False, f"본문 마지막 문자 비정상({plain_for_check[-1]!r})"
 
     # 사고 과정 노출
@@ -704,7 +791,8 @@ def ai_quality_check(title: str, body: str, media_prefix: str) -> Tuple[bool, Li
         json_part = parts[0]
         clean = re.sub(r"```json\s*", "", json_part)
         clean = re.sub(r"```\s*", "", clean).strip()
-        result = json.loads(clean)
+        decoder = json.JSONDecoder()
+        result, _ = decoder.raw_decode(clean)
         total = int(result.get("total", 0))
         passed = result.get("pass", False) and total >= 72
         fails = result.get("fails", [])
@@ -872,6 +960,192 @@ def get_hybrid_meta(title, body, ai_cat, ai_tags):
 
 def strip_html_tags(html):
     return BeautifulSoup(html, "html.parser").get_text(separator='\n', strip=True) if html else ""
+
+
+def _extract_first_date(text: str) -> Optional[datetime]:
+    if not text:
+        return None
+    m = re.search(r'(\d{4})[./-](\d{1,2})[./-](\d{1,2})', text)
+    if not m:
+        return None
+    try:
+        return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), tzinfo=KST)
+    except Exception:
+        return None
+
+
+def load_review_articles_from_targets(target_ids: List[str]) -> List[dict]:
+    articles = []
+    for url_id in target_ids:
+        source_url = url_id if url_id.startswith("http") else f"https://{url_id}"
+        db_title = ""
+        db_source_published_at = None
+        try:
+            conn = get_db_connection()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT title, source_published_at FROM published_articles WHERE url_id = %s LIMIT 1", (url_id,))
+                    row = cur.fetchone()
+                    if row:
+                        db_title = row.get("title") or ""
+                        db_source_published_at = row.get("source_published_at")
+                    if not db_title:
+                        cur.execute("SELECT title, source_published_at FROM article_attempts WHERE url_id = %s LIMIT 1", (url_id,))
+                        row = cur.fetchone()
+                        if row:
+                            db_title = row.get("title") or ""
+                            db_source_published_at = row.get("source_published_at") or db_source_published_at
+            finally:
+                conn.close()
+        except Exception:
+            pass
+
+        resp = fetch_with_retry(source_url, timeout=20)
+        if not resp or resp.status_code != 200:
+            print(f"   ⚠️ [리뷰 원문] 직접 fetch 실패: {url_id} (HTTP {getattr(resp, 'status_code', 'none')})")
+            continue
+        resp.encoding = "utf-8"
+        soup = BeautifulSoup(resp.text, "html.parser")
+        title = ""
+        h1 = soup.select_one("h1")
+        if h1:
+            title = h1.get_text(" ", strip=True)
+        if not title:
+            og_title = soup.find("meta", attrs={"property": "og:title"}) or soup.find("meta", attrs={"name": "og:title"})
+            if og_title and og_title.get("content"):
+                title = og_title.get("content", "").strip()
+        if not title:
+            title = db_title or url_id
+
+        body_node = (
+            soup.select_one(".view_cont")
+            or soup.select_one(".article-content")
+            or soup.select_one("#articleBody")
+            or soup.select_one("article")
+            or soup.select_one(".content")
+            or soup.select_one(".view_cont")
+        )
+        body_text = body_node.get_text(separator="\n", strip=True) if body_node else strip_html_tags(resp.text)
+        main_node = soup.select_one("main.main") or soup.select_one("section.area_contents") or soup.select_one("main")
+        if not db_source_published_at and main_node:
+            db_source_published_at = _extract_first_date(main_node.get_text(" ", strip=True)[:1200])
+        if not db_source_published_at:
+            db_source_published_at = _extract_first_date(soup.get_text(" ", strip=True)[:1200])
+
+        articles.append({
+            "url": source_url,
+            "url_id": url_id,
+            "title": title[:1000],
+            "body": body_text[:40000],
+            "image": "",
+            "source_published_at": db_source_published_at,
+        })
+    return articles
+
+def _review_output_dir() -> str:
+    configured = os.environ.get("REVIEW_OUTPUT_DIR", "review_outputs").strip() or "review_outputs"
+    if os.path.isabs(configured):
+        return configured
+    return os.path.join(script_dir, configured)
+
+
+def _review_safe_slug(text: str, fallback: str = "article") -> str:
+    slug = re.sub(r"[^0-9A-Za-z가-힣]+", "_", (text or "").strip()).strip("_")
+    if not slug:
+        slug = fallback
+    return slug[:60]
+
+
+def _format_review_report(records: List[dict]) -> str:
+    created_at = now_kst().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        "# 기사 재작성 리뷰",
+        "",
+        f"- 생성 시각(KST): {created_at}",
+        f"- 리뷰 모드: {'ON' if REVIEW_ONLY else 'OFF'}",
+        f"- 대상 기사 수: {len(records)}",
+    ]
+    if TARGET_URL_IDS:
+        lines.append(f"- 대상 URL 필터: {len(TARGET_URL_IDS)}건")
+    lines.append("")
+
+    for idx, record in enumerate(records, 1):
+        title = (record.get("source_title") or record.get("title") or "").strip() or "(제목 없음)"
+        source_url = record.get("source_url") or record.get("url") or "-"
+        source_published_at = record.get("source_published_at")
+        if isinstance(source_published_at, datetime):
+            source_published_at = to_kst_iso(source_published_at) or "-"
+        source_chars = record.get("source_chars")
+        source_body = record.get("source_body")
+        if source_chars is None and isinstance(source_body, str):
+            source_chars = len(source_body)
+
+        lines.extend([
+            f"## {idx}. {title}",
+            f"- 원문 URL: {source_url}",
+            f"- 원문 시각(KST): {source_published_at or '-'}",
+            f"- 원문 길이: {source_chars if source_chars is not None else '-'}자",
+        ])
+
+        if record.get("status"):
+            lines.append(f"- 상태: {record.get('status')}")
+        if record.get("message"):
+            lines.append(f"- 사유: {record.get('message')}")
+        if record.get("stage") or record.get("code"):
+            stage = record.get("stage") or "-"
+            code = record.get("code") or "-"
+            lines.append(f"- 실패 코드: {stage}/{code}")
+
+        variants = record.get("variants") or []
+        if not variants:
+            lines.append("")
+            continue
+
+        success_count = sum(1 for v in variants if v.get("status") == "SUCCESS" or v.get("qa_pass"))
+        failed_count = len(variants) - success_count
+        lines.extend([
+            f"- 변형 성공: {success_count}건",
+            f"- 변형 실패: {failed_count}건",
+            "",
+        ])
+
+        for variant in variants:
+            prefix = (variant.get("prefix") or "").rstrip("_") or "?"
+            lines.append(f"### {prefix}")
+            lines.append(f"- 상태: {variant.get('status') or ('통과' if variant.get('qa_pass') else '실패')}")
+            if variant.get("qa_score") is not None:
+                lines.append(f"- QA 점수: {variant.get('qa_score')}")
+            if variant.get("qa_fails"):
+                lines.append(f"- QA 지적: {', '.join(variant.get('qa_fails'))}")
+            if variant.get("fixed_applied"):
+                lines.append("- 자동보완: 적용")
+            if variant.get("failure"):
+                lines.append(f"- 실패: {variant.get('failure')}")
+            lines.append(f"- 제목: {variant.get('title', '')}")
+            lines.append(f"- 리드문: {variant.get('excerpt', '')}")
+            lines.append(f"- 카테고리: {variant.get('cat', '')}")
+            tags = variant.get("tags") or []
+            lines.append(f"- 태그: {', '.join(tags) if tags else '-'}")
+            lines.append("- 본문:")
+            body = (variant.get("body") or "").rstrip()
+            if body:
+                lines.append("")
+                lines.append(body)
+            else:
+                lines.append("없음")
+            lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_review_report(records: List[dict]) -> str:
+    output_dir = _review_output_dir()
+    os.makedirs(output_dir, exist_ok=True)
+    filename = f"rewrite_review_{now_kst().strftime('%Y%m%d_%H%M%S')}.md"
+    path = os.path.join(output_dir, filename)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(_format_review_report(records))
+    return path
 
 # ========================= [5. 워드프레스 연동] =========================
 
@@ -1432,7 +1706,7 @@ def classify_attempt_state(failure: PipelineFailure, prior_state: Optional[dict]
 
 # ========================= [8. 메인 파이프라인] =========================
 
-def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, rules: Optional[dict] = None) -> list:
+def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, rules: Optional[dict] = None, review_mode: bool = False) -> list:
     """RSS에서 기사를 수집하여 리스트로 반환 (시트 없이 메모리에서 직접 처리)"""
     current_kst = now_kst()
     today = current_kst.date()
@@ -1460,27 +1734,28 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, 
                 if count >= feed_limit: break
                 if not hasattr(e, 'link'): continue
                 curr_id = extract_unique_id(e.link)
-                if curr_id in ex_ids: continue
+                if not review_mode and curr_id in ex_ids: continue
                 if TARGET_URL_IDS and curr_id not in TARGET_URL_IDS:
                     continue
                 if not is_mainly_korean(e.title, threshold=0.5): continue
-                title_hash = hash_title_for_rule(e.title)
-                source_url_key = normalize_url_for_rule(e.link)
-                rule_allowed = (
-                    curr_id in rule_allowed_ids
-                    or title_hash in rule_allowed_title_hashes
-                    or source_url_key in rule_allowed_source_urls
-                )
-                if (
-                    curr_id in rule_blocked_ids
-                    or title_hash in rule_blocked_title_hashes
-                    or source_url_key in rule_blocked_source_urls
-                ):
-                    if not rule_allowed:
+                if not review_mode:
+                    title_hash = hash_title_for_rule(e.title)
+                    source_url_key = normalize_url_for_rule(e.link)
+                    rule_allowed = (
+                        curr_id in rule_allowed_ids
+                        or title_hash in rule_allowed_title_hashes
+                        or source_url_key in rule_allowed_source_urls
+                    )
+                    if (
+                        curr_id in rule_blocked_ids
+                        or title_hash in rule_blocked_title_hashes
+                        or source_url_key in rule_blocked_source_urls
+                    ):
+                        if not rule_allowed:
+                            continue
+                    if not rule_allowed and curr_id in blocked_ids:
                         continue
-                if not rule_allowed and curr_id in blocked_ids:
-                    continue
-                if is_semantic_duplicate(e.title, ex_titles, threshold=0.9): continue
+                    if is_semantic_duplicate(e.title, ex_titles, threshold=0.9): continue
                 dt = e.get('published_parsed') or e.get('updated_parsed')
                 source_published_at = feed_time_to_kst(dt)
                 if not source_published_at: continue
@@ -1538,23 +1813,33 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, 
     return articles
 
 
-def process_article(article: dict, upload_counts: dict) -> str:
+def process_article(article: dict, upload_counts: dict, review_mode: bool = REVIEW_ONLY) -> dict:
     """기사 1건을 3개 매체에 재작성 + 발행."""
     print(f"\n▶ 기사 처리 시작: {article['title'][:40]}...")
     source_published_at = article.get("source_published_at")
     published_at = now_kst()
+    review_record = {
+        "source_title": article.get("title", ""),
+        "source_url": article.get("url", ""),
+        "source_published_at": source_published_at,
+        "source_chars": len(article.get("body", "") or ""),
+        "variants": [],
+    }
 
-    # 이미지 확인
-    print(f"   🔎 이미지 탐색 중...", end="", flush=True)
-    image_candidates = find_best_image(article)
-    if not image_candidates:
-        print(" 실패 (이미지 없음/저작권).")
-        raise PipelineFailure("image", "NO_USABLE_IMAGE", "이미지 후보 없음", retryable=False)
-    print(f" 찾음.")
+    if review_mode:
+        print("   🧪 리뷰 전용 모드: 이미지/발행 단계 생략")
+    else:
+        # 이미지 확인
+        print(f"   🔎 이미지 탐색 중...", end="", flush=True)
+        image_candidates = find_best_image(article)
+        if not image_candidates:
+            print(" 실패 (이미지 없음/저작권).")
+            raise PipelineFailure("image", "NO_USABLE_IMAGE", "이미지 후보 없음", retryable=False)
+        print(f" 찾음.")
 
-    print(f"   📥 이미지 다운로드 중...", end="", flush=True)
-    img_bytes, img_content_type, fn, best_cap, best_img = download_best_image(image_candidates)
-    print(f" 완료 ({len(img_bytes)//1024}KB).")
+        print(f"   📥 이미지 다운로드 중...", end="", flush=True)
+        img_bytes, img_content_type, fn, best_cap, best_img = download_best_image(image_candidates)
+        print(f" 완료 ({len(img_bytes)//1024}KB).")
 
     rewritten = {}
     published_prefixes = []
@@ -1579,6 +1864,7 @@ def process_article(article: dict, upload_counts: dict) -> str:
             print(" 작성완료.", flush=True)
             print(f"      🔍 [{prefix}] Solar Pro 3 품질검수 중...", end="", flush=True)
             passed, fails, score, fixed = ai_quality_check(p['title'], p['body'], prefix)
+            final_pass = passed
 
             if not passed:
                 print(f" {score}점(미달).", flush=True)
@@ -1588,6 +1874,7 @@ def process_article(article: dict, upload_counts: dict) -> str:
                     if not is_valid:
                         raise PipelineFailure("qa", "QA_FIXED_VALIDATION_FAIL", msg, retryable=False)
                     p = fixed
+                    final_pass = True
                     print(f" 완료.")
                 else:
                     raise PipelineFailure("qa", "QA_HARD_FAIL", f"AI검수 최종미달(점수:{score})", retryable=False)
@@ -1597,6 +1884,25 @@ def process_article(article: dict, upload_counts: dict) -> str:
             cat, tags = get_hybrid_meta(p['title'], p['body'], p['cat'], p['tags'])
             rw = {"title": p['title'], "excerpt": p.get('excerpt', ''), "body": p['body'], "cat": cat, "tags": tags}
             rewritten[prefix] = rw
+
+            variant_review = {
+                "prefix": prefix,
+                "status": "SUCCESS",
+                "qa_pass": final_pass,
+                "qa_score": score,
+                "qa_fails": fails,
+                "fixed_applied": bool(fixed),
+                "title": rw["title"],
+                "excerpt": rw["excerpt"],
+                "body": rw["body"],
+                "cat": rw["cat"],
+                "tags": rw["tags"],
+            }
+
+            if review_mode:
+                review_record["variants"].append(variant_review)
+                published_prefixes.append(prefix)
+                continue
 
             # 발행 단계: 매체별로 독립 실행
             try:
@@ -1623,6 +1929,7 @@ def process_article(article: dict, upload_counts: dict) -> str:
                 )
                 upload_counts[prefix] += 1
                 published_prefixes.append(prefix)
+                variant_review["publish_id"] = pid
                 print(f" 성공 (ID:{pid}).")
                 submit_sitemap_to_gsc(prefix)
                 time.sleep(1)
@@ -1632,19 +1939,69 @@ def process_article(article: dict, upload_counts: dict) -> str:
                 failure = PipelineFailure("publish", f"PUBLISH_HTTP_{status or 'ERROR'}", str(e), retryable=retryable, abort_run=status in (401, 403))
                 print(f" 실패 ({failure.stage}/{failure.code}).")
                 failures.append(failure)
+                if review_mode:
+                    variant_review["status"] = "FAILED"
+                    variant_review["failure"] = f"{failure.stage}/{failure.code}: {failure.message[:200]}"
+                    review_record["variants"].append(variant_review)
                 continue
+
+            if review_mode:
+                review_record["variants"].append(variant_review)
 
         except PipelineFailure as e:
             if e.abort_run and e.stage in ("rewrite", "qa"):
                 raise
             print(f" 실패 ({e.stage}/{e.code}).")
             failures.append(e)
+            if review_mode:
+                review_record["variants"].append({
+                    "prefix": prefix,
+                    "status": "FAILED",
+                    "qa_pass": False,
+                    "qa_score": 0,
+                    "qa_fails": [e.message] if e.message else [],
+                    "fixed_applied": False,
+                    "title": "",
+                    "excerpt": "",
+                    "body": "",
+                    "cat": "",
+                    "tags": [],
+                    "failure": f"{e.stage}/{e.code}: {e.message[:200]}",
+                })
             continue
         except Exception as e:
             failure = PipelineFailure("publish", "PUBLISH_RUNTIME_ERROR", str(e), retryable=True)
             print(f" 실패 ({failure.stage}/{failure.code}).")
             failures.append(failure)
+            if review_mode:
+                review_record["variants"].append({
+                    "prefix": prefix,
+                    "status": "FAILED",
+                    "qa_pass": False,
+                    "qa_score": 0,
+                    "qa_fails": [str(e)[:200]],
+                    "fixed_applied": False,
+                    "title": "",
+                    "excerpt": "",
+                    "body": "",
+                    "cat": "",
+                    "tags": [],
+                    "failure": f"{failure.stage}/{failure.code}: {failure.message[:200]}",
+                })
             continue
+
+    if review_mode:
+        review_record["success_media"] = [p.rstrip("_") for p in published_prefixes]
+        review_record["partial_success"] = len(published_prefixes) < len(MEDIA_PREFIXES)
+        review_record["failure_count"] = len(failures)
+        review_record["status"] = "SUCCESS" if published_prefixes else "FAILED"
+        if failures and not published_prefixes:
+            primary = failures[0]
+            details = " | ".join(f"{f.stage}/{f.code}" for f in failures[:3])
+            review_record["message"] = f"모든 변형 실패: {details}"
+            review_record["stage"] = primary.stage
+            review_record["code"] = primary.code
+        return review_record
 
     if published_prefixes:
         return {
@@ -1674,31 +2031,53 @@ def run():
     if TARGET_URL_IDS:
         print(f"🎯 대상 URL 필터 활성화: {len(TARGET_URL_IDS)}건")
 
-    # 테이블 자동 생성 (없을 경우)
-    db_ensure_table()
+    if REVIEW_ONLY:
+        remaining = len(TARGET_URL_IDS) if TARGET_URL_IDS else PER_RUN_LIMIT
+        ex_ids, ex_titles = set(), set()
+        blocked_ids = set()
+        article_rules = {
+            "blocked_ids": set(),
+            "blocked_title_hashes": set(),
+            "blocked_source_urls": set(),
+            "allowed_ids": set(),
+            "allowed_title_hashes": set(),
+            "allowed_source_urls": set(),
+        }
+        print(f"🧪 리뷰 전용 모드: 발행/DB 기록 없음, 후보 상한 {remaining}건")
+    else:
+        # 테이블 자동 생성 (없을 경우)
+        db_ensure_table()
 
-    # 오늘 발행 건수 확인
-    today_count = db_get_today_count()
-    remaining = min(DAILY_PUBLISH_LIMIT - today_count, PER_RUN_LIMIT)
-    print(f"📊 금일 발행 현황: {today_count}/{DAILY_PUBLISH_LIMIT}건 (잔여: {remaining}건)")
+        # 오늘 발행 건수 확인
+        today_count = db_get_today_count()
+        remaining = min(DAILY_PUBLISH_LIMIT - today_count, PER_RUN_LIMIT)
+        print(f"📊 금일 발행 현황: {today_count}/{DAILY_PUBLISH_LIMIT}건 (잔여: {remaining}건)")
 
-    if remaining <= 0:
-        print("🛑 금일 목표 달성. 종료.")
-        return
+        if remaining <= 0:
+            print("🛑 금일 목표 달성. 종료.")
+            return
 
-    # DB에서 기존 발행 URL/제목 로드
-    print("   ⏳ DB에서 기발행 데이터 로드 중...", end="", flush=True)
-    ex_ids, ex_titles = db_get_existing_ids_and_titles()
-    print(f" 완료 (URL {len(ex_ids)}건, 제목 {len(ex_titles)}개)")
+        # DB에서 기존 발행 URL/제목 로드
+        print("   ⏳ DB에서 기발행 데이터 로드 중...", end="", flush=True)
+        ex_ids, ex_titles = db_get_existing_ids_and_titles()
+        print(f" 완료 (URL {len(ex_ids)}건, 제목 {len(ex_titles)}개)")
 
-    # RSS 수집
-    print("   ⬇️ 신규 기사 수집(RSS) 시작...")
-    blocked_ids = db_get_retry_blocked_ids()
-    article_rules = db_get_active_article_rules()
-    articles = collect_articles(ex_ids, ex_titles, blocked_ids, remaining, article_rules)
+        blocked_ids = db_get_retry_blocked_ids()
+        article_rules = db_get_active_article_rules()
+
+    # 기사 수집
+    if REVIEW_ONLY and TARGET_URL_ID_LIST:
+        print("   ⬇️ 리뷰 대상 원문 직접 수집 시작...")
+        articles = load_review_articles_from_targets(TARGET_URL_ID_LIST)
+    else:
+        print("   ⬇️ 신규 기사 수집(RSS) 시작...")
+        articles = collect_articles(ex_ids, ex_titles, blocked_ids, remaining, article_rules, review_mode=REVIEW_ONLY)
 
     if not articles:
         print("👍 신규 기사 없음. 종료.")
+        if REVIEW_ONLY:
+            report_path = write_review_report([])
+            print(f"📝 리뷰 리포트 저장: {report_path}")
         return
 
     print(f"✅ 처리할 기사: {len(articles)}건")
@@ -1706,12 +2085,17 @@ def run():
     # 기사 처리
     upload_counts = {p: 0 for p in MEDIA_PREFIXES}
     published = 0
+    review_records: List[dict] = []
     for article in articles:
         if published >= remaining:
             break
         try:
-            result = process_article(article, upload_counts)
+            result = process_article(article, upload_counts, review_mode=REVIEW_ONLY)
             if result:
+                if REVIEW_ONLY:
+                    review_records.append(result)
+                    published += 1
+                    continue
                 success_media = result.get("success_media", [])
                 media_value = ",".join(success_media) if success_media else "ALL"
                 db_record_success(
@@ -1733,6 +2117,21 @@ def run():
                 published += 1
                 print(f"   🎉 발행 완료! (금일 누적: {today_count + published}건)")
         except PipelineFailure as failure:
+            if REVIEW_ONLY:
+                review_records.append({
+                    "source_title": article.get("title", ""),
+                    "source_url": article.get("url", ""),
+                    "source_published_at": article.get("source_published_at"),
+                    "source_chars": len(article.get("body", "") or ""),
+                    "status": "FAILED",
+                    "stage": failure.stage,
+                    "code": failure.code,
+                    "message": failure.message,
+                    "variants": [],
+                })
+                if failure.abort_run:
+                    raise
+                continue
             status, retry_count, next_retry_at = classify_attempt_state(failure, db_get_attempt_state(article["url_id"]))
             db_store_attempt_state(
                 article["url_id"],
@@ -1767,6 +2166,12 @@ def run():
             )
 
     # 결과 요약
+    if REVIEW_ONLY:
+        report_path = write_review_report(review_records)
+        print(f"\n📝 리뷰 리포트 저장: {report_path}")
+        print("   (발행/DB 기록 없음)")
+        return
+
     print(f"\n--- 실행 완료(KST): {now_kst().strftime('%H:%M:%S')} ---")
     print(f"📊 [작업 요약]")
     for p, c in upload_counts.items():
