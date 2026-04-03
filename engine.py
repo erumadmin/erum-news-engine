@@ -653,7 +653,7 @@ def validate_content_quality(title, body):
         return False, f"본문 너무 김({len(body)}자)"
 
     # 라벨 잔재
-    for label in ["제목:", "본문:", "내용:", "카테고리:", "태그:", "Title:", "Body:"]:
+    for label in ["제목:", "본문:", "내용:", "카테고리:", "태그:", "Title:", "Body:", "리드문:", "배경:", "과제:", "전망:", "솔루션:", "문제:", "해결책:", "임팩트:"]:
         if label in body:
             return False, f"라벨 잔재 발견({label})"
 
