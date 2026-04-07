@@ -93,6 +93,13 @@ ERUM_CFG = {
     "CB_": {"site": "CB", "gsc_site": "sc-domain:csrbriefing.kr", "sitemap": "https://csrbriefing.kr/sitemap-news.xml"},
 }
 
+# 카테고리별 기자 배정 (조직도: mgmt/03_operations/언론사_편집국_조직도.md)
+JOURNALIST_MAP: dict[str, dict[str, str]] = {
+    "IJ": {"정치": "오지현", "경제": "이성민", "사회": "윤성민", "IT/과학": "장예린", "문화/생활": "한재원", "국제": "서민준", "환경": "나혜진"},
+    "NN": {"정치": "최지훈", "경제": "윤재원", "사회": "박서연", "IT/과학": "임태양", "문화/생활": "강미래", "국제": "송현아", "환경": "김도현"},
+    "CB": {"정치": "김민서", "경제": "이준혁", "사회": "박지은", "IT/과학": "최현우", "문화/생활": "정수빈", "국제": "한다영", "환경": "오태준"},
+}
+
 # Cloudflare R2
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
@@ -1306,6 +1313,8 @@ class ErumSite:
         }
         if payload["sourcePublishedAt"] is None:
             payload.pop("sourcePublishedAt")
+        if author:
+            payload["author"] = author
         r = requests.post(f"{self.api_base}/api/articles",
                           json=payload, headers=self.headers, timeout=30)
         r.raise_for_status()
@@ -1917,6 +1926,9 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
                     mid, _ = site.upload_image_bytes(img_bytes, fn, img_content_type, rw["title"], best_cap)
                     if not mid:
                         raise PipelineFailure("publish", "IMAGE_UPLOAD_FAIL", "이미지 업로드 실패", retryable=True)
+                # 카테고리 기반 기자 배정
+                site_code = ERUM_CFG[prefix]["site"] if is_erum else None
+                journalist = JOURNALIST_MAP.get(site_code, {}).get(rw["cat"]) if site_code else None
                 pid = site.create_post(
                     rw["title"],
                     rw["body"],
@@ -1924,6 +1936,7 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
                     site.get_tag_ids(rw["tags"]),
                     mid,
                     excerpt=rw.get("excerpt", ""),
+                    author=journalist,
                     published_at=published_at,
                     source_published_at=source_published_at,
                 )
