@@ -3,5 +3,6 @@ __pycache__/
 .env
 *.json
 !prompts/
+!prompts/*.json
 venv/
 .venv/

@@ -682,6 +682,19 @@ def db_ensure_table():
                     KEY idx_audit_logs_created_at (created_at)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pattern_violations (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    url_id VARCHAR(512),
+                    media VARCHAR(50),
+                    pattern_group VARCHAR(100) NOT NULL,
+                    pattern_value VARCHAR(500) NOT NULL,
+                    detected_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    KEY idx_pv_pattern_group (pattern_group),
+                    KEY idx_pv_detected_at (detected_at),
+                    KEY idx_pv_url_id (url_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
             # 기존 테이블에는 새 컬럼이 없을 수 있으므로, 안전하게 보강한다.
             for table_name, column_name, column_def in [
                 ("published_articles", "source_published_at", "DATETIME DEFAULT NULL"),
@@ -735,7 +748,34 @@ def extract_unique_id(url):
         if 'no' in qs: return f"nw_{qs['no'][0]}"
     return url.replace("https://", "").replace("http://", "").replace("www.", "").strip().rstrip("/")
 
-def validate_content_quality(title, body):
+def _load_validation_patterns() -> dict:
+    """prompts/validation_patterns.json 에서 블랙리스트 패턴 로드."""
+    path = os.path.join(script_dir, "prompts", "validation_patterns.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+_VALIDATION_PATTERNS: dict = _load_validation_patterns()
+
+def log_pattern_violation(url_id: str, media: str, group: str, value: str) -> None:
+    """탐지된 패턴 위반을 DB에 기록. 실패해도 파이프라인 중단 없음."""
+    try:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO pattern_violations (url_id, media, pattern_group, pattern_value) VALUES (%s, %s, %s, %s)",
+                    (url_id[:512] if url_id else None, media[:50] if media else None, group[:100], value[:500]),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+def validate_content_quality(title, body, url_id: str = "", media: str = ""):
     # 제목
     if not title or len(title) < 5:
         return False, "제목 누락 또는 너무 짧음"
@@ -746,34 +786,34 @@ def validate_content_quality(title, body):
     if len(body) > HARD_REWRITTEN_BODY_CHARS:
         return False, f"본문 너무 김({len(body)}자)"
 
-    # 라벨 잔재
-    for label in ["제목:", "본문:", "내용:", "카테고리:", "태그:", "Title:", "Body:", "리드문:", "배경:", "과제:", "전망:", "솔루션:", "문제:", "해결책:", "임팩트:"]:
-        if label in body:
-            return False, f"라벨 잔재 발견({label})"
-
-    # 포맷 오염
-    if "**" in body or "##" in body:
-        return False, "마크다운(**, ##) 잔재 발견"
-    # HTML 태그 검사 제거: clean_body_html()이 의도적으로 <p>/<strong>/<h3> 등을 생성하므로 오탐
+    # validation_patterns.json 기반 블랙리스트 검사
+    plain_body = re.sub(r’<[^>]+>’, ‘ ‘, body)
+    for group, rule in _VALIDATION_PATTERNS.items():
+        desc = rule.get(“description”, group)
+        pat_type = rule.get(“type”, “contains”)
+        for pat in rule.get(“patterns”, []):
+            hit = False
+            if pat_type == “contains”:
+                hit = pat in plain_body
+            elif pat_type == “regex”:
+                hit = bool(re.search(pat, plain_body, re.MULTILINE))
+            if hit:
+                log_pattern_violation(url_id, media, group, pat)
+                return False, f”{desc}({pat})”
 
     # 미완성 기사
-    if "..." in body or "…" in body:
-        return False, "말줄임표(미완성 의심) 발견"
+    if “...” in body or “…” in body:
+        return False, “말줄임표(미완성 의심) 발견”
     stripped = body.rstrip()
-    plain_for_check = re.sub(r'<[^>]+>', '', stripped).strip()
-    if plain_for_check and plain_for_check[-1] not in ("다", ".", "!", "?", '"', "'", "〉", "》", ")", "]", "”", "’"):
-        return False, f"본문 마지막 문자 비정상({plain_for_check[-1]!r})"
-
-    # 사고 과정 노출
-    for pat in ["Step 1", "Step 2", "Phase 1", "분석:", "생각:", "검토:", "THINK"]:
-        if pat in body:
-            return False, f"내부 추론 노출({pat})"
+    plain_for_check = re.sub(r’<[^>]+>’, ‘’, stripped).strip()
+    if plain_for_check and plain_for_check[-1] not in (“다”, “.”, “!”, “?”, ‘”’, “’”, “〉”, “》”, “)”, “]”, “””, “’”):
+        return False, f”본문 마지막 문자 비정상({plain_for_check[-1]!r})”
 
     # 경어체 혼용
-    if re.search(r'(습니다|입니다|드립니다|겠습니다)', body):
-        return False, "경어체(습니다) 혼용 발견"
+    if re.search(r’(습니다|입니다|드립니다|겠습니다)’, body):
+        return False, “경어체(습니다) 혼용 발견”
 
-    return True, "OK"
+    return True, “OK”
 
 # [v23.0] AI 품질검수 시스템
 MEDIA_TONE_DESC = {
@@ -1883,7 +1923,7 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
                 stage="rewrite",
             )
             p = parse_llm_response(res)
-            is_valid, msg = validate_content_quality(p['title'], p['body'])
+            is_valid, msg = validate_content_quality(p['title'], p['body'], url_id=article.get("url_id", ""), media=prefix)
             if not is_valid:
                 raise PipelineFailure("rewrite", "REWRITE_VALIDATION_FAIL", msg, retryable=False)
 
@@ -1897,7 +1937,7 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
                 print(f" {score}점(미달).", flush=True)
                 if fixed:
                     print(f"      🔧 [{prefix}] 자동보완 적용...", end="", flush=True)
-                    is_valid, msg = validate_content_quality(fixed['title'], fixed['body'])
+                    is_valid, msg = validate_content_quality(fixed['title'], fixed['body'], url_id=article.get("url_id", ""), media=prefix)
                     if not is_valid:
                         raise PipelineFailure("qa", "QA_FIXED_VALIDATION_FAIL", msg, retryable=False)
                     p = fixed
