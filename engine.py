@@ -813,6 +813,24 @@ def ai_quality_check(title: str, body: str, media_prefix: str) -> Tuple[bool, Li
         print(f"      ⚠️ [AI검수] 파싱 실패({str(e)[:50]}), 실패 처리")
         return False, ["AI검수 파싱 실패"], 0, None
 
+_META_TEXT_RE = re.compile(
+    r'^(첫\s*번째\s*문단[에서는으로]*\s*[:,：]?\s*|'
+    r'두\s*번째\s*문단[에서는으로]*\s*[:,：]?\s*|'
+    r'세\s*번째\s*문단[에서는으로]*\s*[:,：]?\s*|'
+    r'네\s*번째\s*문단[에서는으로]*\s*[:,：]?\s*|'
+    r'마지막\s*문단[에서는으로]*\s*[:,：]?\s*|'
+    r'중간\s*문단[에서는으로]*\s*[:,：]?\s*)',
+    re.MULTILINE,
+)
+
+def _strip_meta_text(text: str) -> str:
+    """본문에 노출된 '두 번째 문단에서는...' 형태의 구조 서술 제거."""
+    if not text:
+        return text
+    lines = text.splitlines()
+    cleaned = [_META_TEXT_RE.sub("", line) for line in lines]
+    return "\n".join(cleaned)
+
 def _strip_model_fences(text: str) -> str:
     if not text:
         return ""
@@ -937,7 +955,7 @@ def parse_llm_response(text):
     title = re.sub(r"[#\*\[\]`]", "", title).strip().strip('"')
     excerpt = re.sub(r"[#\*\[\]`]", "", excerpt).strip()
     excerpt = html.unescape(excerpt) if excerpt else ""
-    body_raw = limit_rewritten_body_text("\n".join(body_lines).strip(), HARD_REWRITTEN_BODY_CHARS)
+    body_raw = limit_rewritten_body_text(_strip_meta_text("\n".join(body_lines).strip()), HARD_REWRITTEN_BODY_CHARS)
     final_body = clean_body_html(body_raw)
     # 리드문이 비어 있으면 본문 첫 2문장으로 자동 생성
     if not excerpt and final_body:
