@@ -112,11 +112,13 @@ UPSTAGE_API_URL = os.environ.get("UPSTAGE_API_URL", f"{UPSTAGE_API_BASE.rstrip('
 UPSTAGE_MODEL = os.environ.get("UPSTAGE_MODEL", "solar-pro3")
 UPSTAGE_MODEL_REWRITE = os.environ.get("UPSTAGE_MODEL_REWRITE", UPSTAGE_MODEL)
 UPSTAGE_MODEL_QA = os.environ.get("UPSTAGE_MODEL_QA", UPSTAGE_MODEL)
-UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS", "1500"))
-UPSTAGE_QA_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_QA_MAX_OUTPUT_TOKENS", "900"))
+UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS", "2500"))
+UPSTAGE_QA_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_QA_MAX_OUTPUT_TOKENS", "2500"))
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-pro")
 GEMINI_MODEL_REWRITE = os.environ.get("GEMINI_MODEL_REWRITE", GEMINI_MODEL)
 GEMINI_MODEL_QA = os.environ.get("GEMINI_MODEL_QA", GEMINI_MODEL)
+# thinking 모델(gemma-4-31b-it 등)은 thinking 토큰이 maxOutputTokens를 잡아먹으므로 별도 높은 한도 사용
+GEMINI_THINKING_MAX_OUTPUT_TOKENS = int(os.environ.get("GEMINI_THINKING_MAX_OUTPUT_TOKENS", "8000"))
 REWRITE_SOURCE_MAX_CHARS = int(os.environ.get("REWRITE_SOURCE_MAX_CHARS", "4000"))
 MIN_REWRITTEN_BODY_CHARS = int(os.environ.get("MIN_REWRITTEN_BODY_CHARS", "300"))
 SOFT_REWRITTEN_BODY_CHARS = int(os.environ.get("SOFT_REWRITTEN_BODY_CHARS", "4500"))
@@ -346,8 +348,15 @@ def _llm_failure(stage: str, exc: Exception) -> PipelineFailure:
     return PipelineFailure(stage, f"{stage.upper()}_API_ERROR", message[:500], retryable=False)
 
 def _ask_gemini_rest(persona, text, model=None, max_output_tokens=None, stage="rewrite"):
-    use_model = model if (model and str(model).startswith("gemini")) else (GEMINI_MODEL_QA if stage == "qa" else GEMINI_MODEL_REWRITE)
-    output_tokens = max_output_tokens or (UPSTAGE_QA_MAX_OUTPUT_TOKENS if stage == "qa" else UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS)
+    use_model = model if (model and (str(model).startswith("gemini") or str(model).startswith("gemma"))) else (GEMINI_MODEL_QA if stage == "qa" else GEMINI_MODEL_REWRITE)
+    # thinking 모델(gemma-4-31b-it 등)은 thinking 토큰이 maxOutputTokens를 소비하므로 별도 높은 한도 적용
+    is_thinking_model = str(use_model).startswith("gemma")
+    if max_output_tokens:
+        output_tokens = max_output_tokens
+    elif is_thinking_model:
+        output_tokens = GEMINI_THINKING_MAX_OUTPUT_TOKENS
+    else:
+        output_tokens = UPSTAGE_QA_MAX_OUTPUT_TOKENS if stage == "qa" else UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{use_model}:generateContent"
     try:
         response = requests.post(
@@ -367,7 +376,7 @@ def _ask_gemini_rest(persona, text, model=None, max_output_tokens=None, stage="r
                     "maxOutputTokens": output_tokens,
                 },
             },
-            timeout=120,
+            timeout=300,
         )
         response.raise_for_status()
         data = response.json()
@@ -375,9 +384,11 @@ def _ask_gemini_rest(persona, text, model=None, max_output_tokens=None, stage="r
         if not candidates:
             raise ValueError("Gemini 응답에 candidates가 없음")
         parts = ((candidates[0].get("content") or {}).get("parts") or [])
+        # thinking 모델은 thought=True 파트를 필터링(내부 사고과정 제외)
         content = "".join(
-            part.get("text", "") if isinstance(part, dict) else str(part)
+            part.get("text", "")
             for part in parts
+            if isinstance(part, dict) and not part.get("thought")
         )
         return content.strip()
     except PipelineFailure:
@@ -387,7 +398,10 @@ def _ask_gemini_rest(persona, text, model=None, max_output_tokens=None, stage="r
 
 def ask_llm(persona, text, model=None, max_output_tokens=None, stage="rewrite"):
     provider = "upstage"
+    resolved_model = model or (UPSTAGE_MODEL_QA if stage == "qa" else UPSTAGE_MODEL_REWRITE)
     if REVIEW_ONLY and not UPSTAGE_API_KEY and GEMINI_API_KEY:
+        provider = "gemini"
+    elif GEMINI_API_KEY and (str(resolved_model).startswith("gemini") or str(resolved_model).startswith("gemma")):
         provider = "gemini"
     if provider == "gemini":
         return _ask_gemini_rest(persona, text, model=model, max_output_tokens=max_output_tokens, stage=stage)
@@ -784,9 +798,10 @@ MEDIA_TONE_DESC = {
 
 QA_SYSTEM_PROMPT = load_skill("qa_checker")
 
-def ai_quality_check(title: str, body: str, media_prefix: str) -> Tuple[bool, List[str], int, Optional[dict]]:
+def ai_quality_check(title: str, body: str, media_prefix: str, source_len: int = 0) -> Tuple[bool, List[str], int, Optional[dict]]:
     media_tone = MEDIA_TONE_DESC.get(media_prefix, "일반 뉴스")
-    system_prompt = QA_SYSTEM_PROMPT.format(media_tone=media_tone)
+    min_chars = int(source_len * 0.8) if source_len > 0 else 0
+    system_prompt = QA_SYSTEM_PROMPT.format(media_tone=media_tone, source_chars=source_len, min_chars=min_chars)
     # HTML 태그 제거 후 검수 — qa_checker는 HTML 태그를 포맷 오염으로 즉시 탈락 처리함
     plain_body = re.sub(r'<[^>]+>', ' ', body).strip()
     plain_body = re.sub(r'\s+', ' ', plain_body)
@@ -808,6 +823,33 @@ def ai_quality_check(title: str, body: str, media_prefix: str) -> Tuple[bool, Li
         fixed = None
         if not passed and len(parts) > 1:
             fixed = parse_llm_response(parts[1].strip())
+
+        # 분량 미달이면 강제 탈락 (원문 분량의 80% 기준, source_len이 없으면 300자)
+        body_char_count = len(plain_body)
+        min_body = int(source_len * 0.8) if source_len > 0 else 300
+        if body_char_count < min_body:
+            passed = False
+            if "분량 미달" not in str(fails):
+                fails = fails + [f"분량 미달({body_char_count}자, 기준 {min_body}자)"]
+
+        # QA 미통과 시 fixed 없거나 fixed도 분량 미달이면 fallback
+        if not passed and not fixed:
+            retry_user = (
+                f"다음 기사가 검수에서 탈락했다: {', '.join(str(f) for f in fails)}.\n"
+                f"탈락 사유를 모두 수정한 완성 기사를 출력하라. "
+                f"제목은 30자 이내, 쉼표 없이. 본문은 원문({source_len}자) 분량의 90~100% 수준으로.\n\n"
+                f"제목: {title}\n\n본문: {plain_body}"
+            )
+            retry_raw = ask_llm(
+                QA_SYSTEM_PROMPT.format(media_tone=MEDIA_TONE_DESC.get(media_prefix, "일반 뉴스"), source_chars=source_len, min_chars=min_body),
+                retry_user, model=UPSTAGE_MODEL_QA, max_output_tokens=UPSTAGE_QA_MAX_OUTPUT_TOKENS, stage="qa"
+            )
+            parts3 = retry_raw.split("---", 1)
+            if len(parts3) > 1:
+                candidate = parse_llm_response(parts3[1].strip())
+                if len(candidate.get('title', '')) < 60 and len(candidate.get('body', '')) > 200:
+                    fixed = candidate
+
         return passed, fails, total, fixed
     except Exception as e:
         print(f"      ⚠️ [AI검수] 파싱 실패({str(e)[:50]}), 실패 처리")
@@ -935,6 +977,10 @@ def parse_llm_response(text):
     if not title and lines:
         title = lines[0].strip()
     title = re.sub(r"[#\*\[\]`]", "", title).strip().strip('"')
+    title = title.replace(',', '').replace('，', '')  # 제목 쉼표 금지 후처리
+    # 제목이 영어로만 구성된 경우 제거 (모델이 원문을 echo하는 오류 방지)
+    if title and re.match(r'^[A-Za-z0-9 :,.\'"!?()-]+$', title):
+        title = ""
     excerpt = re.sub(r"[#\*\[\]`]", "", excerpt).strip()
     excerpt = html.unescape(excerpt) if excerpt else ""
     body_raw = limit_rewritten_body_text("\n".join(body_lines).strip(), HARD_REWRITTEN_BODY_CHARS)
@@ -1872,7 +1918,7 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
             # AI 품질검수+보완 (Solar Pro 3 1회)
             print(" 작성완료.", flush=True)
             print(f"      🔍 [{prefix}] Solar Pro 3 품질검수 중...", end="", flush=True)
-            passed, fails, score, fixed = ai_quality_check(p['title'], p['body'], prefix)
+            passed, fails, score, fixed = ai_quality_check(p['title'], p['body'], prefix, source_len=len(source_text))
             final_pass = passed
 
             if not passed:
