@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Solar Pro 3 vs gemma-4-31b-it 비교 테스트 (현재 프롬프트 기준)"""
+"""NN / CB 프롬프트 테스트 — Solar Pro 3"""
 import os, sys, re
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -8,39 +8,32 @@ load_dotenv()
 
 import engine as eng
 
-print(f"Solar Pro 3 모델: {eng.UPSTAGE_MODEL_REWRITE}")
-print(f"Gemma 모델: gemma-4-31b-it")
-print(f"QA 모델: {eng.UPSTAGE_MODEL_QA}")
+print(f"Rewrite model: {eng.UPSTAGE_MODEL_REWRITE}")
+print(f"QA model:      {eng.UPSTAGE_MODEL_QA}")
 
 # ─── 원문 3종 ───────────────────────────────────────────────
 
 SOURCES = {
     "1200자": """
-서울시가 2025년부터 저소득층 청소년을 대상으로 디지털 교육 지원사업을 본격 시행한다. 서울시에 따르면 이 사업은 중위소득 60% 이하 가구의 만 12~18세 청소년 약 3,200명에게 태블릿PC와 인터넷 요금을 무상 지원하고, 코딩 교육 프로그램도 함께 제공한다. 총 사업비는 연간 48억 원이며 시 예산 70%와 자치구 매칭 30%로 구성된다.
+포스코홀딩스가 2025년부터 자사 철강 제품의 탄소 발자국을 제품 단위별로 공개하기로 했다. 포스코는 연간 철강 생산량의 50% 이상을 차지하는 주요 제품군 8종에 대해 생산 1톤당 탄소 배출량을 반기별로 고객사에 제공한다. 2024년 기준 포스코의 제품별 탄소 집약도는 철강 업종 글로벌 평균(1.85tCO2e/t)의 1.4배 수준이다.
 
-사업의 배경에는 서울 내 저소득층 청소년의 스마트기기 보유율이 전국 평균 대비 23%포인트 낮다는 조사 결과가 있다. 서울시 교육국이 2024년 실시한 전수조사에서 중위소득 60% 이하 가구 청소년 가운데 39%가 학습용 스마트기기를 보유하지 않은 것으로 나타났다. 이들 중 절반 이상은 학교 과제를 수행하기 위해 PC방을 이용하거나 형제·자매와 기기를 공유하는 것으로 조사됐다. 기기 부재는 학습 격차로 직결된다는 게 서울시의 판단이다.
+이번 결정의 배경에는 현대차·기아 등 주요 완성차 고객사의 공급망 탄소 데이터 요구가 있다. 현대차는 2023년부터 1차 협력사에 탄소 발자국 데이터를 납품 평가 항목에 포함했으며 2026년부터는 소재 공급사로 범위를 확대할 방침이다. 포스코가 탄소 데이터 공개를 거부하거나 기준을 충족하지 못하면 완성차 공급망에서 이탈할 가능성이 생긴다. 자동차용 강판은 포스코 매출의 약 27%를 차지하는 핵심 사업이다.
 
-지원 대상으로 선정된 청소년은 2년간 태블릿PC와 월 최대 3만 원 상당의 인터넷 요금을 지원받는다. 코딩 교육은 온·오프라인을 병행하며 연간 60시간 이상의 커리큘럼으로 운영된다. 서울시는 협약 교육기관 12곳과 손잡고 실습 중심의 프로그램을 제공할 예정이다. 교육 이수 후에는 디지털 역량 인증서를 발급해 진학·취업 시 활용할 수 있도록 한다.
+포스코는 탄소 집약도 개선을 위해 수소 환원 제철 기술 개발에 2030년까지 3조 4,000억 원을 투자한다. 수소 환원 제철은 석탄 대신 수소를 환원제로 사용해 철강 생산 시 이산화탄소 대신 물만 발생하는 기술이다. 현재는 시범 설비 수준이며 상용화까지 최소 8년이 걸릴 것으로 전망된다. 단기 탄소 감축은 전기로 전환과 재생에너지 사용 비중 확대로 대응한다.
 
-신청은 2025년 3월 1일부터 거주지 자치구 복지관을 통해 접수된다. 온라인 신청도 병행하며, 서울시 복지포털에서 신청서를 내려받아 제출할 수 있다. 선정된 청소년의 학습 이력은 별도 데이터베이스에 기록되며 성취도에 따라 향후 장학금 연계 프로그램으로 연결된다. 서울시 교육국장은 "디지털 격차가 학습 격차로 이어지는 악순환을 끊는 것이 목표"라며 "지원 효과를 분기별로 점검하고 필요 시 대상을 확대하겠다"고 밝혔다.
-
-다만 중위소득 60%를 초과하는 저소득 가구 청소년은 지원 대상에서 제외된다. 기준선 바로 위에 있는 차상위 계층 청소년은 디지털 격차를 겪으면서도 제도 밖에 남는다. 서울시는 2026년도 예산 심의에서 지원 기준을 중위소득 70%까지 확대하는 방안을 검토하기로 했다. 사업의 실효성을 높이려면 경계선 계층을 포용하는 추가 재원 마련이 선행 과제로 꼽힌다.
-
-서울시는 이 사업이 단순한 기기 보급에 그치지 않도록 사후 관리 체계도 마련했다. 지원 청소년 전담 멘토링 프로그램을 운영해 학습 활용도를 높이고, 6개월마다 학습 이력과 기기 활용 현황을 점검한다. 기기 파손이나 분실의 경우 1회에 한해 무상 교체를 지원하며 부품 수리비는 실비로 처리한다. 서울시는 2025년 사업 결과를 바탕으로 2027년까지 지원 대상을 5,000명으로 늘리는 중장기 계획도 수립 중이다.
+다만 탄소 데이터 공개가 경쟁사 대비 불리한 수치를 노출시킬 수 있다는 점은 리스크 요인이다. 한국철강협회는 "국내 철강사의 탄소 집약도가 유럽 경쟁사보다 높은 현실에서 데이터 투명성이 오히려 시장 지위를 약화시킬 수 있다"고 지적했다. 포스코는 2027년까지 탄소 집약도를 10% 낮추는 단기 목표를 제시했으나 유럽 경쟁사들과의 격차를 좁히는 데는 2030년 이후가 될 것으로 보인다.
 """.strip(),
 
     "1500자": """
-정부가 2025년 하반기부터 중소기업 전용 AI 도입 지원 프로그램을 본격 운영한다. 중소벤처기업부는 직원 50인 이하 제조업체를 우선 대상으로 AI 솔루션 도입 비용의 최대 80%를 지원하며 1개사당 최대 5,000만 원의 보조금을 지급한다고 발표했다. 지원 대상 기업은 전국 약 1만 2,000개사로 추산되며 총 예산은 6,000억 원 규모다.
+LG화학이 2025년부터 1차 협력사 전체를 대상으로 온실가스 배출량과 산업재해 현황을 반기별로 공개하는 의무 보고 체계를 도입한다. 공개 대상은 약 320개 협력사이며 이 중 중소기업 비중이 78%에 달한다. 공개 기준을 충족하지 못한 협력사는 2026년부터 신규 계약 체결이 제한된다. LG화학은 이 정보를 자사 지속가능경영보고서에 통합해 매년 공개하기로 했다.
 
-사업 신청은 2025년 7월 1일부터 중기부 공식 포털을 통해 가능하다. 정부는 이 사업의 근거로 OECD가 2023년 발간한 보고서를 들었다. 해당 보고서는 AI를 도입한 제조업체의 생산성이 평균 34% 향상됐다는 분석을 담고 있다. 중기부는 국내 소규모 제조업체도 AI 도입 시 유사한 효과를 낼 것으로 기대한다고 밝혔다. 지원 가능한 AI 솔루션 유형은 공정 자동화, 품질 검사, 수요 예측, 재고 관리 등 4개 분야로 나뉜다.
+이번 조치는 EU 공급망실사지침(CSDDD) 대응이 배경이다. CSDDD는 2026년부터 연매출 1억 5,000만 유로(약 2,200억 원) 이상 기업에 공급망 내 인권·환경 실사 의무를 부과하며 위반 시 매출의 최대 5%를 과징금으로 부과한다. LG화학의 2024년 유럽 매출은 약 4조 7,000억 원으로, 이론상 최대 2,350억 원의 과징금 리스크를 안고 있다. 재계에서는 이번 LG화학의 조치가 CSDDD 선제 대응 차원이라고 분석한다.
 
-그러나 현장에서는 실효성에 의문을 제기하는 목소리가 나온다. 중소기업중앙회는 AI 솔루션 공급업체 선정 기준이 불투명하다며 "현장 수요와 맞지 않는 솔루션이 밀려들 우려가 있다"고 지적했다. 특히 지방 소재 기업의 경우 AI 전문 인력 자체를 구하기 어려워 솔루션을 도입하더라도 실제 활용률이 낮을 수 있다는 우려도 제기됐다. 중소기업연구원이 지난해 실시한 조사에서 지방 제조업체 중 AI 운용 인력을 1명 이상 보유한 곳은 전체의 8.3%에 그쳤다.
+LG화학은 협력사 지원을 위해 '협력사 ESG 진단 플랫폼'을 2025년 3월 출시한다. 플랫폼 이용료는 무상이지만, 배출량 산정에 필요한 제3자 검증 비용은 협력사가 부담해야 한다. 검증 비용은 기업 규모에 따라 연 500만~3,000만 원 수준이다. 한국공급망ESG협의회에 따르면 국내 중소 협력사 가운데 탄소 배출량을 자체 측정할 역량을 갖춘 곳은 전체의 11%에 불과하다.
 
-공급업체 선정 방식도 논란이다. 정부는 사전 심사를 통해 승인된 업체 목록을 제공하고 기업이 그 안에서 선택하는 방식을 검토 중이다. 중소기업중앙회는 목록에 없는 특화 솔루션을 활용하지 못하게 되는 문제를 지적하며 수요자 중심의 선택권 보장을 요구했다. 현장 컨설팅 없이 솔루션만 공급하는 방식으로는 도입 효과를 내기 어렵다는 지적도 나왔다. 중기부는 분기별 성과 점검을 통해 지원 대상과 보조율을 탄력적으로 조정할 방침이라고 밝혔다.
+계약 제한 조항을 놓고 협력업체들의 반발이 나오고 있다. 중소기업중앙회는 "준비 기간 없이 일방적인 계약 조건 변경은 협력사 경영에 직접적인 부담을 준다"며 적응 기간 2년 연장을 요청했다. LG화학은 기준 미달 협력사에 2026~2027년 2년간 개선 계획서 제출로 계약 유지를 허용하는 유예 조항을 마련했다고 밝혔다. 그러나 유예 기간 종료 이후에도 기준을 충족하지 못하면 계약 해지가 가능해, 중소 협력사들의 불안은 가시지 않고 있다.
 
-이번 프로그램은 제조업 외에 서비스업과 물류업으로도 2026년 확대될 예정이다. 산업별 AI 활용 특성이 달라 업종별 맞춤 가이드라인도 별도로 마련할 계획이다. 정부는 1차 지원 결과를 2025년 4분기까지 분석해 2026년 확대 적용 여부를 최종 결정하기로 했다. 전문가들은 인력 양성과 컨설팅 지원을 보조금과 함께 묶어야 실질적인 생산성 향상으로 이어질 수 있다고 조언한다.
-
-보조금 지급은 선심사 후 정산 방식으로 진행된다. 기업이 먼저 자체 자금으로 솔루션을 도입한 뒤 실적을 제출하면 정부가 비용을 정산해 지급하는 구조다. 이 때문에 자금 여력이 부족한 영세 기업은 사실상 신청하기 어렵다는 지적이 나온다. 중기부는 이를 보완하기 위해 정책금융기관과 연계한 AI 도입 전용 저금리 대출 상품도 함께 출시할 예정이라고 밝혔다. 또한 지방 기업의 인력 문제를 해소하기 위해 AI 현장 지원단을 구성해 방문 컨설팅을 제공하는 방안도 검토 중이다. 현장 지원단은 권역별로 총 120명 규모로 운영될 예정이며 6개월간 기업당 평균 4회 방문을 목표로 한다.
+LG화학은 이번 조치와 별도로 2030년까지 배터리 소재 부문의 탄소 집약도를 2022년 대비 35% 낮추겠다는 목표도 내세웠다. 글로벌 전기차 제조사들이 배터리 소재 공급업체에 탄소 발자국 데이터를 납품 조건으로 요구하기 시작했기 때문이다. LG화학은 탄소 집약도 개선이 유럽 및 미국 완성차 공급망 유지와 직결된다고 설명했다. 회사 측은 탄소 목표를 달성하지 못하면 주요 전기차 공급망에서 이탈할 가능성을 공식적으로 인정한 셈이다.
 """.strip(),
 
     "2000자": """
@@ -60,17 +53,15 @@ SOURCES = {
 """.strip(),
 }
 
-GEMMA_31B = "gemma-4-31b-it"
-GEMMA_26B = "gemma-4-26b-a4b-it"
+MEDIAS = ["IJ_", "NN_", "CB_"]
 
-persona = eng.PERSONA_DEFINITIONS["IJ_"]
-
-def run_one(label, source, model_name, use_gemini=False):
-    """단일 모델로 리라이트+QA 실행. 결과 dict 반환."""
+def run_one(label, source, model_name, media_prefix, use_gemini=False):
+    """단일 모델·매체로 리라이트+QA 실행. 결과 dict 반환."""
+    persona = eng.PERSONA_DEFINITIONS[media_prefix]
     src_len = len(source)
     min_body = int(src_len * 0.8)
 
-    print(f"    [{model_name}] 리라이트...", end="", flush=True)
+    print(f"    [{media_prefix}] 리라이트...", end="", flush=True)
     try:
         if use_gemini:
             raw = eng._ask_gemini_rest(persona, source, model=model_name, stage="rewrite")
@@ -90,7 +81,7 @@ def run_one(label, source, model_name, use_gemini=False):
     print(f" {rw_len}자", end="", flush=True)
 
     print(f" | QA...", end="", flush=True)
-    passed, fails, score, fixed = eng.ai_quality_check(p['title'], p['body'], "IJ_", source_len=src_len)
+    passed, fails, score, fixed = eng.ai_quality_check(p['title'], p['body'], media_prefix, source_len=src_len)
     final = fixed if fixed else p
     final_body_raw = final.get('body', '')
     final_plain = re.sub(r'<[^>]+>', ' ', final_body_raw).strip()
@@ -108,7 +99,7 @@ def run_one(label, source, model_name, use_gemini=False):
     return {
         "title": final.get('title', ''),
         "excerpt": final.get('excerpt', ''),
-        "body": final_plain[:300] + ("..." if len(final_plain) > 300 else ""),
+        "body": final_plain[:400] + ("..." if len(final_plain) > 400 else ""),
         "full_body_len": final_plain_len,
         "rw_len": rw_len,
         "score": score,
@@ -117,9 +108,8 @@ def run_one(label, source, model_name, use_gemini=False):
         "issues": issues,
     }
 
-summary_solar = []
-summary_gemma = []
-summary_g26b  = []
+# results[media_prefix] = [(label, src_len, result), ...]
+results = {m: [] for m in MEDIAS}
 
 for label, source in SOURCES.items():
     src_len = len(source)
@@ -127,42 +117,30 @@ for label, source in SOURCES.items():
     print(f"▶ [{label}] 원문 {src_len}자  (기준 {int(src_len*0.8)}자)")
     print(f"{'━'*70}")
 
-    r_solar  = run_one(label, source, eng.UPSTAGE_MODEL_REWRITE, use_gemini=False)
-    r_g31b   = run_one(label, source, GEMMA_31B, use_gemini=True)
-    r_g26b   = run_one(label, source, GEMMA_26B, use_gemini=True)
-
-    def show(tag, r):
+    for media in MEDIAS:
+        r = run_one(label, source, eng.UPSTAGE_MODEL_REWRITE, media_prefix=media)
         icon = '✅' if not r['issues'] else '⚠️'
-        print(f"  ┌─ {tag} ({r['full_body_len']}자 / QA {r['score']}점) {icon}")
+        print(f"  ┌─ [{media}] {r['full_body_len']}자 / QA {r['score']}점 {icon}")
         print(f"  │  제목: {r['title']}")
         print(f"  │  리드: {r['excerpt'][:80]}")
         print(f"  │  본문: {r['body']}")
         for iss in r['issues']:
             print(f"  │  ⚠ {iss}")
         print(f"  └{'─'*60}")
+        results[media].append((label, src_len, r))
 
-    print()
-    show("Solar Pro 3    ", r_solar)
-    show("gemma-4-31b-it ", r_g31b)
-    show("gemma-4-26b-a4b", r_g26b)
-
-    summary_solar.append((label, src_len, r_solar))
-    summary_gemma.append((label, src_len, r_g31b))
-    summary_g26b.append((label, src_len, r_g26b))
-
-# ─── 종합 비교표 ────────────────────────────────────────────
+# ─── 종합표 ────────────────────────────────────────────────
 print()
-print("=" * 75)
-print("종합 비교")
-print("=" * 75)
-print(f"{'원문':>6} | {'모델':<22} | {'리라이트':>6} | {'최종(평문)':>10} | {'기준(80%)':>9} | {'QA':>4} | 판정")
-print("-" * 75)
-for (label, src_len, rs), (_, __, rg), (___, ____, rg2) in zip(summary_solar, summary_gemma, summary_g26b):
+print("=" * 72)
+print("종합")
+print("=" * 72)
+print(f"{'원문':>6} | {'매체':<6} | {'리라이트':>6} | {'최종(평문)':>10} | {'기준(80%)':>9} | {'QA':>4} | 판정")
+print("-" * 72)
+for label, source in SOURCES.items():
+    src_len = len(source)
     base = int(src_len * 0.8)
-    si  = "✅" if not rs['issues']  else "❌"
-    gi  = "✅" if not rg['issues']  else "❌"
-    gi2 = "✅" if not rg2['issues'] else "❌"
-    print(f"{label:>6} | {'solar-pro3':<22} | {rs['rw_len']:>6} | {rs['full_body_len']:>10} | {base:>9} | {rs['score']:>4} | {si}")
-    print(f"{'':>6} | {'gemma-4-31b-it':<22} | {rg['rw_len']:>6} | {rg['full_body_len']:>10} | {base:>9} | {rg['score']:>4} | {gi}")
-    print(f"{'':>6} | {'gemma-4-26b-a4b-it':<22} | {rg2['rw_len']:>6} | {rg2['full_body_len']:>10} | {base:>9} | {rg2['score']:>4} | {gi2}")
-    print(f"{'':>6} | {'':<22} | {'':>6} | {'':>10} | {'':>9} | {'':>4} |")
+    for media in MEDIAS:
+        row = next(r for l, s, r in results[media] if l == label)
+        icon = "✅" if not row['issues'] else "❌"
+        print(f"{label:>6} | {media:<6} | {row['rw_len']:>6} | {row['full_body_len']:>10} | {base:>9} | {row['score']:>4} | {icon}")
+    print(f"{'':>6} | {'':>6} |")

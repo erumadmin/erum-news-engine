@@ -967,8 +967,11 @@ def parse_llm_response(text):
             body_lines.append(line)
         elif current == "title" and not title:
             title = line
-        elif current == "excerpt" and not excerpt:
-            excerpt = line
+        elif current == "excerpt":
+            if not excerpt:
+                excerpt = line
+            else:
+                body_lines.append(line)  # 리드문 이후 라벨 없는 본문 텍스트 처리
         elif current == "cat" and not cat:
             cat = line
         elif current == "tags" and not tags:
