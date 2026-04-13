@@ -2088,6 +2088,189 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
     raise PipelineFailure("run", "NO_MEDIA_PUBLISHED", "모든 매체 발행 실패", retryable=False)
 
 
+# ========================= [고객 보도자료 자동 처리] =========================
+
+def fetch_customer_requests() -> list:
+    """erum-one.com에서 SUBMITTED 상태의 고객 요청 목록을 가져온다."""
+    try:
+        r = requests.get(
+            f"{ERUM_API_BASE}/api/engine/customer-requests",
+            headers={"x-api-key": ERUM_API_KEY},
+            timeout=15,
+        )
+        r.raise_for_status()
+        return r.json().get("requests", [])
+    except Exception as e:
+        print(f"   ⚠️ 고객 요청 fetch 실패 (RSS 계속 진행): {e}")
+        return []
+
+
+def complete_customer_request(cr_id: int, published_urls: dict, message: str) -> bool:
+    """발행 완료(또는 실패) 결과를 erum-one.com에 콜백한다."""
+    try:
+        if published_urls:
+            body = {"publishedUrls": published_urls, "publishedTitle": message}
+        else:
+            body = {"failReason": message}
+        r = requests.post(
+            f"{ERUM_API_BASE}/api/engine/customer-requests/{cr_id}/complete",
+            headers={"x-api-key": ERUM_API_KEY, "Content-Type": "application/json"},
+            json=body,
+            timeout=15,
+        )
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"   ⚠️ 고객 요청 완료 콜백 실패 (cr_id={cr_id}): {e}")
+        return False
+
+
+def _cr_site_domain(prefix: str) -> str:
+    """prefix → 사이트 도메인 (https://impactjournal.kr 형태)."""
+    sitemap = ERUM_CFG.get(prefix, {}).get("sitemap", "")
+    if sitemap:
+        parts = sitemap.split("/sitemap")
+        return parts[0]
+    return ""
+
+
+def process_customer_request(cr: dict, upload_counts: dict) -> Optional[dict]:
+    """고객 보도자료 1건을 IJ/NN/CB에 발행한다."""
+    cr_id = cr["id"]
+    title = cr.get("title", "")
+    body_raw = cr.get("body") or ""
+    featured_image_url = cr.get("featuredImageUrl") or ""
+    image_caption = cr.get("imageCaption") or ""
+    ai_rewrite = bool(cr.get("aiRewriteActive", True))
+    published_at = now_kst()
+
+    print(f"\n📨 고객 요청 처리: [{cr.get('requestNumber', cr_id)}] {title[:40]}...")
+    print(f"   AI재작성={ai_rewrite}, 이미지={'있음' if featured_image_url else '없음'}")
+
+    # 이미지 처리
+    img_bytes: Optional[bytes] = None
+    img_content_type = "image/jpeg"
+    img_fn = f"cr_{cr_id}.jpg"
+    r2_url: Optional[str] = None
+
+    if featured_image_url:
+        try:
+            print(f"   📥 이미지 다운로드 중...", end="", flush=True)
+            resp = fetch_with_retry(featured_image_url, timeout=20)
+            if resp and resp.status_code == 200:
+                img_bytes = resp.content
+                ct = resp.headers.get("Content-Type", "image/jpeg")
+                img_content_type = ct.split(";")[0].strip()
+                ext = "jpg" if "jpeg" in img_content_type else img_content_type.split("/")[-1]
+                img_fn = f"cr_{cr_id}.{ext}"
+                print(f" 완료 ({len(img_bytes)//1024}KB).")
+                r2_url = upload_to_r2(img_bytes, img_fn, img_content_type)
+            else:
+                print(f" 실패(HTTP {getattr(resp, 'status_code', '?')}).")
+        except Exception as e:
+            print(f" 실패({e}).")
+
+    published_urls: dict = {}
+    failures: list = []
+    first_published_title = title
+
+    for prefix in MEDIA_PREFIXES:
+        site = SITES[prefix]
+        site_code = ERUM_CFG[prefix]["site"]
+        img_url = r2_url if r2_url else (featured_image_url or None)
+
+        try:
+            if ai_rewrite:
+                # Solar Pro 3 재작성 경로
+                print(f"   ✍️ [{prefix}] Solar Pro 3 재작성 중...", end="", flush=True)
+                source_text = strip_html_tags(body_raw)[:REWRITE_SOURCE_MAX_CHARS]
+                res = ask_llm(
+                    PERSONA_DEFINITIONS[prefix],
+                    source_text,
+                    model=UPSTAGE_MODEL_REWRITE,
+                    max_output_tokens=UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS,
+                    stage="rewrite",
+                )
+                p = parse_llm_response(res)
+                is_valid, msg = validate_content_quality(p["title"], p["body"])
+                if not is_valid:
+                    raise PipelineFailure("rewrite", "REWRITE_VALIDATION_FAIL", msg, retryable=False)
+                print(" 완료.", flush=True)
+
+                print(f"   🔍 [{prefix}] QA 중...", end="", flush=True)
+                passed, qa_fails, score, fixed = ai_quality_check(
+                    p["title"], p["body"], prefix, source_len=len(source_text)
+                )
+                if not passed:
+                    if fixed:
+                        is_valid, msg = validate_content_quality(fixed["title"], fixed["body"])
+                        if not is_valid:
+                            raise PipelineFailure("qa", "QA_FIXED_VALIDATION_FAIL", msg, retryable=False)
+                        p = fixed
+                    else:
+                        raise PipelineFailure("qa", "QA_HARD_FAIL", f"QA 미달(점수:{score})", retryable=False)
+                print(f" {score}점 통과.", flush=True)
+
+                cat, tags = get_hybrid_meta(p["title"], p["body"], p["cat"], p["tags"])
+                pub_title = p["title"]
+                pub_body = p["body"]
+                pub_excerpt = p.get("excerpt", "")
+            else:
+                # AI 미사용: 문단 정규화만
+                print(f"   📝 [{prefix}] 문단 정규화 발행...", end="", flush=True)
+                pub_title = title
+                pub_body = re.sub(r"\n{3,}", "\n\n", body_raw.strip())
+                pub_excerpt = pub_body[:200].split("\n")[0]
+                cat = DEFAULT_CATEGORY
+                tags = []
+                print(" 완료.", flush=True)
+
+            journalist = JOURNALIST_MAP.get(site_code, {}).get(cat)
+            cat_id = site.get_cat_id(cat)
+
+            print(f"   🚀 [{prefix}] 발행 중...", end="", flush=True)
+            pid = site.create_post(
+                pub_title,
+                pub_body,
+                cat_id,
+                site.get_tag_ids(tags),
+                img_url,
+                excerpt=pub_excerpt,
+                author=journalist,
+                published_at=published_at,
+                source_published_at=None,
+            )
+            domain = _cr_site_domain(prefix)
+            article_url = f"{domain}/articles/{pid}" if domain else ""
+            published_urls[site_code] = article_url
+            upload_counts[prefix] = upload_counts.get(prefix, 0) + 1
+            if not first_published_title or first_published_title == title:
+                first_published_title = pub_title
+            print(f" 성공 (ID:{pid}).")
+            submit_sitemap_to_gsc(prefix)
+            time.sleep(1)
+
+        except PipelineFailure as e:
+            print(f" 실패({e.stage}/{e.code}).")
+            failures.append(f"{prefix}: {e.stage}/{e.code}")
+            if e.abort_run:
+                break
+        except Exception as e:
+            print(f" 실패({e}).")
+            failures.append(f"{prefix}: {str(e)[:80]}")
+
+    if published_urls:
+        complete_customer_request(cr_id, published_urls, first_published_title)
+        return {
+            "success_media": list(published_urls.keys()),
+            "partial_success": len(published_urls) < len(MEDIA_PREFIXES),
+        }
+    else:
+        detail = " | ".join(failures[:3]) if failures else "원인 불명"
+        complete_customer_request(cr_id, {}, f"모든 매체 발행 실패: {detail}")
+        return None
+
+
 def run():
     print(f"\n🚀 AI 뉴스 엔진 (v25.1-Upstage_SolarPro3_KST) 가동: {now_kst().strftime('%Y-%m-%d %H:%M:%S')}")
     if TARGET_URL_IDS:
@@ -2126,6 +2309,29 @@ def run():
 
         blocked_ids = db_get_retry_blocked_ids()
         article_rules = db_get_active_article_rules()
+
+    # 고객 보도자료 우선 처리 (Priority Fetch)
+    if not REVIEW_ONLY:
+        print("\n📬 고객 보도자료 우선 처리 시작...")
+        customer_reqs = fetch_customer_requests()
+        if customer_reqs:
+            print(f"   📥 대기 중인 고객 요청: {len(customer_reqs)}건")
+            cr_upload_counts = {p: 0 for p in MEDIA_PREFIXES}
+            for cr in customer_reqs:
+                try:
+                    result = process_customer_request(cr, cr_upload_counts)
+                    if result:
+                        print(f"   ✅ [{cr.get('requestNumber', cr.get('id'))}] 발행 완료: {result.get('success_media')}")
+                    else:
+                        print(f"   ❌ [{cr.get('requestNumber', cr.get('id'))}] 발행 실패")
+                except Exception as e:
+                    print(f"   ❌ [{cr.get('requestNumber', cr.get('id'))}] 예외 발생: {e}")
+                    try:
+                        complete_customer_request(cr["id"], {}, f"예외 발생: {str(e)[:200]}")
+                    except Exception:
+                        pass
+        else:
+            print("   ✅ 대기 중인 고객 요청 없음.")
 
     # 기사 수집
     if REVIEW_ONLY and TARGET_URL_ID_LIST:
