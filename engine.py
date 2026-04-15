@@ -93,13 +93,6 @@ ERUM_CFG = {
     "CB_": {"site": "CB", "gsc_site": "sc-domain:csrbriefing.kr", "sitemap": "https://csrbriefing.kr/sitemap-news.xml"},
 }
 
-# 카테고리별 기자 배정 (조직도: mgmt/03_operations/언론사_편집국_조직도.md)
-JOURNALIST_MAP: dict[str, dict[str, str]] = {
-    "IJ": {"정치": "오지현", "경제": "이성민", "사회": "윤성민", "IT/과학": "장예린", "문화/생활": "한재원", "국제": "서민준", "환경": "나혜진"},
-    "NN": {"정치": "최지훈", "경제": "윤재원", "사회": "박서연", "IT/과학": "임태양", "문화/생활": "강미래", "국제": "송현아", "환경": "김도현"},
-    "CB": {"정치": "김민서", "경제": "이준혁", "사회": "박지은", "IT/과학": "최현우", "문화/생활": "정수빈", "국제": "한다영", "환경": "오태준"},
-}
-
 # Cloudflare R2
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
@@ -112,18 +105,21 @@ UPSTAGE_API_URL = os.environ.get("UPSTAGE_API_URL", f"{UPSTAGE_API_BASE.rstrip('
 UPSTAGE_MODEL = os.environ.get("UPSTAGE_MODEL", "solar-pro3")
 UPSTAGE_MODEL_REWRITE = os.environ.get("UPSTAGE_MODEL_REWRITE", UPSTAGE_MODEL)
 UPSTAGE_MODEL_QA = os.environ.get("UPSTAGE_MODEL_QA", UPSTAGE_MODEL)
-UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS", "2500"))
-UPSTAGE_QA_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_QA_MAX_OUTPUT_TOKENS", "2500"))
+UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS", "1500"))
+UPSTAGE_REWRITE_RETRY_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_REWRITE_RETRY_MAX_OUTPUT_TOKENS", "2200"))
+UPSTAGE_QA_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_QA_MAX_OUTPUT_TOKENS", "900"))
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-pro")
 GEMINI_MODEL_REWRITE = os.environ.get("GEMINI_MODEL_REWRITE", GEMINI_MODEL)
 GEMINI_MODEL_QA = os.environ.get("GEMINI_MODEL_QA", GEMINI_MODEL)
-# thinking 모델(gemma-4-31b-it 등)은 thinking 토큰이 maxOutputTokens를 잡아먹으므로 별도 높은 한도 사용
-GEMINI_THINKING_MAX_OUTPUT_TOKENS = int(os.environ.get("GEMINI_THINKING_MAX_OUTPUT_TOKENS", "8000"))
 REWRITE_SOURCE_MAX_CHARS = int(os.environ.get("REWRITE_SOURCE_MAX_CHARS", "4000"))
 MIN_REWRITTEN_BODY_CHARS = int(os.environ.get("MIN_REWRITTEN_BODY_CHARS", "300"))
+SHORT_FORM_MIN_REWRITTEN_BODY_CHARS = int(os.environ.get("SHORT_FORM_MIN_REWRITTEN_BODY_CHARS", "220"))
+SHORT_FORM_MIN_SENTENCE_COUNT = int(os.environ.get("SHORT_FORM_MIN_SENTENCE_COUNT", "4"))
+SHORT_FORM_MIN_PARAGRAPH_COUNT = int(os.environ.get("SHORT_FORM_MIN_PARAGRAPH_COUNT", "3"))
 SOFT_REWRITTEN_BODY_CHARS = int(os.environ.get("SOFT_REWRITTEN_BODY_CHARS", "4500"))
 HARD_REWRITTEN_BODY_CHARS = int(os.environ.get("HARD_REWRITTEN_BODY_CHARS", "6500"))
 QA_INPUT_MAX_CHARS = int(os.environ.get("QA_INPUT_MAX_CHARS", "2400"))
+QA_SOURCE_MAX_CHARS = int(os.environ.get("QA_SOURCE_MAX_CHARS", "1800"))
 LLM_RESPONSE_MAX_CHARS = int(os.environ.get("LLM_RESPONSE_MAX_CHARS", "12000"))
 MAX_REWRITTEN_BODY_CHARS = SOFT_REWRITTEN_BODY_CHARS  # backward compatibility for older helper code
 MAX_ARTICLE_RETRY_ATTEMPTS = 2
@@ -306,7 +302,12 @@ IJ_CATEGORY_AUTHOR = {
 
 # ========================= [2. Upstage / 프롬프트] =========================
 
-PROMPT_USER_TEMPLATE = """원문 자료:
+REWRITE_USER_TEMPLATE = """원문 메타데이터
+제목: {source_title}
+출처 URL: {source_url}
+원문 발행시각: {source_published_at}
+
+원문 본문
 {original_text}
 """
 
@@ -326,6 +327,18 @@ PERSONA_DEFINITIONS = {
     "NN_": f"{EDITOR_COMMON_PROMPT}\n\n{load_skill('news_editor_nn')}",
     "CB_": f"{EDITOR_COMMON_PROMPT}\n\n{load_skill('news_editor_cb')}",
 }
+
+def build_rewrite_user_message(article: dict) -> str:
+    source_title = re.sub(r"\s+", " ", (article.get("title") or "").strip()) or "미상"
+    source_url = (article.get("url") or "").strip() or "미상"
+    source_published_at = to_kst_iso(article.get("source_published_at")) or "미상"
+    original_text = strip_html_tags(article.get("body", ""))[:REWRITE_SOURCE_MAX_CHARS]
+    return REWRITE_USER_TEMPLATE.format(
+        source_title=source_title,
+        source_url=source_url,
+        source_published_at=source_published_at,
+        original_text=original_text,
+    )
 
 def _llm_failure(stage: str, exc: Exception) -> PipelineFailure:
     status = getattr(exc, "status_code", None)
@@ -347,16 +360,9 @@ def _llm_failure(stage: str, exc: Exception) -> PipelineFailure:
         return PipelineFailure(stage, f"{stage.upper()}_API_ERROR", message[:500], retryable=True)
     return PipelineFailure(stage, f"{stage.upper()}_API_ERROR", message[:500], retryable=False)
 
-def _ask_gemini_rest(persona, text, model=None, max_output_tokens=None, stage="rewrite"):
-    use_model = model if (model and (str(model).startswith("gemini") or str(model).startswith("gemma"))) else (GEMINI_MODEL_QA if stage == "qa" else GEMINI_MODEL_REWRITE)
-    # thinking 모델(gemma-4-31b-it 등)은 thinking 토큰이 maxOutputTokens를 소비하므로 별도 높은 한도 적용
-    is_thinking_model = str(use_model).startswith("gemma")
-    if max_output_tokens:
-        output_tokens = max_output_tokens
-    elif is_thinking_model:
-        output_tokens = GEMINI_THINKING_MAX_OUTPUT_TOKENS
-    else:
-        output_tokens = UPSTAGE_QA_MAX_OUTPUT_TOKENS if stage == "qa" else UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS
+def _ask_gemini_rest(persona, user_text, model=None, max_output_tokens=None, stage="rewrite"):
+    use_model = model if (model and str(model).startswith("gemini")) else (GEMINI_MODEL_QA if stage == "qa" else GEMINI_MODEL_REWRITE)
+    output_tokens = max_output_tokens or (UPSTAGE_QA_MAX_OUTPUT_TOKENS if stage == "qa" else UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS)
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{use_model}:generateContent"
     try:
         response = requests.post(
@@ -369,14 +375,14 @@ def _ask_gemini_rest(persona, text, model=None, max_output_tokens=None, stage="r
             json={
                 "systemInstruction": {"parts": [{"text": persona}]},
                 "contents": [
-                    {"role": "user", "parts": [{"text": PROMPT_USER_TEMPLATE.format(original_text=text)}]}
+                    {"role": "user", "parts": [{"text": user_text}]}
                 ],
                 "generationConfig": {
                     "temperature": 0.2,
                     "maxOutputTokens": output_tokens,
                 },
             },
-            timeout=300,
+            timeout=120,
         )
         response.raise_for_status()
         data = response.json()
@@ -384,11 +390,9 @@ def _ask_gemini_rest(persona, text, model=None, max_output_tokens=None, stage="r
         if not candidates:
             raise ValueError("Gemini 응답에 candidates가 없음")
         parts = ((candidates[0].get("content") or {}).get("parts") or [])
-        # thinking 모델은 thought=True 파트를 필터링(내부 사고과정 제외)
         content = "".join(
-            part.get("text", "")
+            part.get("text", "") if isinstance(part, dict) else str(part)
             for part in parts
-            if isinstance(part, dict) and not part.get("thought")
         )
         return content.strip()
     except PipelineFailure:
@@ -396,17 +400,13 @@ def _ask_gemini_rest(persona, text, model=None, max_output_tokens=None, stage="r
     except Exception as e:
         raise _llm_failure(stage, e)
 
-def ask_llm(persona, text, model=None, max_output_tokens=None, stage="rewrite"):
+def ask_llm(persona, user_text, model=None, max_output_tokens=None, stage="rewrite"):
     provider = "upstage"
-    resolved_model = model or (UPSTAGE_MODEL_QA if stage == "qa" else UPSTAGE_MODEL_REWRITE)
     if REVIEW_ONLY and not UPSTAGE_API_KEY and GEMINI_API_KEY:
         provider = "gemini"
-    elif GEMINI_API_KEY and (str(resolved_model).startswith("gemini") or str(resolved_model).startswith("gemma")):
-        provider = "gemini"
     if provider == "gemini":
-        return _ask_gemini_rest(persona, text, model=model, max_output_tokens=max_output_tokens, stage=stage)
+        return _ask_gemini_rest(persona, user_text, model=model, max_output_tokens=max_output_tokens, stage=stage)
     use_model = model or (UPSTAGE_MODEL_QA if stage == "qa" else UPSTAGE_MODEL_REWRITE)
-    user_msg = PROMPT_USER_TEMPLATE.format(original_text=text)
     output_tokens = max_output_tokens or (UPSTAGE_QA_MAX_OUTPUT_TOKENS if stage == "qa" else UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS)
     try:
         response = requests.post(
@@ -420,7 +420,7 @@ def ask_llm(persona, text, model=None, max_output_tokens=None, stage="rewrite"):
                 "model": use_model,
                 "messages": [
                     {"role": "system", "content": persona},
-                    {"role": "user", "content": user_msg},
+                    {"role": "user", "content": user_text},
                 ],
                 "temperature": 0.2,
                 "max_tokens": output_tokens,
@@ -750,20 +750,39 @@ def extract_unique_id(url):
     return url.replace("https://", "").replace("http://", "").replace("www.", "").strip().rstrip("/")
 
 def validate_content_quality(title, body):
+    plain_body = strip_html_tags(body)
+    plain_body = re.sub(r'\s+', ' ', plain_body).strip()
+    plain_body_len = len(plain_body)
+    paragraph_count = len(re.findall(r'<p\b', body, flags=re.IGNORECASE))
+    if not paragraph_count and plain_body:
+        paragraph_count = max(1, len([p for p in re.split(r'\n{2,}', plain_body) if p.strip()]))
+    sentence_count = len([
+        part.strip()
+        for part in re.split(r'(?<=[.!?])\s+|(?<=다)\s+(?=[가-힣A-Z0-9“"\'\(\[])', plain_body)
+        if len(part.strip()) >= 12
+    ])
+
     # 제목
     if not title or len(title) < 5:
         return False, "제목 누락 또는 너무 짧음"
 
     # 본문 길이
-    if len(body) < MIN_REWRITTEN_BODY_CHARS:
-        return False, f"본문 너무 짧음({len(body)}자)"
-    if len(body) > HARD_REWRITTEN_BODY_CHARS:
-        return False, f"본문 너무 김({len(body)}자)"
+    complete_short_form = (
+        plain_body_len >= SHORT_FORM_MIN_REWRITTEN_BODY_CHARS
+        and sentence_count >= SHORT_FORM_MIN_SENTENCE_COUNT
+        and paragraph_count >= SHORT_FORM_MIN_PARAGRAPH_COUNT
+    )
+    if plain_body_len < MIN_REWRITTEN_BODY_CHARS and not complete_short_form:
+        return False, f"본문 너무 짧음({plain_body_len}자, {sentence_count}문장)"
+    if plain_body_len > HARD_REWRITTEN_BODY_CHARS:
+        return False, f"본문 너무 김({plain_body_len}자)"
 
     # 라벨 잔재
-    for label in ["제목:", "본문:", "내용:", "카테고리:", "태그:", "Title:", "Body:", "리드문:", "배경:", "과제:", "전망:", "솔루션:", "문제:", "해결책:", "임팩트:"]:
+    for label in ["제목:", "본문:", "내용:", "카테고리:", "태그:", "Title:", "Body:", "리드문:", "배경:", "과제:", "전망:", "솔루션:", "문제:", "해결책:", "임팩트:", "해석:"]:
         if label in body:
             return False, f"라벨 잔재 발견({label})"
+    if re.search(r'<p>\s*(배경|과제|전망|솔루션|문제|해결책|임팩트|해석)\s*</p>', body, flags=re.IGNORECASE):
+        return False, "라벨 잔재 발견(단독 소제목)"
 
     # 포맷 오염
     if "**" in body or "##" in body:
@@ -789,6 +808,19 @@ def validate_content_quality(title, body):
 
     return True, "OK"
 
+
+def should_retry_rewrite_validation(message: str) -> bool:
+    if not message:
+        return False
+    return any(
+        token in message
+        for token in (
+            "본문 너무 짧음",
+            "라벨 잔재 발견",
+            "본문 마지막 문자 비정상",
+        )
+    )
+
 # [v23.0] AI 품질검수 시스템
 MEDIA_TONE_DESC = {
     "IJ_": "솔루션 저널리즘 - 사회 문제의 구조적 해결책 제시, 수요자 중심 관점",
@@ -798,15 +830,50 @@ MEDIA_TONE_DESC = {
 
 QA_SYSTEM_PROMPT = load_skill("qa_checker")
 
-def ai_quality_check(title: str, body: str, media_prefix: str, source_len: int = 0) -> Tuple[bool, List[str], int, Optional[dict]]:
-    media_tone = MEDIA_TONE_DESC.get(media_prefix, "일반 뉴스")
-    min_chars = int(source_len * 0.8) if source_len > 0 else 0
-    system_prompt = QA_SYSTEM_PROMPT.format(media_tone=media_tone, source_chars=source_len, min_chars=min_chars)
-    # HTML 태그 제거 후 검수 — qa_checker는 HTML 태그를 포맷 오염으로 즉시 탈락 처리함
+def build_qa_user_message(
+    source_article: Optional[dict],
+    title: str,
+    excerpt: str,
+    body: str,
+) -> str:
     plain_body = re.sub(r'<[^>]+>', ' ', body).strip()
     plain_body = re.sub(r'\s+', ' ', plain_body)
     plain_body = limit_rewritten_body_text(plain_body, QA_INPUT_MAX_CHARS)
-    article_text = f"제목: {title}\n\n본문: {plain_body}"
+    excerpt = re.sub(r'\s+', ' ', (excerpt or '').strip())
+    excerpt = excerpt[:240]
+    lines = []
+    if source_article:
+        source_title = re.sub(r'\s+', ' ', (source_article.get("title") or "").strip()) or "미상"
+        source_url = (source_article.get("url") or "").strip() or "미상"
+        source_published_at = to_kst_iso(source_article.get("source_published_at")) or "미상"
+        source_plain = strip_html_tags(source_article.get("body", ""))
+        source_plain = re.sub(r'\s+', ' ', source_plain).strip()[:QA_SOURCE_MAX_CHARS]
+        lines.extend([
+            "원문 기사",
+            f"제목: {source_title}",
+            f"출처 URL: {source_url}",
+            f"원문 발행시각: {source_published_at}",
+            f"본문: {source_plain}",
+            "",
+        ])
+    lines.extend([
+        "재작성 기사",
+        f"제목: {title}",
+        f"리드문: {excerpt}",
+        f"본문: {plain_body}",
+    ])
+    return "\n".join(lines)
+
+def ai_quality_check(
+    title: str,
+    excerpt: str,
+    body: str,
+    media_prefix: str,
+    source_article: Optional[dict] = None,
+) -> Tuple[bool, List[str], int, Optional[dict]]:
+    media_tone = MEDIA_TONE_DESC.get(media_prefix, "일반 뉴스")
+    system_prompt = QA_SYSTEM_PROMPT.format(media_tone=media_tone)
+    article_text = build_qa_user_message(source_article, title, excerpt, body)
     raw = ask_llm(system_prompt, article_text, model=UPSTAGE_MODEL_QA, max_output_tokens=UPSTAGE_QA_MAX_OUTPUT_TOKENS, stage="qa")
     try:
         parts = raw.split("---", 1)
@@ -823,33 +890,6 @@ def ai_quality_check(title: str, body: str, media_prefix: str, source_len: int =
         fixed = None
         if not passed and len(parts) > 1:
             fixed = parse_llm_response(parts[1].strip())
-
-        # 분량 미달이면 강제 탈락 (원문 분량의 80% 기준, source_len이 없으면 300자)
-        body_char_count = len(plain_body)
-        min_body = int(source_len * 0.8) if source_len > 0 else 300
-        if body_char_count < min_body:
-            passed = False
-            if "분량 미달" not in str(fails):
-                fails = fails + [f"분량 미달({body_char_count}자, 기준 {min_body}자)"]
-
-        # QA 미통과 시 fixed 없거나 fixed도 분량 미달이면 fallback
-        if not passed and not fixed:
-            retry_user = (
-                f"다음 기사가 검수에서 탈락했다: {', '.join(str(f) for f in fails)}.\n"
-                f"탈락 사유를 모두 수정한 완성 기사를 출력하라. "
-                f"제목은 30자 이내, 쉼표 없이. 본문은 원문({source_len}자) 분량의 90~100% 수준으로.\n\n"
-                f"제목: {title}\n\n본문: {plain_body}"
-            )
-            retry_raw = ask_llm(
-                QA_SYSTEM_PROMPT.format(media_tone=MEDIA_TONE_DESC.get(media_prefix, "일반 뉴스"), source_chars=source_len, min_chars=min_body),
-                retry_user, model=UPSTAGE_MODEL_QA, max_output_tokens=UPSTAGE_QA_MAX_OUTPUT_TOKENS, stage="qa"
-            )
-            parts3 = retry_raw.split("---", 1)
-            if len(parts3) > 1:
-                candidate = parse_llm_response(parts3[1].strip())
-                if len(candidate.get('title', '')) < 60 and len(candidate.get('body', '')) > 200:
-                    fixed = candidate
-
         return passed, fails, total, fixed
     except Exception as e:
         print(f"      ⚠️ [AI검수] 파싱 실패({str(e)[:50]}), 실패 처리")
@@ -935,11 +975,30 @@ def parse_llm_response(text):
     tags = []
     body_lines: List[str] = []
     current = None
-    label_re = re.compile(r'^(제목|Title|헤드라인|리드문|Excerpt|요약|본문|Body|내용|카테고리|Category|태그|Tags)\s*[:：]\s*(.*)$', re.IGNORECASE)
+    label_re = re.compile(r'^(제목|Title|헤드라인|리드문|Excerpt|요약|본문|Body|내용|카테고리|Category|태그|Tags)\s*[:：]?\s*(.*)$', re.IGNORECASE)
+    bare_labels = {
+        "제목": "title",
+        "title": "title",
+        "헤드라인": "title",
+        "리드문": "excerpt",
+        "excerpt": "excerpt",
+        "요약": "excerpt",
+        "본문": "body",
+        "body": "body",
+        "내용": "body",
+        "카테고리": "cat",
+        "category": "cat",
+        "태그": "tags",
+        "tags": "tags",
+    }
 
     for raw_line in lines:
         line = raw_line.strip()
         if not line:
+            continue
+        lower_line = line.lower()
+        if lower_line in bare_labels:
+            current = bare_labels[lower_line]
             continue
         m = label_re.match(line)
         if m:
@@ -967,11 +1026,8 @@ def parse_llm_response(text):
             body_lines.append(line)
         elif current == "title" and not title:
             title = line
-        elif current == "excerpt":
-            if not excerpt:
-                excerpt = line
-            else:
-                body_lines.append(line)  # 리드문 이후 라벨 없는 본문 텍스트 처리
+        elif current == "excerpt" and not excerpt:
+            excerpt = line
         elif current == "cat" and not cat:
             cat = line
         elif current == "tags" and not tags:
@@ -980,10 +1036,6 @@ def parse_llm_response(text):
     if not title and lines:
         title = lines[0].strip()
     title = re.sub(r"[#\*\[\]`]", "", title).strip().strip('"')
-    title = title.replace(',', '').replace('，', '')  # 제목 쉼표 금지 후처리
-    # 제목이 영어로만 구성된 경우 제거 (모델이 원문을 echo하는 오류 방지)
-    if title and re.match(r'^[A-Za-z0-9 :,.\'"!?()-]+$', title):
-        title = ""
     excerpt = re.sub(r"[#\*\[\]`]", "", excerpt).strip()
     excerpt = html.unescape(excerpt) if excerpt else ""
     body_raw = limit_rewritten_body_text("\n".join(body_lines).strip(), HARD_REWRITTEN_BODY_CHARS)
@@ -1362,8 +1414,6 @@ class ErumSite:
         }
         if payload["sourcePublishedAt"] is None:
             payload.pop("sourcePublishedAt")
-        if author:
-            payload["author"] = author
         r = requests.post(f"{self.api_base}/api/articles",
                           json=payload, headers=self.headers, timeout=30)
         r.raise_for_status()
@@ -1905,23 +1955,43 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
     for prefix in MEDIA_PREFIXES:
         print(f"      ✍️ [{prefix}] Solar Pro 3 기사 작성 중...", end="", flush=True)
         try:
-            source_text = strip_html_tags(article["body"])[:REWRITE_SOURCE_MAX_CHARS]
-            res = ask_llm(
-                PERSONA_DEFINITIONS[prefix],
-                source_text,
-                model=UPSTAGE_MODEL_REWRITE,
-                max_output_tokens=UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS,
-                stage="rewrite",
-            )
-            p = parse_llm_response(res)
-            is_valid, msg = validate_content_quality(p['title'], p['body'])
-            if not is_valid:
-                raise PipelineFailure("rewrite", "REWRITE_VALIDATION_FAIL", msg, retryable=False)
+            rewrite_input = build_rewrite_user_message(article)
+            rewrite_token_budgets = [UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS]
+            if UPSTAGE_REWRITE_RETRY_MAX_OUTPUT_TOKENS not in rewrite_token_budgets:
+                rewrite_token_budgets.append(UPSTAGE_REWRITE_RETRY_MAX_OUTPUT_TOKENS)
+
+            p = None
+            msg = ""
+            for attempt_idx, max_tokens in enumerate(rewrite_token_budgets):
+                res = ask_llm(
+                    PERSONA_DEFINITIONS[prefix],
+                    rewrite_input,
+                    model=UPSTAGE_MODEL_REWRITE,
+                    max_output_tokens=max_tokens,
+                    stage="rewrite",
+                )
+                p = parse_llm_response(res)
+                is_valid, msg = validate_content_quality(p['title'], p['body'])
+                if is_valid:
+                    break
+                if attempt_idx + 1 >= len(rewrite_token_budgets) or not should_retry_rewrite_validation(msg):
+                    raise PipelineFailure("rewrite", "REWRITE_VALIDATION_FAIL", msg, retryable=False)
+                next_tokens = rewrite_token_budgets[attempt_idx + 1]
+                print(f" 재시도({msg}, {max_tokens}->{next_tokens} 토큰)...", end="", flush=True)
+
+            if p is None:
+                raise PipelineFailure("rewrite", "REWRITE_VALIDATION_FAIL", msg or "재작성 결과 없음", retryable=False)
 
             # AI 품질검수+보완 (Solar Pro 3 1회)
             print(" 작성완료.", flush=True)
             print(f"      🔍 [{prefix}] Solar Pro 3 품질검수 중...", end="", flush=True)
-            passed, fails, score, fixed = ai_quality_check(p['title'], p['body'], prefix, source_len=len(source_text))
+            passed, fails, score, fixed = ai_quality_check(
+                p['title'],
+                p.get('excerpt', ''),
+                p['body'],
+                prefix,
+                source_article=article,
+            )
             final_pass = passed
 
             if not passed:
@@ -1975,9 +2045,6 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
                     mid, _ = site.upload_image_bytes(img_bytes, fn, img_content_type, rw["title"], best_cap)
                     if not mid:
                         raise PipelineFailure("publish", "IMAGE_UPLOAD_FAIL", "이미지 업로드 실패", retryable=True)
-                # 카테고리 기반 기자 배정
-                site_code = ERUM_CFG[prefix]["site"] if is_erum else None
-                journalist = JOURNALIST_MAP.get(site_code, {}).get(rw["cat"]) if site_code else None
                 pid = site.create_post(
                     rw["title"],
                     rw["body"],
@@ -1985,7 +2052,6 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
                     site.get_tag_ids(rw["tags"]),
                     mid,
                     excerpt=rw.get("excerpt", ""),
-                    author=journalist,
                     published_at=published_at,
                     source_published_at=source_published_at,
                 )
@@ -2088,189 +2154,6 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
     raise PipelineFailure("run", "NO_MEDIA_PUBLISHED", "모든 매체 발행 실패", retryable=False)
 
 
-# ========================= [고객 보도자료 자동 처리] =========================
-
-def fetch_customer_requests() -> list:
-    """erum-one.com에서 SUBMITTED 상태의 고객 요청 목록을 가져온다."""
-    try:
-        r = requests.get(
-            f"{ERUM_API_BASE}/api/engine/customer-requests",
-            headers={"x-api-key": ERUM_API_KEY},
-            timeout=15,
-        )
-        r.raise_for_status()
-        return r.json().get("requests", [])
-    except Exception as e:
-        print(f"   ⚠️ 고객 요청 fetch 실패 (RSS 계속 진행): {e}")
-        return []
-
-
-def complete_customer_request(cr_id: int, published_urls: dict, message: str) -> bool:
-    """발행 완료(또는 실패) 결과를 erum-one.com에 콜백한다."""
-    try:
-        if published_urls:
-            body = {"publishedUrls": published_urls, "publishedTitle": message}
-        else:
-            body = {"failReason": message}
-        r = requests.post(
-            f"{ERUM_API_BASE}/api/engine/customer-requests/{cr_id}/complete",
-            headers={"x-api-key": ERUM_API_KEY, "Content-Type": "application/json"},
-            json=body,
-            timeout=15,
-        )
-        r.raise_for_status()
-        return True
-    except Exception as e:
-        print(f"   ⚠️ 고객 요청 완료 콜백 실패 (cr_id={cr_id}): {e}")
-        return False
-
-
-def _cr_site_domain(prefix: str) -> str:
-    """prefix → 사이트 도메인 (https://impactjournal.kr 형태)."""
-    sitemap = ERUM_CFG.get(prefix, {}).get("sitemap", "")
-    if sitemap:
-        parts = sitemap.split("/sitemap")
-        return parts[0]
-    return ""
-
-
-def process_customer_request(cr: dict, upload_counts: dict) -> Optional[dict]:
-    """고객 보도자료 1건을 IJ/NN/CB에 발행한다."""
-    cr_id = cr["id"]
-    title = cr.get("title", "")
-    body_raw = cr.get("body") or ""
-    featured_image_url = cr.get("featuredImageUrl") or ""
-    image_caption = cr.get("imageCaption") or ""
-    ai_rewrite = bool(cr.get("aiRewriteActive", True))
-    published_at = now_kst()
-
-    print(f"\n📨 고객 요청 처리: [{cr.get('requestNumber', cr_id)}] {title[:40]}...")
-    print(f"   AI재작성={ai_rewrite}, 이미지={'있음' if featured_image_url else '없음'}")
-
-    # 이미지 처리
-    img_bytes: Optional[bytes] = None
-    img_content_type = "image/jpeg"
-    img_fn = f"cr_{cr_id}.jpg"
-    r2_url: Optional[str] = None
-
-    if featured_image_url:
-        try:
-            print(f"   📥 이미지 다운로드 중...", end="", flush=True)
-            resp = fetch_with_retry(featured_image_url, timeout=20)
-            if resp and resp.status_code == 200:
-                img_bytes = resp.content
-                ct = resp.headers.get("Content-Type", "image/jpeg")
-                img_content_type = ct.split(";")[0].strip()
-                ext = "jpg" if "jpeg" in img_content_type else img_content_type.split("/")[-1]
-                img_fn = f"cr_{cr_id}.{ext}"
-                print(f" 완료 ({len(img_bytes)//1024}KB).")
-                r2_url = upload_to_r2(img_bytes, img_fn, img_content_type)
-            else:
-                print(f" 실패(HTTP {getattr(resp, 'status_code', '?')}).")
-        except Exception as e:
-            print(f" 실패({e}).")
-
-    published_urls: dict = {}
-    failures: list = []
-    first_published_title = title
-
-    for prefix in MEDIA_PREFIXES:
-        site = SITES[prefix]
-        site_code = ERUM_CFG[prefix]["site"]
-        img_url = r2_url if r2_url else (featured_image_url or None)
-
-        try:
-            if ai_rewrite:
-                # Solar Pro 3 재작성 경로
-                print(f"   ✍️ [{prefix}] Solar Pro 3 재작성 중...", end="", flush=True)
-                source_text = strip_html_tags(body_raw)[:REWRITE_SOURCE_MAX_CHARS]
-                res = ask_llm(
-                    PERSONA_DEFINITIONS[prefix],
-                    source_text,
-                    model=UPSTAGE_MODEL_REWRITE,
-                    max_output_tokens=UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS,
-                    stage="rewrite",
-                )
-                p = parse_llm_response(res)
-                is_valid, msg = validate_content_quality(p["title"], p["body"])
-                if not is_valid:
-                    raise PipelineFailure("rewrite", "REWRITE_VALIDATION_FAIL", msg, retryable=False)
-                print(" 완료.", flush=True)
-
-                print(f"   🔍 [{prefix}] QA 중...", end="", flush=True)
-                passed, qa_fails, score, fixed = ai_quality_check(
-                    p["title"], p["body"], prefix, source_len=len(source_text)
-                )
-                if not passed:
-                    if fixed:
-                        is_valid, msg = validate_content_quality(fixed["title"], fixed["body"])
-                        if not is_valid:
-                            raise PipelineFailure("qa", "QA_FIXED_VALIDATION_FAIL", msg, retryable=False)
-                        p = fixed
-                    else:
-                        raise PipelineFailure("qa", "QA_HARD_FAIL", f"QA 미달(점수:{score})", retryable=False)
-                print(f" {score}점 통과.", flush=True)
-
-                cat, tags = get_hybrid_meta(p["title"], p["body"], p["cat"], p["tags"])
-                pub_title = p["title"]
-                pub_body = p["body"]
-                pub_excerpt = p.get("excerpt", "")
-            else:
-                # AI 미사용: 문단 정규화만
-                print(f"   📝 [{prefix}] 문단 정규화 발행...", end="", flush=True)
-                pub_title = title
-                pub_body = re.sub(r"\n{3,}", "\n\n", body_raw.strip())
-                pub_excerpt = pub_body[:200].split("\n")[0]
-                cat = DEFAULT_CATEGORY
-                tags = []
-                print(" 완료.", flush=True)
-
-            journalist = JOURNALIST_MAP.get(site_code, {}).get(cat)
-            cat_id = site.get_cat_id(cat)
-
-            print(f"   🚀 [{prefix}] 발행 중...", end="", flush=True)
-            pid = site.create_post(
-                pub_title,
-                pub_body,
-                cat_id,
-                site.get_tag_ids(tags),
-                img_url,
-                excerpt=pub_excerpt,
-                author=journalist,
-                published_at=published_at,
-                source_published_at=None,
-            )
-            domain = _cr_site_domain(prefix)
-            article_url = f"{domain}/articles/{pid}" if domain else ""
-            published_urls[site_code] = article_url
-            upload_counts[prefix] = upload_counts.get(prefix, 0) + 1
-            if not first_published_title or first_published_title == title:
-                first_published_title = pub_title
-            print(f" 성공 (ID:{pid}).")
-            submit_sitemap_to_gsc(prefix)
-            time.sleep(1)
-
-        except PipelineFailure as e:
-            print(f" 실패({e.stage}/{e.code}).")
-            failures.append(f"{prefix}: {e.stage}/{e.code}")
-            if e.abort_run:
-                break
-        except Exception as e:
-            print(f" 실패({e}).")
-            failures.append(f"{prefix}: {str(e)[:80]}")
-
-    if published_urls:
-        complete_customer_request(cr_id, published_urls, first_published_title)
-        return {
-            "success_media": list(published_urls.keys()),
-            "partial_success": len(published_urls) < len(MEDIA_PREFIXES),
-        }
-    else:
-        detail = " | ".join(failures[:3]) if failures else "원인 불명"
-        complete_customer_request(cr_id, {}, f"모든 매체 발행 실패: {detail}")
-        return None
-
-
 def run():
     print(f"\n🚀 AI 뉴스 엔진 (v25.1-Upstage_SolarPro3_KST) 가동: {now_kst().strftime('%Y-%m-%d %H:%M:%S')}")
     if TARGET_URL_IDS:
@@ -2309,29 +2192,6 @@ def run():
 
         blocked_ids = db_get_retry_blocked_ids()
         article_rules = db_get_active_article_rules()
-
-    # 고객 보도자료 우선 처리 (Priority Fetch)
-    if not REVIEW_ONLY:
-        print("\n📬 고객 보도자료 우선 처리 시작...")
-        customer_reqs = fetch_customer_requests()
-        if customer_reqs:
-            print(f"   📥 대기 중인 고객 요청: {len(customer_reqs)}건")
-            cr_upload_counts = {p: 0 for p in MEDIA_PREFIXES}
-            for cr in customer_reqs:
-                try:
-                    result = process_customer_request(cr, cr_upload_counts)
-                    if result:
-                        print(f"   ✅ [{cr.get('requestNumber', cr.get('id'))}] 발행 완료: {result.get('success_media')}")
-                    else:
-                        print(f"   ❌ [{cr.get('requestNumber', cr.get('id'))}] 발행 실패")
-                except Exception as e:
-                    print(f"   ❌ [{cr.get('requestNumber', cr.get('id'))}] 예외 발생: {e}")
-                    try:
-                        complete_customer_request(cr["id"], {}, f"예외 발생: {str(e)[:200]}")
-                    except Exception:
-                        pass
-        else:
-            print("   ✅ 대기 중인 고객 요청 없음.")
 
     # 기사 수집
     if REVIEW_ONLY and TARGET_URL_ID_LIST:
