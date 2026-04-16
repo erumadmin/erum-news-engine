@@ -249,6 +249,13 @@ BLOCKED_IMAGE_PATTERNS = [
 
 # 이미지 최소 파일 크기 (bytes) — 이 이하는 로고/아이콘으로 간주하여 스킵
 MIN_IMAGE_BYTES = 20_000
+MIN_IMAGE_WIDTH = int(os.environ.get("MIN_IMAGE_WIDTH", "1200"))
+MIN_IMAGE_ASPECT_RATIO = float(os.environ.get("MIN_IMAGE_ASPECT_RATIO", "0.6"))
+MAX_IMAGE_ASPECT_RATIO = float(os.environ.get("MAX_IMAGE_ASPECT_RATIO", "2.4"))
+IMAGE_MASTER_MAX_WIDTH = int(os.environ.get("IMAGE_MASTER_MAX_WIDTH", "1600"))
+IMAGE_MASTER_WEBP_QUALITY = int(os.environ.get("IMAGE_MASTER_WEBP_QUALITY", "84"))
+IMAGE_THUMB_MAX_WIDTH = int(os.environ.get("IMAGE_THUMB_MAX_WIDTH", "640"))
+IMAGE_THUMB_WEBP_QUALITY = int(os.environ.get("IMAGE_THUMB_WEBP_QUALITY", "78"))
 
 CONTACT_ALT_RE = re.compile(r'\d{2,3}-\d{3,4}-\d{4}|담당\s*부서|책임자.*과\s*장|사무관.*주무관')
 
@@ -288,6 +295,12 @@ class ImageCandidate:
     caption: Optional[str]
     source: str
     score: int = 0
+
+@dataclass
+class ImageInspection:
+    width: int
+    height: int
+    aspect_ratio: float
 
 # IJ 카테고리별 기자 매핑 (WP user ID)
 IJ_CATEGORY_AUTHOR = {
@@ -729,6 +742,50 @@ def normalize_text(text):
     text = re.sub(r'\[.*?\]|\(.*?\)', '', text)
     return re.sub(r'[^가-힣a-zA-Z0-9]', '', text)
 
+def split_plain_sentences(text: str) -> List[str]:
+    if not text:
+        return []
+    normalized = re.sub(r'\s+', ' ', text).strip()
+    if not normalized:
+        return []
+    return [
+        part.strip()
+        for part in re.split(r'(?<=[.!?])\s+|(?<=다)\s+(?=[가-힣A-Z0-9“"\'\(\[])', normalized)
+        if part.strip()
+    ]
+
+def auto_paragraphize_text(text: str) -> str:
+    if not text:
+        return ""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return ""
+
+    nonempty_lines = [line.strip() for line in normalized.split("\n") if line.strip()]
+    structural_prefixes = ("##", "###", "<h", "<p", "<ul", "<ol", "<li", "- ", "* ")
+    if len(nonempty_lines) >= 2 or any(line.startswith(structural_prefixes) for line in nonempty_lines):
+        return "\n".join(nonempty_lines)
+
+    plain_line = re.sub(r'\s+', ' ', nonempty_lines[0]).strip()
+    sentences = split_plain_sentences(plain_line)
+    if len(sentences) < 3:
+        return plain_line
+
+    minimum_paragraphs = 3 if len(sentences) >= SHORT_FORM_MIN_SENTENCE_COUNT else 2
+    target_paragraphs = min(5, max(minimum_paragraphs, (len(sentences) + 2) // 3))
+    base_size = len(sentences) // target_paragraphs
+    extras = len(sentences) % target_paragraphs
+
+    paragraphs: List[str] = []
+    cursor = 0
+    for idx in range(target_paragraphs):
+        chunk_size = base_size + (1 if idx < extras else 0)
+        chunk = sentences[cursor:cursor + chunk_size]
+        if chunk:
+            paragraphs.append(" ".join(chunk))
+        cursor += chunk_size
+    return "\n\n".join(paragraphs).strip()
+
 def is_semantic_duplicate(new_title, existing_titles, threshold=0.9):
     clean_new = normalize_text(new_title)
     if not clean_new: return False
@@ -756,11 +813,7 @@ def validate_content_quality(title, body):
     paragraph_count = len(re.findall(r'<p\b', body, flags=re.IGNORECASE))
     if not paragraph_count and plain_body:
         paragraph_count = max(1, len([p for p in re.split(r'\n{2,}', plain_body) if p.strip()]))
-    sentence_count = len([
-        part.strip()
-        for part in re.split(r'(?<=[.!?])\s+|(?<=다)\s+(?=[가-힣A-Z0-9“"\'\(\[])', plain_body)
-        if len(part.strip()) >= 12
-    ])
+    sentence_count = len([part for part in split_plain_sentences(plain_body) if len(part) >= 12])
 
     # 제목
     if not title or len(title) < 5:
@@ -776,6 +829,8 @@ def validate_content_quality(title, body):
         return False, f"본문 너무 짧음({plain_body_len}자, {sentence_count}문장)"
     if plain_body_len > HARD_REWRITTEN_BODY_CHARS:
         return False, f"본문 너무 김({plain_body_len}자)"
+    if plain_body_len >= SHORT_FORM_MIN_REWRITTEN_BODY_CHARS and sentence_count >= SHORT_FORM_MIN_SENTENCE_COUNT and paragraph_count < 2:
+        return False, f"문단 수 부족({paragraph_count}개)"
 
     # 라벨 잔재
     for label in ["제목:", "본문:", "내용:", "카테고리:", "태그:", "Title:", "Body:", "리드문:", "배경:", "과제:", "전망:", "솔루션:", "문제:", "해결책:", "임팩트:", "해석:"]:
@@ -818,6 +873,7 @@ def should_retry_rewrite_validation(message: str) -> bool:
             "본문 너무 짧음",
             "라벨 잔재 발견",
             "본문 마지막 문자 비정상",
+            "문단 수 부족",
         )
     )
 
@@ -1018,6 +1074,7 @@ def clean_body_html(text):
     text = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', text)
     text = re.sub(r'^##\s+(.*?)$', r'<h3>\1</h3>', text, flags=re.MULTILINE)
     text = re.sub(r'^###\s+(.*?)$', r'<h4>\1</h4>', text, flags=re.MULTILINE)
+    text = auto_paragraphize_text(text)
     lines = text.split('\n')
     formatted_lines = []
     for line in lines:
@@ -1407,23 +1464,11 @@ def upload_to_r2(img_bytes: bytes, filename: str, content_type: str) -> Optional
     """이미지를 WebP로 변환 후 Cloudflare R2에 업로드하고 퍼블릭 URL 반환. 실패 시 None."""
     if not R2_ACCESS_KEY_ID or not R2_SECRET_ACCESS_KEY:
         return None
-    # WebP 변환 (1200px 이하 리사이즈, quality 82)
+    variants: Dict[str, Tuple[bytes, str, str]]
     try:
-        from PIL import Image
-        import io as _io
-        img = Image.open(_io.BytesIO(img_bytes))
-        if img.mode not in ("RGB", "RGBA"):
-            img = img.convert("RGB")
-        if img.width > 1200:
-            ratio = 1200 / img.width
-            img = img.resize((1200, int(img.height * ratio)), Image.LANCZOS)
-        buf = _io.BytesIO()
-        img.save(buf, format="WEBP", quality=82)
-        img_bytes = buf.getvalue()
-        content_type = "image/webp"
-        filename = filename.rsplit(".", 1)[0] + ".webp"
+        variants = build_r2_variants(img_bytes, filename)
     except Exception:
-        pass  # 변환 실패 시 원본 사용
+        variants = {"master": (img_bytes, content_type, filename)}
     try:
         import boto3
         from botocore.config import Config
@@ -1435,9 +1480,12 @@ def upload_to_r2(img_bytes: bytes, filename: str, content_type: str) -> Optional
             config=Config(signature_version="s3v4"),
             region_name="auto",
         )
-        key = f"news/{now_kst().strftime('%Y/%m')}/{filename}"
-        s3.put_object(Bucket=R2_BUCKET_NAME, Key=key, Body=img_bytes, ContentType=content_type)
-        return f"{R2_PUBLIC_URL}/{key}"
+        uploaded_urls: Dict[str, str] = {}
+        for variant_name, (variant_bytes, variant_content_type, variant_filename) in variants.items():
+            key = f"news/{now_kst().strftime('%Y/%m')}/{variant_filename}"
+            s3.put_object(Bucket=R2_BUCKET_NAME, Key=key, Body=variant_bytes, ContentType=variant_content_type)
+            uploaded_urls[variant_name] = f"{R2_PUBLIC_URL}/{key}"
+        return uploaded_urls.get("master")
     except Exception as e:
         print(f"\n      ⚠️ [R2 업로드 실패]: {str(e)[:100]}")
         return None
@@ -1737,6 +1785,51 @@ def is_valid_image(url):
     except:
         return False
 
+def inspect_image_bytes(img_bytes: bytes) -> Optional[ImageInspection]:
+    try:
+        from PIL import Image
+        import io as _io
+        img = Image.open(_io.BytesIO(img_bytes))
+        width, height = img.size
+        if width <= 0 or height <= 0:
+            return None
+        return ImageInspection(width=width, height=height, aspect_ratio=width / height)
+    except Exception:
+        return None
+
+def assess_image_quality(inspection: Optional[ImageInspection]) -> Tuple[bool, str]:
+    if inspection is None:
+        return False, "해상도 판독 실패"
+    if inspection.width < MIN_IMAGE_WIDTH:
+        return False, f"해상도 미달({inspection.width}x{inspection.height})"
+    if inspection.aspect_ratio < MIN_IMAGE_ASPECT_RATIO or inspection.aspect_ratio > MAX_IMAGE_ASPECT_RATIO:
+        return False, f"비율 부적합({inspection.width}x{inspection.height})"
+    return True, "OK"
+
+def build_r2_variants(img_bytes: bytes, filename: str) -> Dict[str, Tuple[bytes, str, str]]:
+    from PIL import Image
+    import io as _io
+
+    img = Image.open(_io.BytesIO(img_bytes))
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGB")
+
+    stem = filename.rsplit(".", 1)[0] or f"img_{hash(filename) & 0xFFFFFF:06x}"
+
+    def render_variant(max_width: int, quality: int, suffix: str) -> Tuple[bytes, str, str]:
+        variant = img.copy()
+        if variant.width > max_width:
+            ratio = max_width / variant.width
+            variant = variant.resize((max_width, int(variant.height * ratio)), Image.LANCZOS)
+        buf = _io.BytesIO()
+        variant.save(buf, format="WEBP", quality=quality)
+        return buf.getvalue(), "image/webp", f"{stem}{suffix}.webp"
+
+    return {
+        "master": render_variant(IMAGE_MASTER_MAX_WIDTH, IMAGE_MASTER_WEBP_QUALITY, ""),
+        "thumb": render_variant(IMAGE_THUMB_MAX_WIDTH, IMAGE_THUMB_WEBP_QUALITY, "__thumb"),
+    }
+
 def fix_newswire_url(url: str) -> str:
     if "newswire.co.kr" in url and "/thumb/" in url:
         return re.sub(r'/thumb/\d+/', '/data/', url).replace('/data/data/', '/data/')
@@ -1824,6 +1917,7 @@ def find_best_image(article):
 def download_best_image(candidates: list[ImageCandidate]) -> Tuple[bytes, str, str, Optional[str], str]:
     retryable_seen = False
     blocked_seen = False
+    quality_seen = False
     for cand in candidates:
         try:
             if _is_blocked_image_url(cand.url):
@@ -1857,6 +1951,12 @@ def download_best_image(candidates: list[ImageCandidate]) -> Tuple[bytes, str, s
             candidate_bytes = img_resp.content
             if len(candidate_bytes) < MIN_IMAGE_BYTES:
                 continue
+            inspection = inspect_image_bytes(candidate_bytes)
+            quality_ok, quality_reason = assess_image_quality(inspection)
+            if not quality_ok:
+                quality_seen = True
+                print(f" [품질 미달:{quality_reason}]", end="")
+                continue
 
             filename = re.sub(r'[^\w\.-]', '', cand.url.split("/")[-1].split("?")[0])[-50:]
             if not filename:
@@ -1868,6 +1968,8 @@ def download_best_image(candidates: list[ImageCandidate]) -> Tuple[bytes, str, s
 
     if retryable_seen:
         raise PipelineFailure("image", "IMAGE_FETCH_HTTP_5XX", "이미지 다운로드 실패", retryable=True)
+    if quality_seen:
+        raise PipelineFailure("image", "IMAGE_QUALITY_TOO_LOW", "대표이미지 품질 미달", retryable=False)
     raise PipelineFailure("image", "NO_USABLE_IMAGE", "사용 가능한 이미지 없음", retryable=False)
 
 def classify_attempt_state(failure: PipelineFailure, prior_state: Optional[dict] = None) -> Tuple[str, int, Optional[datetime]]:
@@ -1896,6 +1998,20 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, 
     today = current_kst.date()
     current_hour = current_kst.hour
     articles = []
+    stats = {
+        "feed_entries": 0,
+        "skipped_missing_link": 0,
+        "skipped_existing_id": 0,
+        "skipped_target_filter": 0,
+        "skipped_non_korean_title": 0,
+        "skipped_rule_blocked": 0,
+        "skipped_global_blocked": 0,
+        "skipped_semantic_duplicate": 0,
+        "skipped_missing_date": 0,
+        "skipped_out_of_range": 0,
+        "skipped_non_korean_newswire": 0,
+        "kept": 0,
+    }
     rule_blocked_ids = (rules or {}).get("blocked_ids", set())
     rule_blocked_title_hashes = (rules or {}).get("blocked_title_hashes", set())
     rule_blocked_source_urls = (rules or {}).get("blocked_source_urls", set())
@@ -1915,13 +2031,21 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, 
             resp.encoding = 'utf-8'
             f = feedparser.parse(resp.text)
             for e in f.entries:
+                stats["feed_entries"] += 1
                 if count >= feed_limit: break
-                if not hasattr(e, 'link'): continue
-                curr_id = extract_unique_id(e.link)
-                if not review_mode and curr_id in ex_ids: continue
-                if TARGET_URL_IDS and curr_id not in TARGET_URL_IDS:
+                if not hasattr(e, 'link'):
+                    stats["skipped_missing_link"] += 1
                     continue
-                if not is_mainly_korean(e.title, threshold=0.5): continue
+                curr_id = extract_unique_id(e.link)
+                if not review_mode and curr_id in ex_ids:
+                    stats["skipped_existing_id"] += 1
+                    continue
+                if TARGET_URL_IDS and curr_id not in TARGET_URL_IDS:
+                    stats["skipped_target_filter"] += 1
+                    continue
+                if not is_mainly_korean(e.title, threshold=0.5):
+                    stats["skipped_non_korean_title"] += 1
+                    continue
                 if not review_mode:
                     title_hash = hash_title_for_rule(e.title)
                     source_url_key = normalize_url_for_rule(e.link)
@@ -1936,20 +2060,31 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, 
                         or source_url_key in rule_blocked_source_urls
                     ):
                         if not rule_allowed:
+                            stats["skipped_rule_blocked"] += 1
                             continue
                     if not rule_allowed and curr_id in blocked_ids:
+                        stats["skipped_global_blocked"] += 1
                         continue
-                    if is_semantic_duplicate(e.title, ex_titles, threshold=0.9): continue
+                    if is_semantic_duplicate(e.title, ex_titles, threshold=0.9):
+                        stats["skipped_semantic_duplicate"] += 1
+                        continue
                 dt = e.get('published_parsed') or e.get('updated_parsed')
                 source_published_at = feed_time_to_kst(dt)
-                if not source_published_at: continue
+                if not source_published_at:
+                    stats["skipped_missing_date"] += 1
+                    continue
                 article_date = source_published_at.date()
                 if RETRY_DAYS > 0:
                     if article_date < today - timedelta(days=RETRY_DAYS) or article_date > today:
+                        stats["skipped_out_of_range"] += 1
                         continue
                 else:
-                    if article_date != today: continue
-                if is_newswire and not re.search('[가-힣]', e.title): continue
+                    if article_date != today:
+                        stats["skipped_out_of_range"] += 1
+                        continue
+                if is_newswire and not re.search('[가-힣]', e.title):
+                    stats["skipped_non_korean_newswire"] += 1
+                    continue
 
                 img_link = ""
                 if hasattr(e, 'media_content'):
@@ -1967,6 +2102,7 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, 
                 ex_ids.add(curr_id)
                 ex_titles.add(e.title[:1000])
                 count += 1
+                stats["kept"] += 1
             print(f" {count}건 확보")
         except Exception as err:
             print(f" 오류({err})")
@@ -1993,6 +2129,17 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, 
         if total_remaining > 0:
             print(f"      👉 목표 미달({total_remaining}건 부족) -> 뉴스와이어 가동")
             fetch_feed(RSS_FEEDS[-1], "뉴스와이어", total_remaining, is_newswire=True)
+
+    if review_mode or TARGET_URL_IDS:
+        print(
+            "      🧮 [수집 필터] "
+            f"입력 {stats['feed_entries']} / 유지 {stats['kept']} / "
+            f"중복 {stats['skipped_semantic_duplicate']} / 대상필터 {stats['skipped_target_filter']} / "
+            f"날짜 {stats['skipped_out_of_range']} / 비한글제목 {stats['skipped_non_korean_title']} / "
+            f"ID중복 {stats['skipped_existing_id']} / 규칙차단 {stats['skipped_rule_blocked']} / "
+            f"전역차단 {stats['skipped_global_blocked']} / 날짜누락 {stats['skipped_missing_date']} / "
+            f"뉴스와이어비한글 {stats['skipped_non_korean_newswire']}"
+        )
 
     return articles
 
@@ -2028,11 +2175,16 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
         },
         "variants": [],
     }
+    img_bytes = None
+    img_content_type = ""
+    fn = ""
+    best_cap = None
+    best_img = ""
+    review_record["image_status"] = "skipped:review_mode" if review_mode else "pending"
 
     if review_mode:
         print("   🧪 리뷰 전용 모드: 이미지/발행 단계 생략")
     else:
-        # 이미지 확인
         print(f"   🔎 이미지 탐색 중...", end="", flush=True)
         image_candidates = find_best_image(article)
         if not image_candidates:
@@ -2042,6 +2194,7 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
 
         print(f"   📥 이미지 다운로드 중...", end="", flush=True)
         img_bytes, img_content_type, fn, best_cap, best_img = download_best_image(image_candidates)
+        review_record["image_status"] = f"ok:{len(img_bytes)//1024}KB"
         print(f" 완료 ({len(img_bytes)//1024}KB).")
 
     rewritten = {}
