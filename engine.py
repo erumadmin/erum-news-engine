@@ -821,6 +821,71 @@ def should_retry_rewrite_validation(message: str) -> bool:
         )
     )
 
+CB_DIRECT_KEYWORDS: Tuple[str, ...] = (
+    "과징금", "가산세", "감면", "지원금", "보조금", "수출바우처", "바우처", "수의계약",
+    "입찰", "조달", "공급망", "물류비", "인허가", "특례", "규제특례", "규제특구",
+    "네거티브", "시행령", "입법예고", "매점매석", "사업재편", "펀드", "계약 제한",
+    "계약 체결", "자격", "경력 요건", "지원 요건", "대부료", "사용료", "유예 조항",
+)
+CB_SIGNAL_KEYWORDS: Tuple[str, ...] = (
+    "공공주택", "착공", "인구유입", "지방소멸", "재생에너지", "전력망", "철도", "중련운행",
+    "좌석", "스타트업", "인플루언서", "관광", "콘텐츠", "예능", "IP", "브랜드",
+    "K-푸드", "K-컬처", "기술인재", "거점국립대", "AI", "바이오", "메가특구",
+)
+CB_BUSINESS_CONTEXT_KEYWORDS: Tuple[str, ...] = (
+    "기업", "업계", "산업", "시장", "중소기업", "소상공인", "창업", "협력사", "제조",
+    "수출", "투자", "관광객", "콘텐츠", "공급", "수요",
+)
+CB_SKIP_SHAPE_KEYWORDS: Tuple[str, ...] = (
+    "행사", "캠페인", "기념식", "축사", "담화", "간담회", "홍보", "초청", "체험", "방한",
+)
+
+
+def _keyword_hits(text: str, compact: str, keywords: Tuple[str, ...]) -> List[str]:
+    tokens = re.findall(r"[0-9A-Za-z가-힣-]+", text)
+    hits: List[str] = []
+    for keyword in keywords:
+        lowered = keyword.lower().strip()
+        compact_keyword = re.sub(r"\s+", "", lowered)
+        if " " in lowered:
+            if lowered in text or compact_keyword in compact:
+                hits.append(keyword)
+            continue
+        token_hit = any(
+            token == lowered
+            or token.startswith(lowered)
+            or token.endswith(lowered)
+            for token in tokens
+        )
+        if token_hit:
+            hits.append(keyword)
+    return hits
+
+
+def assess_cb_article_fit(article: dict) -> Tuple[str, str]:
+    title = re.sub(r"\s+", " ", (article.get("title") or "").strip())
+    body = strip_html_tags(article.get("body", ""))[:5000]
+    text = re.sub(r"\s+", " ", f"{title} {body}".lower()).strip()
+    compact = re.sub(r"\s+", "", text)
+
+    direct_hits = _keyword_hits(text, compact, CB_DIRECT_KEYWORDS)
+    if direct_hits:
+        return "direct", f"직접 영향 키워드: {', '.join(direct_hits[:3])}"
+
+    signal_hits = _keyword_hits(text, compact, CB_SIGNAL_KEYWORDS)
+    if signal_hits:
+        return "signal", f"시장 신호 키워드: {', '.join(signal_hits[:3])}"
+
+    business_hits = _keyword_hits(text, compact, CB_BUSINESS_CONTEXT_KEYWORDS)
+    if business_hits:
+        return "signal", f"기업 맥락 키워드: {', '.join(business_hits[:3])}"
+
+    skip_hits = _keyword_hits(text, compact, CB_SKIP_SHAPE_KEYWORDS)
+    if skip_hits:
+        return "skip", "행사·발언·홍보 성격은 있으나 기업 직접 영향이나 시장 신호가 약함"
+
+    return "skip", "기업 독자 기준 직접 영향과 시장 신호가 약함"
+
 # [v23.0] AI 품질검수 시스템
 MEDIA_TONE_DESC = {
     "IJ_": "솔루션 저널리즘 - 사회 문제의 구조적 해결책 제시, 수요자 중심 관점",
@@ -1471,17 +1536,28 @@ REQUEST_HEADERS = {
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
+def build_request_headers(url: str = "") -> dict:
+    headers = dict(REQUEST_HEADERS)
+    parsed = urlparse(url or "")
+    host = (parsed.netloc or "").lower()
+    if "korea.kr" in host:
+        headers["Referer"] = "https://www.korea.kr/"
+        headers["Origin"] = "https://www.korea.kr"
+        headers["Cache-Control"] = "no-cache"
+        headers["Pragma"] = "no-cache"
+    return headers
+
 def fetch_with_retry(url, max_retries=2, timeout=15, stream=False, retry_statuses=(429, 500, 502, 503, 504)):
     last_response = None
     for attempt in range(max_retries + 1):
         try:
-            r = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout, stream=stream)
+            r = requests.get(url, headers=build_request_headers(url), timeout=timeout, stream=stream)
             last_response = r
             if r.status_code in retry_statuses and attempt < max_retries:
                 time.sleep(1 + attempt)
                 continue
             return r
-        except (requests.exceptions.ConnectionError, ConnectionResetError):
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, ConnectionResetError, requests.exceptions.RequestException):
             if attempt < max_retries:
                 time.sleep(1 + attempt)
                 continue
@@ -1926,11 +2002,30 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
     print(f"\n▶ 기사 처리 시작: {article['title'][:40]}...")
     source_published_at = article.get("source_published_at")
     published_at = now_kst()
+    media_plan: Dict[str, Dict[str, Any]] = {
+        prefix: {"enabled": True, "mode": "default", "reason": ""}
+        for prefix in MEDIA_PREFIXES
+    }
+    cb_mode, cb_reason = assess_cb_article_fit(article)
+    media_plan["CB_"] = {
+        "enabled": cb_mode != "skip",
+        "mode": cb_mode,
+        "reason": cb_reason,
+    }
+    expected_media_count = sum(1 for prefix in MEDIA_PREFIXES if media_plan.get(prefix, {}).get("enabled", True))
     review_record = {
         "source_title": article.get("title", ""),
         "source_url": article.get("url", ""),
         "source_published_at": source_published_at,
         "source_chars": len(article.get("body", "") or ""),
+        "media_plan": {
+            prefix.rstrip("_"): {
+                "enabled": plan.get("enabled", True),
+                "mode": plan.get("mode", "default"),
+                "reason": plan.get("reason", ""),
+            }
+            for prefix, plan in media_plan.items()
+        },
         "variants": [],
     }
 
@@ -1953,6 +2048,27 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
     published_prefixes = []
     failures: List[PipelineFailure] = []
     for prefix in MEDIA_PREFIXES:
+        plan = media_plan.get(prefix, {"enabled": True, "mode": "default", "reason": ""})
+        if not plan.get("enabled", True):
+            print(f"      ⏭️ [{prefix}] 스킵 ({plan.get('reason', 'CB 비적합')}).")
+            if review_mode:
+                review_record["variants"].append({
+                    "prefix": prefix,
+                    "status": "SKIPPED",
+                    "qa_pass": False,
+                    "qa_score": 0,
+                    "qa_fails": [],
+                    "fixed_applied": False,
+                    "title": "",
+                    "excerpt": "",
+                    "body": "",
+                    "cat": "",
+                    "tags": [],
+                    "failure": f"skip/{plan.get('mode', 'skip')}: {plan.get('reason', 'CB 비적합')}",
+                })
+            continue
+        if prefix == "CB_" and plan.get("mode") in ("direct", "signal"):
+            print(f"      🧭 [CB_] {plan.get('mode')} 앵글 ({plan.get('reason')}).")
         print(f"      ✍️ [{prefix}] Solar Pro 3 기사 작성 중...", end="", flush=True)
         try:
             rewrite_input = build_rewrite_user_message(article)
@@ -2120,7 +2236,7 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
 
     if review_mode:
         review_record["success_media"] = [p.rstrip("_") for p in published_prefixes]
-        review_record["partial_success"] = len(published_prefixes) < len(MEDIA_PREFIXES)
+        review_record["partial_success"] = len(published_prefixes) < expected_media_count
         review_record["failure_count"] = len(failures)
         review_record["status"] = "SUCCESS" if published_prefixes else "FAILED"
         if failures and not published_prefixes:
@@ -2134,7 +2250,7 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
     if published_prefixes:
         return {
             "success_media": [p.rstrip("_") for p in published_prefixes],
-            "partial_success": len(published_prefixes) < len(MEDIA_PREFIXES),
+            "partial_success": len(published_prefixes) < expected_media_count,
             "failure_count": len(failures),
         }
 
