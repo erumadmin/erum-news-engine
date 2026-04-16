@@ -142,6 +142,12 @@ DAILY_PUBLISH_LIMIT = 50
 PER_RUN_LIMIT = 15  # 1회 실행당 최대 발행 수
 RETRY_DAYS = int(os.environ.get('RETRY_DAYS', '0'))  # 0=당일만, N=N일 전까지 재시도
 REVIEW_ONLY = os.environ.get("REVIEW_ONLY", "0") == "1"
+HIDDEN_PUBLISH_TEST = os.environ.get("HIDDEN_PUBLISH_TEST", "0") == "1"
+PUBLISH_STATUS = (os.environ.get("PUBLISH_STATUS", "PUBLISHED").strip() or "PUBLISHED").upper()
+if PUBLISH_STATUS not in {"PUBLISHED", "DRAFT"}:
+    raise RuntimeError("PUBLISH_STATUS는 PUBLISHED 또는 DRAFT만 허용됩니다.")
+if HIDDEN_PUBLISH_TEST:
+    PUBLISH_STATUS = "DRAFT"
 if not UPSTAGE_API_KEY and not (REVIEW_ONLY and GEMINI_API_KEY):
     raise RuntimeError("UPSTAGE_API_KEY가 없습니다. 리뷰 전용 모드에서는 GEMINI_API_KEY가 필요합니다.")
 MEDIA_PREFIXES = ["IJ_", "NN_", "CB_"]
@@ -1519,7 +1525,7 @@ class ErumSite:
             "title": title,
             "content": body,
             "excerpt": excerpt or "",
-            "status": "PUBLISHED",
+            "status": PUBLISH_STATUS,
             "categoryId": cat_id,
             "featuredImageUrl": img_url,
             "publishedAt": to_kst_iso(publish_dt),
@@ -1539,6 +1545,8 @@ for _prefix, _cfg in ERUM_CFG.items():
 # ========================= [6. GSC 사이트맵 제출] =========================
 
 def submit_sitemap_to_gsc(prefix):
+    if PUBLISH_STATUS != "PUBLISHED":
+        return
     cfg = WP_CFG.get(prefix) or ERUM_CFG.get(prefix)
     if not cfg or not cfg.get("gsc_site"): return
 
@@ -2199,6 +2207,7 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
 
     rewritten = {}
     published_prefixes = []
+    published_items: List[dict] = []
     failures: List[PipelineFailure] = []
     for prefix in MEDIA_PREFIXES:
         plan = media_plan.get(prefix, {"enabled": True, "mode": "default", "reason": ""})
@@ -2326,6 +2335,14 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
                 )
                 upload_counts[prefix] += 1
                 published_prefixes.append(prefix)
+                published_items.append({
+                    "prefix": prefix.rstrip("_"),
+                    "site": ERUM_CFG.get(prefix, {}).get("site", prefix.rstrip("_")),
+                    "id": pid,
+                    "title": rw["title"],
+                    "status": PUBLISH_STATUS,
+                    "preview_url": f"{ERUM_API_BASE}/preview/articles/{pid}",
+                })
                 variant_review["publish_id"] = pid
                 print(f" 성공 (ID:{pid}).")
                 submit_sitemap_to_gsc(prefix)
@@ -2405,6 +2422,7 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
             "success_media": [p.rstrip("_") for p in published_prefixes],
             "partial_success": len(published_prefixes) < expected_media_count,
             "failure_count": len(failures),
+            "published_items": published_items,
         }
 
     if failures:
@@ -2428,7 +2446,22 @@ def run():
     if TARGET_URL_IDS:
         print(f"🎯 대상 URL 필터 활성화: {len(TARGET_URL_IDS)}건")
 
-    if REVIEW_ONLY:
+    if HIDDEN_PUBLISH_TEST:
+        if not TARGET_URL_ID_LIST:
+            raise RuntimeError("HIDDEN_PUBLISH_TEST 모드에서는 TARGET_URL_IDS가 필요합니다.")
+        remaining = len(TARGET_URL_ID_LIST)
+        ex_ids, ex_titles = set(), set()
+        blocked_ids = set()
+        article_rules = {
+            "blocked_ids": set(),
+            "blocked_title_hashes": set(),
+            "blocked_source_urls": set(),
+            "allowed_ids": set(),
+            "allowed_title_hashes": set(),
+            "allowed_source_urls": set(),
+        }
+        print(f"🕶️ 숨김 발행 테스트 모드: {remaining}건, 상태 {PUBLISH_STATUS}, DB/GSC 기록 없음")
+    elif REVIEW_ONLY:
         remaining = len(TARGET_URL_IDS) if TARGET_URL_IDS else PER_RUN_LIMIT
         ex_ids, ex_titles = set(), set()
         blocked_ids = set()
@@ -2463,7 +2496,7 @@ def run():
         article_rules = db_get_active_article_rules()
 
     # 기사 수집
-    if REVIEW_ONLY and TARGET_URL_ID_LIST:
+    if (REVIEW_ONLY or HIDDEN_PUBLISH_TEST) and TARGET_URL_ID_LIST:
         print("   ⬇️ 리뷰 대상 원문 직접 수집 시작...")
         articles = load_review_articles_from_targets(TARGET_URL_ID_LIST)
     else:
@@ -2483,6 +2516,7 @@ def run():
     upload_counts = {p: 0 for p in MEDIA_PREFIXES}
     published = 0
     review_records: List[dict] = []
+    hidden_publish_results: List[dict] = []
     for article in articles:
         if published >= remaining:
             break
@@ -2492,6 +2526,17 @@ def run():
                 if REVIEW_ONLY:
                     review_records.append(result)
                     published += 1
+                    continue
+                if HIDDEN_PUBLISH_TEST:
+                    hidden_publish_results.append({
+                        "source_title": article.get("title", ""),
+                        "source_url": article.get("url", ""),
+                        "published_items": result.get("published_items", []),
+                        "partial_success": result.get("partial_success", False),
+                        "failure_count": result.get("failure_count", 0),
+                    })
+                    published += 1
+                    print(f"   🕶️ 숨김 발행 완료! ({published}/{remaining})")
                     continue
                 success_media = result.get("success_media", [])
                 media_value = ",".join(success_media) if success_media else "ALL"
@@ -2529,6 +2574,19 @@ def run():
                 if failure.abort_run:
                     raise
                 continue
+            if HIDDEN_PUBLISH_TEST:
+                hidden_publish_results.append({
+                    "source_title": article.get("title", ""),
+                    "source_url": article.get("url", ""),
+                    "status": "FAILED",
+                    "stage": failure.stage,
+                    "code": failure.code,
+                    "message": failure.message,
+                    "published_items": [],
+                })
+                if failure.abort_run:
+                    raise
+                continue
             status, retry_count, next_retry_at = classify_attempt_state(failure, db_get_attempt_state(article["url_id"]))
             db_store_attempt_state(
                 article["url_id"],
@@ -2547,6 +2605,17 @@ def run():
                 raise
         except Exception as e:
             failure = PipelineFailure("run", "UNHANDLED_EXCEPTION", str(e), retryable=False)
+            if HIDDEN_PUBLISH_TEST:
+                hidden_publish_results.append({
+                    "source_title": article.get("title", ""),
+                    "source_url": article.get("url", ""),
+                    "status": "FAILED",
+                    "stage": failure.stage,
+                    "code": failure.code,
+                    "message": failure.message,
+                    "published_items": [],
+                })
+                continue
             status, retry_count, next_retry_at = classify_attempt_state(failure, db_get_attempt_state(article["url_id"]))
             db_store_attempt_state(
                 article["url_id"],
@@ -2568,6 +2637,26 @@ def run():
         print(f"\n📝 리뷰 리포트 저장: {report_path}")
         print("   (발행/DB 기록 없음)")
         return
+
+    if HIDDEN_PUBLISH_TEST:
+        print(f"\n--- 숨김 발행 테스트 완료(KST): {now_kst().strftime('%H:%M:%S')} ---")
+        print("📊 [작업 요약]")
+        for p, c in upload_counts.items():
+            print(f"   - {p} 발행 성공: {c}건")
+        for record in hidden_publish_results:
+            items = record.get("published_items", []) or []
+            if not items:
+                print(f"   - 실패: {record.get('source_title', '')} ({record.get('stage')}/{record.get('code')})")
+                continue
+            for item in items:
+                print(
+                    "   - "
+                    f"{item.get('site')} ID:{item.get('id')} "
+                    f"상태:{item.get('status')} "
+                    f"프리뷰:{item.get('preview_url')}"
+                )
+        print("──────────────────────────────────────────")
+        return hidden_publish_results
 
     print(f"\n--- 실행 완료(KST): {now_kst().strftime('%H:%M:%S')} ---")
     print(f"📊 [작업 요약]")
