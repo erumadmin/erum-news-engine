@@ -281,6 +281,49 @@ KEYWORD_CATEGORIES_FALLBACK = {
 }
 DEFAULT_CATEGORY = "사회"
 
+CANONICAL_CATEGORY_SLUGS = {
+    "정치": "politics",
+    "사회": "society",
+    "경제": "economy",
+    "IT/과학": "it-science",
+    "문화/생활": "culture-life",
+    "국제": "international",
+    "환경": "environment",
+}
+
+CATEGORY_ALIASES = {
+    "정치": "정치",
+    "politics": "정치",
+    "사회": "사회",
+    "society": "사회",
+    "경제": "경제",
+    "economy": "경제",
+    "it/과학": "IT/과학",
+    "it과학": "IT/과학",
+    "it-science": "IT/과학",
+    "문화/생활": "문화/생활",
+    "문화생활": "문화/생활",
+    "culture-life": "문화/생활",
+    "국제": "국제",
+    "international": "국제",
+    "환경": "환경",
+    "environment": "환경",
+}
+
+
+def normalize_category_name(name: Optional[str]) -> str:
+    raw = (name or "").strip()
+    if not raw:
+        return DEFAULT_CATEGORY
+    key = raw.lower().replace(" ", "")
+    return CATEGORY_ALIASES.get(key, raw)
+
+
+def get_canonical_category_pair(name: Optional[str]) -> Tuple[str, str]:
+    canonical_name = normalize_category_name(name)
+    canonical_slug = CANONICAL_CATEGORY_SLUGS.get(canonical_name, canonical_name.lower())
+    return canonical_name, canonical_slug
+
 
 @dataclass
 class PipelineFailure(Exception):
@@ -1181,7 +1224,7 @@ def parse_llm_response(text):
 
 def get_hybrid_meta(title, body, ai_cat, ai_tags):
     valid = KEYWORD_CATEGORIES_FALLBACK.keys()
-    cat = ai_cat.replace('[', '').replace(']', '').strip()
+    cat = normalize_category_name(ai_cat.replace('[', '').replace(']', '').strip())
     if cat not in valid:
         cat = DEFAULT_CATEGORY
     tags = ai_tags
@@ -1468,7 +1511,8 @@ class Site:
 
 def upload_to_r2(img_bytes: bytes, filename: str, content_type: str) -> Optional[str]:
     """이미지를 WebP로 변환 후 Cloudflare R2에 업로드하고 퍼블릭 URL 반환. 실패 시 None."""
-    if not R2_ACCESS_KEY_ID or not R2_SECRET_ACCESS_KEY:
+    if not R2_ACCOUNT_ID or not R2_ACCESS_KEY_ID or not R2_SECRET_ACCESS_KEY:
+        print("\n      ⚠️ [R2 업로드 불가]: R2 환경변수 누락")
         return None
     variants: Dict[str, Tuple[bytes, str, str]]
     try:
@@ -1506,11 +1550,11 @@ class ErumSite:
 
     def get_cat_id(self, name: str) -> Optional[int]:
         if not name: return None
-        clean = re.sub(r'[^\w\s가-힣]', '', name).strip()[:30]
-        if not clean: return None
+        clean_name, clean_slug = get_canonical_category_pair(name)
+        if not clean_name or not clean_slug: return None
         try:
             r = requests.post(f"{self.api_base}/api/categories",
-                              json={"site": self.site_code, "name": clean},
+                              json={"site": self.site_code, "name": clean_name, "slug": clean_slug},
                               headers=self.headers, timeout=10)
             r.raise_for_status()
             return r.json()["category"]["id"]
@@ -2316,9 +2360,11 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
                 print(f"      🚀 [{prefix}] {'erum API' if is_erum else '워드프레스'} 발행 중...", end="", flush=True)
                 site = SITES[prefix]
                 if is_erum:
-                    # R2에 업로드 후 CF URL 사용, 실패 시 원본 URL fallback
+                    # ERUM 프론트는 외부 원본 이미지 hotlink에 의존하면 깨질 수 있으므로 R2 URL만 발행한다.
                     r2_url = upload_to_r2(img_bytes, fn, img_content_type)
-                    mid = r2_url if r2_url else best_img
+                    if not r2_url:
+                        raise PipelineFailure("publish", "R2_UPLOAD_REQUIRED", "R2 업로드 실패로 발행 중단", retryable=True)
+                    mid = r2_url
                 else:
                     mid, _ = site.upload_image_bytes(img_bytes, fn, img_content_type, rw["title"], best_cap)
                     if not mid:
