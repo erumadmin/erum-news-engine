@@ -144,8 +144,8 @@ def build_webp_variants(image_bytes: bytes, stem: str) -> Dict[str, Tuple[bytes,
         return output.getvalue(), "image/webp", f"{stem}{suffix}.webp"
 
     return {
-        "master": render(1600, 86, ""),
-        "thumb": render(640, 78, "__thumb"),
+        "master": render(2000, 89, ""),
+        "thumb": render(640, 80, "__thumb"),
     }
 
 

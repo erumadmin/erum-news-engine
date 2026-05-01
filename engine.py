@@ -258,10 +258,10 @@ MIN_IMAGE_BYTES = 20_000
 MIN_IMAGE_WIDTH = int(os.environ.get("MIN_IMAGE_WIDTH", "1200"))
 MIN_IMAGE_ASPECT_RATIO = float(os.environ.get("MIN_IMAGE_ASPECT_RATIO", "0.6"))
 MAX_IMAGE_ASPECT_RATIO = float(os.environ.get("MAX_IMAGE_ASPECT_RATIO", "2.4"))
-IMAGE_MASTER_MAX_WIDTH = int(os.environ.get("IMAGE_MASTER_MAX_WIDTH", "1600"))
-IMAGE_MASTER_WEBP_QUALITY = int(os.environ.get("IMAGE_MASTER_WEBP_QUALITY", "84"))
+IMAGE_MASTER_MAX_WIDTH = int(os.environ.get("IMAGE_MASTER_MAX_WIDTH", "2000"))
+IMAGE_MASTER_WEBP_QUALITY = int(os.environ.get("IMAGE_MASTER_WEBP_QUALITY", "89"))
 IMAGE_THUMB_MAX_WIDTH = int(os.environ.get("IMAGE_THUMB_MAX_WIDTH", "640"))
-IMAGE_THUMB_WEBP_QUALITY = int(os.environ.get("IMAGE_THUMB_WEBP_QUALITY", "78"))
+IMAGE_THUMB_WEBP_QUALITY = int(os.environ.get("IMAGE_THUMB_WEBP_QUALITY", "80"))
 
 CONTACT_ALT_RE = re.compile(r'\d{2,3}-\d{3,4}-\d{4}|담당\s*부서|책임자.*과\s*장|사무관.*주무관')
 
