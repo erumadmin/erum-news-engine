@@ -2391,7 +2391,6 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
                 })
                 variant_review["publish_id"] = pid
                 print(f" 성공 (ID:{pid}).")
-                submit_sitemap_to_gsc(prefix)
                 time.sleep(1)
             except requests.HTTPError as e:
                 status = getattr(getattr(e, "response", None), "status_code", 0)
@@ -2708,6 +2707,9 @@ def run():
     print(f"📊 [작업 요약]")
     for p, c in upload_counts.items():
         print(f"   - {p} 발행 성공: {c}건")
+    for prefix, count in upload_counts.items():
+        if count > 0:
+            submit_sitemap_to_gsc(prefix)
     print(f"   - 금일 최종 누적: {today_count + published}/{DAILY_PUBLISH_LIMIT}건")
     print(f"──────────────────────────────────────────")
 
