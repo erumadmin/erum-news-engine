@@ -15,6 +15,18 @@ REPEAT_MAX_TOTAL = 4
 REPEAT_POLICY_TERMS = ("6개월",)
 
 
+def flatten_nested_paragraph_tags(body: str) -> str:
+    """Fix <p><p>...</p></p> duplicates from the rewrite model."""
+    out = body or ""
+    for _ in range(4):
+        updated = re.sub(r"(<p[^>]*>)\s*<p[^>]*>", r"\1", out, flags=re.IGNORECASE)
+        updated = re.sub(r"</p>\s*</p>", "</p>", updated, flags=re.IGNORECASE)
+        if updated == out:
+            break
+        out = updated
+    return out
+
+
 def normalize_temporal_in_body(body: str, source_text: str) -> str:
     """Replace common mismatch when source says next month."""
     hint = temporal_hint_from_source(source_text)

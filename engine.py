@@ -900,6 +900,8 @@ def validate_content_quality(title, body):
     # 포맷 오염
     if "**" in body or "##" in body:
         return False, "마크다운(**, ##) 잔재 발견"
+    if re.search(r"<p[^>]*>\s*<p", body, flags=re.IGNORECASE):
+        return False, "중첩 p 태그 발견"
     # HTML 태그 검사 제거: clean_body_html()이 의도적으로 <p>/<strong>/<h3> 등을 생성하므로 오탐
 
     # 미완성 기사
@@ -937,6 +939,7 @@ def should_retry_rewrite_validation(message: str) -> bool:
             "반복 과다",
             "한계·조건 서술 부족",
             "IJ 4문단",
+            "중첩 p 태그",
         )
     )
 
@@ -2394,10 +2397,12 @@ def process_article(
                 is_valid, msg = validate_content_quality(p["title"], p["body"])
                 if is_valid and ij_editorial:
                     from engine.pipeline.rewrite_validate import (
+                        flatten_nested_paragraph_tags,
                         normalize_temporal_in_body,
                         validate_ij_editorial_rewrite,
                     )
 
+                    p["body"] = flatten_nested_paragraph_tags(p["body"])
                     p["body"] = normalize_temporal_in_body(p["body"], article.get("body") or "")
                     is_valid, msg = validate_ij_editorial_rewrite(
                         p["title"],
