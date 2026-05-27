@@ -932,6 +932,11 @@ def should_retry_rewrite_validation(message: str) -> bool:
             "라벨 잔재 발견",
             "본문 마지막 문자 비정상",
             "문단 수 부족",
+            "시점 표기 불일치",
+            "독자 확인 URL 누락",
+            "반복 과다",
+            "한계·조건 서술 부족",
+            "IJ 4문단",
         )
     )
 
@@ -2368,21 +2373,66 @@ def process_article(
 
             p = None
             msg = ""
-            for attempt_idx, max_tokens in enumerate(rewrite_token_budgets):
+            ij_editorial = (
+                editorial_ctx
+                and editorial_ctx.use_packet_writing
+                and prefix == "IJ_"
+                and IJ_PACKET_PIPELINE
+            )
+            validation_attempts = int(os.environ.get("IJ_REWRITE_VALIDATION_ATTEMPTS", "3"))
+            current_input = rewrite_input
+            for attempt_idx in range(validation_attempts):
+                max_tokens = rewrite_token_budgets[min(attempt_idx, len(rewrite_token_budgets) - 1)]
                 res = ask_llm(
                     PERSONA_DEFINITIONS[prefix],
-                    rewrite_input,
+                    current_input,
                     model=UPSTAGE_MODEL_REWRITE,
                     max_output_tokens=max_tokens,
                     stage="rewrite",
                 )
                 p = parse_llm_response(res)
-                is_valid, msg = validate_content_quality(p['title'], p['body'])
+                is_valid, msg = validate_content_quality(p["title"], p["body"])
+                if is_valid and ij_editorial:
+                    from engine.pipeline.rewrite_validate import (
+                        normalize_temporal_in_body,
+                        validate_ij_editorial_rewrite,
+                    )
+
+                    p["body"] = normalize_temporal_in_body(p["body"], article.get("body") or "")
+                    is_valid, msg = validate_ij_editorial_rewrite(
+                        p["title"],
+                        p["body"],
+                        editorial_ctx.packet,
+                        article,
+                    )
                 if is_valid:
                     break
-                if attempt_idx + 1 >= len(rewrite_token_budgets) or not should_retry_rewrite_validation(msg):
+                if (
+                    ij_editorial
+                    and "한계·조건" in msg
+                    and attempt_idx + 1 >= validation_attempts
+                ):
+                    from engine.pipeline.rewrite_validate import (
+                        append_limitation_paragraph_if_needed,
+                        validate_ij_editorial_rewrite,
+                    )
+
+                    p["body"] = append_limitation_paragraph_if_needed(p["body"], editorial_ctx.packet)
+                    p["body"] = normalize_temporal_in_body(p["body"], article.get("body") or "")
+                    is_valid, msg = validate_ij_editorial_rewrite(
+                        p["title"],
+                        p["body"],
+                        editorial_ctx.packet,
+                        article,
+                    )
+                if is_valid:
+                    break
+                if attempt_idx + 1 >= validation_attempts or not should_retry_rewrite_validation(msg):
                     raise PipelineFailure("rewrite", "REWRITE_VALIDATION_FAIL", msg, retryable=False)
-                next_tokens = rewrite_token_budgets[attempt_idx + 1]
+                from engine.pipeline.rewrite_validate import build_rewrite_correction_suffix
+
+                current_input = rewrite_input + build_rewrite_correction_suffix(msg)
+                next_tokens = rewrite_token_budgets[min(attempt_idx + 1, len(rewrite_token_budgets) - 1)]
                 print(f" 재시도({msg}, {max_tokens}->{next_tokens} 토큰)...", end="", flush=True)
 
             if p is None:

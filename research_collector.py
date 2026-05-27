@@ -471,11 +471,17 @@ def _first_sentence(text: str, max_len: int = 200) -> str:
 
 
 def _extract_effective_date(text: str) -> str:
-    m = EFFECTIVE_DATE_RE.search(text or "")
-    if not m:
-        return ""
-    y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-    return f"{y:04d}-{mo:02d}-{d:02d}"
+    body = text or ""
+    m = EFFECTIVE_DATE_RE.search(body)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        return f"{y:04d}-{mo:02d}-{d:02d}"
+    if re.search(r"다음\s*달\s*1\s*일", body):
+        return "next-month-1"
+    if re.search(r"(\d{1,2})월\s*1\s*일부터", body):
+        mo = int(re.search(r"(\d{1,2})월\s*1\s*일부터", body).group(1))
+        return f"month-{mo:02d}-01"
+    return ""
 
 
 def _extract_who_affected(text: str) -> list[str]:
