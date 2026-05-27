@@ -150,7 +150,13 @@ if HIDDEN_PUBLISH_TEST:
     PUBLISH_STATUS = "DRAFT"
 if not UPSTAGE_API_KEY and not (REVIEW_ONLY and GEMINI_API_KEY):
     raise RuntimeError("UPSTAGE_API_KEY가 없습니다. 리뷰 전용 모드에서는 GEMINI_API_KEY가 필요합니다.")
+EDITORIAL_PIPELINE = os.environ.get("EDITORIAL_PIPELINE", "1") == "1"
+# IJ + 편집 파이프라인: 수집 원문 전문 + 리서치 패킷·근거를 합쳐 재작성 (0이면 원문만)
+# IJ 작성: 원문 전문 + 리서치 패킷 + 근거 (하이브리드 유저 메시지). 0 = GitHub main처럼 원문만.
+IJ_PACKET_PIPELINE = os.environ.get("IJ_PACKET_PIPELINE", "1") != "0"
+EDITORIAL_PERSIST = os.environ.get("EDITORIAL_PERSIST", "0") == "1"
 MEDIA_PREFIXES = ["IJ_", "NN_", "CB_"]
+SITE_PREFIX_BY_CODE = {"IJ": "IJ_", "NN": "NN_", "CB": "CB_"}
 KST = ZoneInfo("Asia/Seoul")
 TARGET_URL_IDS = {
     x.strip()
@@ -758,6 +764,9 @@ def db_ensure_table():
                     KEY idx_audit_logs_created_at (created_at)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
+            from engine.services.db_editorial import ensure_editorial_tables
+
+            ensure_editorial_tables(lambda sql: cur.execute(sql))
             # 기존 테이블에는 새 컬럼이 없을 수 있으므로, 안전하게 보강한다.
             for table_name, column_name, column_def in [
                 ("published_articles", "source_published_at", "DATETIME DEFAULT NULL"),
@@ -1005,6 +1014,7 @@ def build_qa_user_message(
     title: str,
     excerpt: str,
     body: str,
+    packet: Optional[dict] = None,
 ) -> str:
     plain_body = re.sub(r'<[^>]+>', ' ', body).strip()
     plain_body = re.sub(r'\s+', ' ', plain_body)
@@ -1026,6 +1036,9 @@ def build_qa_user_message(
             f"본문: {source_plain}",
             "",
         ])
+    from engine.pipeline.qa_input import append_packet_block
+
+    append_packet_block(lines, packet)
     lines.extend([
         "재작성 기사",
         f"제목: {title}",
@@ -1034,16 +1047,20 @@ def build_qa_user_message(
     ])
     return "\n".join(lines)
 
+
 def ai_quality_check(
     title: str,
     excerpt: str,
     body: str,
     media_prefix: str,
     source_article: Optional[dict] = None,
+    research_packet: Optional[dict] = None,
 ) -> Tuple[bool, List[str], int, Optional[dict]]:
     media_tone = MEDIA_TONE_DESC.get(media_prefix, "일반 뉴스")
     system_prompt = QA_SYSTEM_PROMPT.format(media_tone=media_tone)
-    article_text = build_qa_user_message(source_article, title, excerpt, body)
+    article_text = build_qa_user_message(
+        source_article, title, excerpt, body, packet=research_packet
+    )
     raw = ask_llm(system_prompt, article_text, model=UPSTAGE_MODEL_QA, max_output_tokens=UPSTAGE_QA_MAX_OUTPUT_TOKENS, stage="qa")
     try:
         parts = raw.split("---", 1)
@@ -2193,30 +2210,82 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, 
             f"뉴스와이어비한글 {stats['skipped_non_korean_newswire']}"
         )
 
+    if articles and EDITORIAL_PIPELINE and os.environ.get("EDITORIAL_ENRICH_ON_COLLECT", "1") != "0":
+        from engine.pipeline.ingest import enrich_articles_batch
+
+        print(f"   📥 [원문보강] RSS {len(articles)}건 → 전문 페이지 fetch 시도...")
+        articles = enrich_articles_batch(articles, fetch_with_retry)
+
     return articles
 
 
-def process_article(article: dict, upload_counts: dict, review_mode: bool = REVIEW_ONLY) -> dict:
-    """기사 1건을 3개 매체에 재작성 + 발행."""
+def _editorial_db_hooks() -> Optional[dict]:
+    if not EDITORIAL_PERSIST:
+        return None
+    from engine.services import db_editorial as edb
+
+    def save_raw_source(raw: dict, research: dict) -> int:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                return edb.insert_raw_source(cur, raw, research)
+        finally:
+            conn.close()
+
+    def save_research_packet(raw_id: int, site: str, packet: dict, publish_grade: str, placement) -> int:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                return edb.insert_research_packet(cur, raw_id, site, packet, publish_grade, placement)
+        finally:
+            conn.close()
+
+    return {"save_raw_source": save_raw_source, "save_research_packet": save_research_packet}
+
+
+def process_article(
+    article: dict,
+    upload_counts: dict,
+    review_mode: bool = REVIEW_ONLY,
+    editorial_ctx=None,
+) -> dict:
+    """기사 1건 처리. editorial_ctx가 있으면 1원문=1사이트 라우팅."""
     print(f"\n▶ 기사 처리 시작: {article['title'][:40]}...")
     source_published_at = article.get("source_published_at")
     published_at = now_kst()
-    media_plan: Dict[str, Dict[str, Any]] = {
-        prefix: {"enabled": True, "mode": "default", "reason": ""}
-        for prefix in MEDIA_PREFIXES
-    }
-    cb_mode, cb_reason = assess_cb_article_fit(article)
-    media_plan["CB_"] = {
-        "enabled": cb_mode != "skip",
-        "mode": cb_mode,
-        "reason": cb_reason,
-    }
-    expected_media_count = sum(1 for prefix in MEDIA_PREFIXES if media_plan.get(prefix, {}).get("enabled", True))
+    if editorial_ctx:
+        from engine.pipeline.media_plan import build_media_plan_for_editorial
+
+        media_plan = build_media_plan_for_editorial(
+            editorial_ctx,
+            assess_cb_article_fit=assess_cb_article_fit,
+            article=article,
+        )
+        active_prefixes = [p for p in MEDIA_PREFIXES if media_plan[p].get("enabled")]
+    else:
+        media_plan = {
+            prefix: {"enabled": True, "mode": "default", "reason": ""}
+            for prefix in MEDIA_PREFIXES
+        }
+        cb_mode, cb_reason = assess_cb_article_fit(article)
+        media_plan["CB_"] = {
+            "enabled": cb_mode != "skip",
+            "mode": cb_mode,
+            "reason": cb_reason,
+        }
+        active_prefixes = [p for p in MEDIA_PREFIXES if media_plan[p].get("enabled")]
+    expected_media_count = len(active_prefixes)
     review_record = {
         "source_title": article.get("title", ""),
         "source_url": article.get("url", ""),
         "source_published_at": source_published_at,
         "source_chars": len(article.get("body", "") or ""),
+        "editorial": {
+            "assigned_site": getattr(editorial_ctx, "assigned_site", None),
+            "publish_grade": getattr(editorial_ctx, "publish_grade", None),
+            "placement": editorial_ctx.placement.to_dict() if editorial_ctx else None,
+            "use_packet_writing": getattr(editorial_ctx, "use_packet_writing", False),
+        } if editorial_ctx else None,
         "media_plan": {
             prefix.rstrip("_"): {
                 "enabled": plan.get("enabled", True),
@@ -2253,7 +2322,7 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
     published_prefixes = []
     published_items: List[dict] = []
     failures: List[PipelineFailure] = []
-    for prefix in MEDIA_PREFIXES:
+    for prefix in active_prefixes:
         plan = media_plan.get(prefix, {"enabled": True, "mode": "default", "reason": ""})
         if not plan.get("enabled", True):
             print(f"      ⏭️ [{prefix}] 스킵 ({plan.get('reason', 'CB 비적합')}).")
@@ -2277,7 +2346,22 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
             print(f"      🧭 [CB_] {plan.get('mode')} 앵글 ({plan.get('reason')}).")
         print(f"      ✍️ [{prefix}] Solar Pro 3 기사 작성 중...", end="", flush=True)
         try:
-            rewrite_input = build_rewrite_user_message(article)
+            if (
+                editorial_ctx
+                and editorial_ctx.use_packet_writing
+                and prefix == "IJ_"
+                and IJ_PACKET_PIPELINE
+            ):
+                from engine.pipeline.packet_writer import build_rewrite_user_message_from_editorial
+
+                rewrite_input = build_rewrite_user_message_from_editorial(
+                    article,
+                    editorial_ctx.packet,
+                    editorial_ctx.evidence,
+                )
+                print(" [원문+리서치]", end="", flush=True)
+            else:
+                rewrite_input = build_rewrite_user_message(article)
             rewrite_token_budgets = [UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS]
             if UPSTAGE_REWRITE_RETRY_MAX_OUTPUT_TOKENS not in rewrite_token_budgets:
                 rewrite_token_budgets.append(UPSTAGE_REWRITE_RETRY_MAX_OUTPUT_TOKENS)
@@ -2313,6 +2397,7 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
                 p['body'],
                 prefix,
                 source_article=article,
+                research_packet=editorial_ctx.packet if editorial_ctx else None,
             )
             final_pass = passed
 
@@ -2381,6 +2466,11 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
                 )
                 upload_counts[prefix] += 1
                 published_prefixes.append(prefix)
+                publish_meta = {}
+                if editorial_ctx:
+                    from engine.pipeline.publish_meta import build_publish_extras
+
+                    publish_meta = build_publish_extras(editorial_ctx)
                 published_items.append({
                     "prefix": prefix.rstrip("_"),
                     "site": ERUM_CFG.get(prefix, {}).get("site", prefix.rstrip("_")),
@@ -2388,6 +2478,7 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
                     "title": rw["title"],
                     "status": PUBLISH_STATUS,
                     "preview_url": f"{ERUM_API_BASE}/preview/articles/{pid}",
+                    **publish_meta,
                 })
                 variant_review["publish_id"] = pid
                 print(f" 성공 (ID:{pid}).")
@@ -2487,7 +2578,12 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
 
 
 def run():
-    print(f"\n🚀 AI 뉴스 엔진 (v25.1-Upstage_SolarPro3_KST) 가동: {now_kst().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"\n🚀 AI 뉴스 엔진 (v26.0-EditorialPipeline_KST) 가동: {now_kst().strftime('%Y-%m-%d %H:%M:%S')}")
+    if EDITORIAL_PIPELINE:
+        print(
+            f"   📰 편집 파이프라인: ON (1원문=1사이트, IJ패킷={'ON' if IJ_PACKET_PIPELINE else 'OFF'}, "
+            f"DB영속={'ON' if EDITORIAL_PERSIST else 'OFF'})"
+        )
     if TARGET_URL_IDS:
         print(f"🎯 대상 URL 필터 활성화: {len(TARGET_URL_IDS)}건")
 
@@ -2562,11 +2658,39 @@ def run():
     published = 0
     review_records: List[dict] = []
     hidden_publish_results: List[dict] = []
+    editorial_hooks = _editorial_db_hooks() if EDITORIAL_PIPELINE and EDITORIAL_PERSIST else None
+    if EDITORIAL_PIPELINE:
+        from engine.pipeline.orchestrator import run_pre_publish_pipeline
+
     for article in articles:
         if published >= remaining:
             break
+        editorial_ctx = None
+        if EDITORIAL_PIPELINE:
+            try:
+                # 리뷰 모드도 TARGET 직접 로드·purpose 테스트는 전문 fetch 필요
+                fetcher = fetch_with_retry
+                editorial_ctx = run_pre_publish_pipeline(
+                    article,
+                    fetcher=fetcher,
+                    persist=bool(editorial_hooks),
+                    db_hooks=editorial_hooks,
+                )
+            except Exception as pipe_err:
+                print(f"   ⚠️ 편집 파이프라인 오류: {pipe_err}")
+                if os.environ.get("EDITORIAL_PIPELINE_STRICT", "0") == "1":
+                    raise
+                editorial_ctx = None
+            if editorial_ctx is None:
+                print("   ⏭️ 편집 파이프라인 DROP — 다음 기사")
+                continue
         try:
-            result = process_article(article, upload_counts, review_mode=REVIEW_ONLY)
+            result = process_article(
+                article,
+                upload_counts,
+                review_mode=REVIEW_ONLY,
+                editorial_ctx=editorial_ctx,
+            )
             if result:
                 if REVIEW_ONLY:
                     review_records.append(result)
