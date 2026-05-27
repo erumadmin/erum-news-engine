@@ -29,3 +29,21 @@ class TestTierC(unittest.TestCase):
 
         added = tc.collect_tier_c_evidence(raw, evidence, packet, fetcher, max_fetch=2)
         self.assertTrue(any("price.go.kr" in (e.get("url") or "") for e in added))
+
+    def test_collect_tier_c_fetches_kepco_reader_url(self):
+        raw = {
+            "title": "전기요금",
+            "body": "확인: https://online.kepco.co.kr/ 및 https://en-ter.co.kr/",
+            "url": "https://www.korea.kr/1",
+        }
+        packet = {"key_facts": ["a", "b", "c"], "risk_flags": ["official_evidence_missing"]}
+
+        def fetcher(url):
+            m = MagicMock()
+            m.status_code = 200
+            m.text = f"<html><title>t</title><article><p>{'요금 안내 ' * 20}</p></article></html>"
+            return m
+
+        added = tc.collect_tier_c_evidence(raw, [], packet, fetcher, max_fetch=2)
+        urls = " ".join(e.get("url") or "" for e in added)
+        self.assertIn("kepco.co.kr", urls)

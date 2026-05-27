@@ -60,6 +60,7 @@ ARTICLE_ROOT_SELECTORS = (
 SKIP_FETCH_EVIDENCE_TYPES = frozenset({"ministry_press_hub"})
 
 MINISTRY_PRESS_HUBS: tuple[tuple[str, str, str], ...] = (
+    (r"기후에너지환경부|기후부", "https://www.me.go.kr/home/web/board/list.do?boardMasterId=1", "ministry_press_hub"),
     (r"공정거래위원회|공정위", "https://www.ftc.go.kr/www/bbs/bbsList.do?key=0000104030000", "ministry_press_hub"),
     (r"과학기술정보통신부|과기정통부", "https://www.msit.go.kr/bbs/list.do?sCode=user&mId=57&mPid=74", "ministry_press_hub"),
     (r"산업통상부|산업통상자원부|산업부", "https://www.motie.go.kr/motie/ne/presse/press2/bbs/bbsList.do?bbs_cd_n=81", "ministry_press_hub"),
@@ -495,21 +496,31 @@ def _extract_who_affected(text: str) -> list[str]:
     return list(dict.fromkeys(found))[:6]
 
 
+def _label_reader_action_url(url: str, anchor: str = "") -> str:
+    label = (anchor or "").strip()
+    lowered = url.lower()
+    if "price.go.kr" in lowered or "참가격" in label:
+        return f"참가격 확인: {url}"
+    if "kepco" in lowered:
+        return f"한전 안내: {url}"
+    if "en-ter.co.kr" in lowered:
+        return f"에너지마켓플레이스: {url}"
+    if ".go.kr" in lowered:
+        return f"공식 안내: {url}"
+    return f"독자 확인: {url}"
+
+
 def _extract_action_items(text: str) -> list[str]:
     """Reader-facing URLs and notice channels mentioned in source text."""
     items: list[str] = []
     for url, anchor in extract_urls_from_text(text or ""):
-        label = (anchor or url).strip()
-        if "price.go.kr" in url or "참가격" in label:
-            items.append(f"참가격 확인: {url}")
-        elif ".go.kr" in url:
-            items.append(f"공식 안내: {url}")
+        items.append(_label_reader_action_url(url, anchor))
     for m in re.finditer(
-        r"(3개월|1개월|30일|60일|90일)[^\n]{0,40}(?:전|이내|이전)",
+        r"(3개월|1개월|30일|60일|90일|6개월)[^\n]{0,40}(?:전|이내|이전|까지)",
         text or "",
     ):
         items.append(m.group(0).strip()[:120])
-    return list(dict.fromkeys(items))[:6]
+    return list(dict.fromkeys(items))[:8]
 
 
 def _bullet_conditions(text: str) -> list[str]:

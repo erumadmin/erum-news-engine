@@ -114,6 +114,16 @@ class TestActionItems(unittest.TestCase):
         joined = " ".join(actions)
         self.assertIn("price.go.kr", joined)
 
+    def test_action_items_includes_kepco_and_energy_market_urls(self):
+        body = (
+            "자세한 내용은 한전ON(https://online.kepco.co.kr/) 또는 "
+            "에너지마켓플레이스(https://en-ter.co.kr/)에서 확인할 수 있다."
+        )
+        actions = rc._extract_action_items(body)
+        joined = " ".join(actions)
+        self.assertIn("kepco.co.kr", joined)
+        self.assertIn("en-ter.co.kr", joined)
+
 
 class TestResearchPacket(unittest.TestCase):
     def test_packet_grade_with_mock_evidence(self):

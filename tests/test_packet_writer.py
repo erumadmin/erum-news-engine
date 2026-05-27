@@ -27,6 +27,9 @@ class TestEditorialHybridRewrite(unittest.TestCase):
             "key_facts": ["협약 체결"],
             "publish_grade": "C",
             "risk_flags": ["official_evidence_missing"],
+            "action_items": ["참가격 확인: https://www.price.go.kr/"],
+            "effective_date": "2026-06-01",
+            "why_now": "협약 시행 임박",
         }
         evidence = [
             {
@@ -45,6 +48,10 @@ class TestEditorialHybridRewrite(unittest.TestCase):
         self.assertIn("[추가 근거]", msg)
         self.assertIn("https://www.price.go.kr/", msg)
         self.assertIn("official_evidence_missing", msg)
+        self.assertIn("[독자 확인 경로", msg)
+        self.assertIn("https://www.price.go.kr/", msg)
+        self.assertIn("4개의 <p>", msg)
+        self.assertIn("effective_date=2026-06-01", msg)
 
 
 if __name__ == "__main__":

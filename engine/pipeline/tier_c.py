@@ -47,6 +47,13 @@ def _existing_urls(evidence: list[dict[str, Any]], raw_source: dict[str, Any]) -
     return {u for u in urls if u}
 
 
+READER_ACTION_HOST_MARKERS = (
+    "price.go.kr",
+    "kepco.co.kr",
+    "en-ter.co.kr",
+)
+
+
 def _deterministic_tier_c_targets(
     raw_source: dict[str, Any],
     existing: set[str],
@@ -58,7 +65,11 @@ def _deterministic_tier_c_targets(
     text = f"{title}\n{body}"
     candidates: list[str] = []
     for url, _anchor in rc.extract_urls_from_text(text):
-        if url in existing:
+        if url in existing or url in candidates:
+            continue
+        lowered = url.lower()
+        if any(marker in lowered for marker in READER_ACTION_HOST_MARKERS):
+            candidates.append(url)
             continue
         _host, _etype, rank = rc.classify_domain(url)
         if rank >= 80:
