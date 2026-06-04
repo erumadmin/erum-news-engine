@@ -40,7 +40,7 @@ def prepare_ij_publish_body(
 ) -> dict[str, Any]:
     """Sanitize body, run publish gate, append sources footer HTML."""
     body, footer = publish_sanitize_body(body_html, packet, article)
-    gate = article_publish_ready(title, excerpt, body_html, packet, article)
+    gate = article_publish_ready(title, excerpt, body, packet, article)
     body += render_sources_footer_html(footer)
     return {
         "body_html": body,

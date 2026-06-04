@@ -45,8 +45,8 @@ def main():
     if args.mode in ("dry-run", "review"):
         env["REVIEW_ONLY"] = "1"
         env["EDITORIAL_IMAGE_PROBE"] = "1"
-        env["EDITORIAL_IMAGE_PROBE_DOWNLOAD"] = "1"  # strict: must download per B2
         if args.mode == "review":
+            env["EDITORIAL_IMAGE_PROBE_DOWNLOAD"] = "1"  # strict: must download per B2
             env.setdefault("EDITORIAL_QUALITY_MAX_ATTEMPTS", "12")
         else:
             env.setdefault("EDITORIAL_QUALITY_MAX_ATTEMPTS", "3")

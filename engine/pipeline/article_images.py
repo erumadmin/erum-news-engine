@@ -13,6 +13,8 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
+from engine.pipeline.exceptions import PipelineFailure
+
 _ENGINE_MAIN = None
 
 BLOCKED_IMAGE_PATTERNS = [
@@ -57,12 +59,6 @@ def fetch_with_retry(url, max_retries=2, timeout=15, stream=False, retry_statuse
         stream=stream,
         retry_statuses=retry_statuses,
     )
-
-
-def __getattr__(name: str):
-    if name == "PipelineFailure":
-        return _engine_main().PipelineFailure
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 @dataclass
@@ -362,7 +358,7 @@ def find_best_image(article):
 
     if not candidates:
         if page_retryable:
-            raise _engine_main().PipelineFailure("image", "SOURCE_FETCH_HTTP_5XX", "기사 본문 조회 실패", retryable=True)
+            raise PipelineFailure("image", "SOURCE_FETCH_HTTP_5XX", "기사 본문 조회 실패", retryable=True)
         return []
 
     candidates = sorted(candidates, key=lambda c: c.score, reverse=True)
@@ -431,10 +427,10 @@ def download_best_image(candidates: list[ImageCandidate]) -> Tuple[bytes, str, s
             continue
 
     if retryable_seen:
-        raise eng.PipelineFailure("image", "IMAGE_FETCH_HTTP_5XX", "이미지 다운로드 실패", retryable=True)
+        raise PipelineFailure("image", "IMAGE_FETCH_HTTP_5XX", "이미지 다운로드 실패", retryable=True)
     if quality_seen:
-        raise eng.PipelineFailure("image", "IMAGE_QUALITY_TOO_LOW", "대표이미지 품질 미달", retryable=False)
-    raise eng.PipelineFailure("image", "NO_USABLE_IMAGE", "사용 가능한 이미지 없음", retryable=False)
+        raise PipelineFailure("image", "IMAGE_QUALITY_TOO_LOW", "대표이미지 품질 미달", retryable=False)
+    raise PipelineFailure("image", "NO_USABLE_IMAGE", "사용 가능한 이미지 없음", retryable=False)
 
 
 def require_article_image(article: dict, *, download: bool = True) -> dict:
@@ -444,7 +440,7 @@ def require_article_image(article: dict, *, download: bool = True) -> dict:
     """
     candidates = find_best_image(article)
     if not candidates:
-        raise _engine_main().PipelineFailure("image", "NO_USABLE_IMAGE", "이미지 후보 없음", retryable=False)
+        raise PipelineFailure("image", "NO_USABLE_IMAGE", "이미지 후보 없음", retryable=False)
     if not download:
         best = candidates[0]
         return {

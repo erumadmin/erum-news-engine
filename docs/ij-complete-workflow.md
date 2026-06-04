@@ -23,7 +23,7 @@ flowchart LR
 | 2 | 이미지 (필수) | `article_images.require_article_image` | No usable image → article skipped; never reaches research/rewrite |
 | 3 | 리서치 | `research_collector`, `ij_pipeline._research_and_build_context` | `publish_grade D` → drop |
 | 4 | 재작성 | `rewrite_validate`, `target_engine` | Quality loop in review modes |
-| 5 | 발행본 | `publish_body.build_publish_body_html` | v4 layout, sources footer |
+| 5 | 발행본 | `publish_body.prepare_ij_publish_body` | v4 layout, sources footer |
 | 6 | ERUM API | `engine.py` publish path | `REVIEW_ONLY=1` → no API; `hidden-publish` → `DRAFT` only |
 
 IJ-specific order is enforced in `engine/pipeline/ij_pipeline.py`: **image gate runs before any LLM research** for `assigned == "IJ"`.

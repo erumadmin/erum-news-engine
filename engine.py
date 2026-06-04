@@ -317,18 +317,7 @@ def get_canonical_category_pair(name: Optional[str]) -> Tuple[str, str]:
     return canonical_name, canonical_slug
 
 
-@dataclass
-class PipelineFailure(Exception):
-    stage: str
-    code: str
-    message: str
-    retryable: bool = False
-    abort_run: bool = False
-    partial_success: bool = False
-
-    def __post_init__(self):
-        super().__init__(self.message)
-
+from engine.pipeline.exceptions import PipelineFailure  # noqa: E402 — shared with pipeline modules
 
 # IJ 카테고리별 기자 매핑 (WP user ID)
 IJ_CATEGORY_AUTHOR = {
@@ -2332,7 +2321,7 @@ def process_article(
                     if not mid:
                         raise PipelineFailure("publish", "IMAGE_UPLOAD_FAIL", "이미지 업로드 실패", retryable=True)
                 publish_body_html = rw["body"]
-                if prefix == "IJ_" and editorial_ctx and editorial_ctx.use_packet_writing:
+                if prefix == "IJ_" and editorial_ctx:
                     from engine.pipeline.publish_body import prepare_ij_publish_body
 
                     pub = prepare_ij_publish_body(
@@ -2742,6 +2731,10 @@ def run():
                     f"상태:{item.get('status')} "
                     f"프리뷰:{item.get('preview_url')}"
                 )
+        if skipped_no_image:
+            skip_path = write_image_skip_report(skipped_image_articles, skipped_no_image)
+            print(f"   🖼️ 이미지 없음 스킵: {skipped_no_image}건")
+            print(f"   📝 이미지 스킵 리포트: {skip_path}")
         print("──────────────────────────────────────────")
         return hidden_publish_results
 

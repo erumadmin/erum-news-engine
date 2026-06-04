@@ -5,7 +5,8 @@ from __future__ import annotations
 import os
 from typing import Any, Callable, Optional
 
-from engine.pipeline.article_images import PipelineFailure, require_article_image
+from engine.pipeline.exceptions import PipelineFailure
+from engine.pipeline.article_images import require_article_image
 from engine.pipeline.ingest import enrich_article_from_page
 from engine.pipeline.orchestrator import enrich_raw_source, should_use_ij_editorial_rewrite
 from engine.pipeline.placement import score_placement
