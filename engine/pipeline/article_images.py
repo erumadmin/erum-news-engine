@@ -6,7 +6,6 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional, Tuple
 from urllib.parse import urljoin
 
@@ -14,8 +13,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from engine.pipeline.exceptions import PipelineFailure
-
-_ENGINE_MAIN = None
+from engine.utils.http import REQUEST_HEADERS, fetch_with_retry
 
 BLOCKED_IMAGE_PATTERNS = [
     "btn_textview", "icon_logo", "go_new", "koreakr_og", "koreakr_fb",
@@ -32,33 +30,6 @@ MIN_IMAGE_ASPECT_RATIO = float(os.environ.get("MIN_IMAGE_ASPECT_RATIO", "0.6"))
 MAX_IMAGE_ASPECT_RATIO = float(os.environ.get("MAX_IMAGE_ASPECT_RATIO", "2.4"))
 
 CONTACT_ALT_RE = re.compile(r'\d{2,3}-\d{3,4}-\d{4}|담당\s*부서|책임자.*과\s*장|사무관.*주무관')
-
-
-def _engine_main():
-    """Load repo-root engine.py (not the engine/ package)."""
-    global _ENGINE_MAIN
-    if _ENGINE_MAIN is not None:
-        return _ENGINE_MAIN
-    import importlib.util
-    import sys
-
-    root = Path(__file__).resolve().parents[2]
-    spec = importlib.util.spec_from_file_location("erum_news_engine_main", root / "engine.py")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)
-    _ENGINE_MAIN = mod
-    return mod
-
-
-def fetch_with_retry(url, max_retries=2, timeout=15, stream=False, retry_statuses=(429, 500, 502, 503, 504)):
-    return _engine_main().fetch_with_retry(
-        url,
-        max_retries=max_retries,
-        timeout=timeout,
-        stream=stream,
-        retry_statuses=retry_statuses,
-    )
 
 
 @dataclass
@@ -374,7 +345,6 @@ def find_best_image(article):
 
 
 def download_best_image(candidates: list[ImageCandidate]) -> Tuple[bytes, str, str, Optional[str], str]:
-    eng = _engine_main()
     retryable_seen = False
     blocked_seen = False
     quality_seen = False
@@ -386,7 +356,7 @@ def download_best_image(candidates: list[ImageCandidate]) -> Tuple[bytes, str, s
 
             is_korea_kr = 'korea.kr/newsWeb/resources/attaches' in cand.url
             if is_korea_kr:
-                kr_headers = dict(eng.REQUEST_HEADERS)
+                kr_headers = dict(REQUEST_HEADERS)
                 kr_headers['Referer'] = 'https://www.korea.kr/'
                 img_resp = requests.get(cand.url, headers=kr_headers, timeout=20)
             else:

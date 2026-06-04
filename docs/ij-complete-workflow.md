@@ -42,8 +42,8 @@ FIXTURE_URL='https://www.korea.kr/news/policyNewsView.do?newsId=...' \
 
 | Mode | Env set by CLI | Underlying script | Max quality attempts |
 |------|----------------|-------------------|----------------------|
-| `dry-run` | `REVIEW_ONLY=1`, strict image download | `run_editorial_quality_loop.py` | 3 (default) |
-| `review` | `REVIEW_ONLY=1`, strict image download | `run_editorial_quality_loop.py` | 12 (default) |
+| `dry-run` | `REVIEW_ONLY=1`, `EDITORIAL_IMAGE_PROBE=1` (no `EDITORIAL_IMAGE_PROBE_DOWNLOAD`) | `run_editorial_quality_loop.py` | 3 (default) |
+| `review` | `REVIEW_ONLY=1`, `EDITORIAL_IMAGE_PROBE=1`, `EDITORIAL_IMAGE_PROBE_DOWNLOAD=1` | `run_editorial_quality_loop.py` | 12 (default) |
 | `hidden-publish` | `REVIEW_ONLY=0`, `HIDDEN_PUBLISH_TEST=1`, `PUBLISH_STATUS=draft` | `engine.py` | N/A (single-target) |
 
 **hidden-publish** requires `TARGET_URL_IDS` (comma-separated URL IDs from DB or test fixtures):

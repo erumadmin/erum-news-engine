@@ -92,16 +92,26 @@ class TestIjPipelineOrder(unittest.TestCase):
             "selected_url": "https://cdn.example/hero.jpg",
             "image_status": "download_ok",
         }
-        mock_require_image.return_value = img_result
-        mock_research.return_value = {
-            "packet": {
-                "publish_grade": "B",
-                "placement_hint": {},
-                "site": "IJ",
-                "risk_flags": [],
-            },
-            "evidence": [],
-        }
+        call_order = []
+
+        def _require_image(*args, **kwargs):
+            call_order.append("image")
+            return img_result
+
+        def _research(*args, **kwargs):
+            call_order.append("research")
+            return {
+                "packet": {
+                    "publish_grade": "B",
+                    "placement_hint": {},
+                    "site": "IJ",
+                    "risk_flags": [],
+                },
+                "evidence": [],
+            }
+
+        mock_require_image.side_effect = _require_image
+        mock_research.side_effect = _research
         mock_placement.return_value = PlacementScore(total=55, slot="ledger")
 
         article = dict(enriched)
@@ -110,6 +120,11 @@ class TestIjPipelineOrder(unittest.TestCase):
         self.assertIsNotNone(result)
         mock_research.assert_called_once()
         mock_require_image.assert_called_once()
+        self.assertLess(
+            call_order.index("image"),
+            call_order.index("research"),
+            "require_article_image must be called before research",
+        )
         self.assertEqual(article.get("_ij_img_result"), img_result)
         self.assertEqual(result.assigned_site, "IJ")
 
