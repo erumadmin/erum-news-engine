@@ -1,0 +1,18 @@
+name: IJ Editorial Review (news-engine-test)
+on:
+  workflow_dispatch:
+  push:
+    branches: [news-engine-test]
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements.txt
+      - run: python -m pytest tests/ -v --ignore=tests/fixtures -q
+      - env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          FIXTURE_URL: https://www.korea.kr/news/policyNewsView.do?newsId=148965108&call_from=rsslink
+        run: python scripts/run_ij_full_pipeline.py --mode dry-run
