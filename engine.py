@@ -142,6 +142,8 @@ DAILY_PUBLISH_LIMIT = 50
 PER_RUN_LIMIT = 15  # 1회 실행당 최대 발행 수
 RETRY_DAYS = int(os.environ.get('RETRY_DAYS', '0'))  # 0=당일만, N=N일 전까지 재시도
 REVIEW_ONLY = os.environ.get("REVIEW_ONLY", "0") == "1"
+EDITORIAL_IMAGE_PROBE = os.environ.get("EDITORIAL_IMAGE_PROBE", "0") == "1"
+EDITORIAL_IMAGE_PROBE_DOWNLOAD = os.environ.get("EDITORIAL_IMAGE_PROBE_DOWNLOAD", "0") == "1"
 HIDDEN_PUBLISH_TEST = os.environ.get("HIDDEN_PUBLISH_TEST", "0") == "1"
 PUBLISH_STATUS = (os.environ.get("PUBLISH_STATUS", "PUBLISHED").strip() or "PUBLISHED").upper()
 if PUBLISH_STATUS not in {"PUBLISHED", "DRAFT"}:
@@ -940,6 +942,23 @@ def should_retry_rewrite_validation(message: str) -> bool:
             "한계·조건 서술 부족",
             "IJ 4문단",
             "중첩 p 태그",
+            "배경·문제",
+            "작동 방식",
+            "너무 짧음",
+            "원문 핵심 누락",
+            "1문단 리드",
+            "coalition_takeaways",
+            "briefing_not_ready",
+            "2문단 배경",
+            "4문단 한계",
+            "한계·유의 부족",
+            "경어체",
+            "말줄임표",
+            "discovered_fact",
+            "미완성 문단",
+            "절차 안내",
+            "보도 인용",
+            "원문 확인",
         )
     )
 
@@ -1143,6 +1162,17 @@ def clean_body_html(text):
     if not text: return ""
     text = text.replace("본문:", "").replace("본문 :", "").replace("내용:", "").replace("내용 :", "")
     text = text.replace("Body:", "").replace("Body :", "").replace("Title:", "").replace("제목:", "")
+    for label in (
+        "리드문:", "배경:", "과제:", "전망:", "솔루션:", "문제:", "해결책:", "임팩트:", "해석:",
+        "리드문 :", "배경 :", "과제 :", "전망 :",
+    ):
+        text = text.replace(label, "")
+    text = re.sub(
+        r"<p>\s*(배경|과제|전망|솔루션|문제|해결책|임팩트|해석)\s*:?\s*</p>",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
     text = re.sub(r'^(본문|Body|내용)[:\s-]*', '', text, flags=re.IGNORECASE).strip()
     text = limit_rewritten_body_text(text)
     text = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', text)
@@ -2310,9 +2340,33 @@ def process_article(
     best_cap = None
     best_img = ""
     review_record["image_status"] = "skipped:review_mode" if review_mode else "pending"
+    review_record["image_probe"] = None
+    review_record["layout_type"] = None
+    review_record["publish_preflight"] = None
 
-    if review_mode:
+    if review_mode and not EDITORIAL_IMAGE_PROBE:
         print("   🧪 리뷰 전용 모드: 이미지/발행 단계 생략")
+    elif review_mode and EDITORIAL_IMAGE_PROBE:
+        print("   🧪 리뷰 모드 + 이미지 프로브...", end="", flush=True)
+        from engine.pipeline.image_probe import probe_article_images
+        from engine.pipeline.layout_decision import decide_layout_type
+
+        review_record["image_probe"] = probe_article_images(
+            article, download=EDITORIAL_IMAGE_PROBE_DOWNLOAD
+        )
+        review_record["image_status"] = review_record["image_probe"].get("status", "probe")
+        review_record["layout_type"] = decide_layout_type(
+            review_record["image_probe"],
+            placement_slot=getattr(getattr(editorial_ctx, "placement", None), "slot", "ledger")
+            if editorial_ctx
+            else "ledger",
+            publish_grade=getattr(editorial_ctx, "publish_grade", "C") if editorial_ctx else "C",
+        )
+        print(
+            f" {review_record['image_status']}"
+            f" layout={review_record['layout_type']}"
+            f" url={(review_record['image_probe'].get('selected_url') or '')[:60]}"
+        )
     else:
         print(f"   🔎 이미지 탐색 중...", end="", flush=True)
         image_candidates = find_best_image(article)
@@ -2356,6 +2410,29 @@ def process_article(
         try:
             if (
                 editorial_ctx
+                and getattr(editorial_ctx, "skip_rewrite", False)
+                and prefix == "IJ_"
+            ):
+                reason = getattr(editorial_ctx, "skip_rewrite_reason", "research_insufficient")
+                print(f" 스킵(Target: {reason})", flush=True)
+                if review_mode:
+                    review_record["variants"].append({
+                        "prefix": prefix,
+                        "status": "SKIPPED",
+                        "qa_pass": False,
+                        "qa_score": 0,
+                        "qa_fails": [reason],
+                        "fixed_applied": False,
+                        "title": "",
+                        "excerpt": "",
+                        "body": "",
+                        "cat": "",
+                        "tags": [],
+                        "failure": f"target/{reason}",
+                    })
+                continue
+            if (
+                editorial_ctx
                 and editorial_ctx.use_packet_writing
                 and prefix == "IJ_"
                 and IJ_PACKET_PIPELINE
@@ -2367,6 +2444,11 @@ def process_article(
                     editorial_ctx.packet,
                     editorial_ctx.evidence,
                 )
+                from engine.pipeline.packet_writer import build_editorial_quality_retry_suffix
+
+                rewrite_input += build_editorial_quality_retry_suffix(
+                    article.get("editorial_score_gaps")
+                )
                 print(" [원문+리서치]", end="", flush=True)
             else:
                 rewrite_input = build_rewrite_user_message(article)
@@ -2376,6 +2458,8 @@ def process_article(
 
             p = None
             msg = ""
+            best_rewrite_candidate: dict | None = None
+            best_rewrite_body_len = 0
             ij_editorial = (
                 editorial_ctx
                 and editorial_ctx.use_packet_writing
@@ -2394,16 +2478,24 @@ def process_article(
                     stage="rewrite",
                 )
                 p = parse_llm_response(res)
+                if ij_editorial:
+                    from engine.pipeline.rewrite_validate import fix_ij_llm_body_markup
+
+                    p["body"] = fix_ij_llm_body_markup(p.get("body") or "")
+                plain_body_len = len(re.sub(r"<[^>]+>", "", p.get("body") or ""))
+                if plain_body_len > best_rewrite_body_len:
+                    best_rewrite_body_len = plain_body_len
+                    best_rewrite_candidate = dict(p)
                 is_valid, msg = validate_content_quality(p["title"], p["body"])
                 if is_valid and ij_editorial:
                     from engine.pipeline.rewrite_validate import (
-                        flatten_nested_paragraph_tags,
-                        normalize_temporal_in_body,
+                        finalize_ij_editorial_body,
                         validate_ij_editorial_rewrite,
                     )
 
-                    p["body"] = flatten_nested_paragraph_tags(p["body"])
-                    p["body"] = normalize_temporal_in_body(p["body"], article.get("body") or "")
+                    p["body"] = finalize_ij_editorial_body(
+                        p["body"], editorial_ctx.packet, article
+                    )
                     is_valid, msg = validate_ij_editorial_rewrite(
                         p["title"],
                         p["body"],
@@ -2414,16 +2506,24 @@ def process_article(
                     break
                 if (
                     ij_editorial
-                    and "한계·조건" in msg
                     and attempt_idx + 1 >= validation_attempts
+                    and any(
+                        tok in msg
+                        for tok in (
+                            "한계·조건",
+                            "한계·유의",
+                            "4문단",
+                        )
+                    )
                 ):
                     from engine.pipeline.rewrite_validate import (
-                        append_limitation_paragraph_if_needed,
+                        finalize_ij_editorial_body,
                         validate_ij_editorial_rewrite,
                     )
 
-                    p["body"] = append_limitation_paragraph_if_needed(p["body"], editorial_ctx.packet)
-                    p["body"] = normalize_temporal_in_body(p["body"], article.get("body") or "")
+                    p["body"] = finalize_ij_editorial_body(
+                        p["body"], editorial_ctx.packet, article
+                    )
                     is_valid, msg = validate_ij_editorial_rewrite(
                         p["title"],
                         p["body"],
@@ -2432,6 +2532,30 @@ def process_article(
                     )
                 if is_valid:
                     break
+                if (
+                    best_rewrite_candidate
+                    and best_rewrite_body_len >= 120
+                    and plain_body_len < 50
+                ):
+                    p = dict(best_rewrite_candidate)
+                    plain_body_len = best_rewrite_body_len
+                    if ij_editorial:
+                        from engine.pipeline.rewrite_validate import (
+                            finalize_ij_editorial_body,
+                            validate_ij_editorial_rewrite,
+                        )
+
+                        p["body"] = finalize_ij_editorial_body(
+                            p["body"], editorial_ctx.packet, article
+                        )
+                        is_valid, msg = validate_ij_editorial_rewrite(
+                            p["title"],
+                            p["body"],
+                            editorial_ctx.packet,
+                            article,
+                        )
+                        if is_valid:
+                            break
                 if attempt_idx + 1 >= validation_attempts or not should_retry_rewrite_validation(msg):
                     raise PipelineFailure("rewrite", "REWRITE_VALIDATION_FAIL", msg, retryable=False)
                 from engine.pipeline.rewrite_validate import build_rewrite_correction_suffix

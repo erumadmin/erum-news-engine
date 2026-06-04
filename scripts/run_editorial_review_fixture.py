@@ -47,22 +47,19 @@ FIXTURE_JSON = ROOT / "tests/fixtures/research/cached_source.json"
 KST = ZoneInfo("Asia/Seoul")
 
 
-def build_article_from_fixture_url() -> dict:
+def build_article_from_fixture_url(*, url: str | None = None, title: str | None = None) -> dict:
     raw = json.loads(FIXTURE_JSON.read_text(encoding="utf-8"))
+    use_url = (url or raw["url"]).strip()
     return {
-        "url": raw["url"],
-        "url_id": eng.extract_unique_id(raw["url"]),
-        "title": raw["title"],
-        "body": raw.get("body", ""),
+        "url": use_url,
+        "url_id": eng.extract_unique_id(use_url),
+        "title": (title or raw.get("title") or "").strip() or "제목 미상",
+        "body": raw.get("body", "") if not url else "",
         "raw_html": "",
         "image": "",
         "source_published_at": datetime.now(tz=KST),
         "source_type": "policy_briefing",
     }
-
-
-def _plain(html: str) -> str:
-    return re.sub(r"\s+", " ", eng.strip_html_tags(html or "")).strip()
 
 
 def write_comparison_report(
@@ -73,65 +70,55 @@ def write_comparison_report(
     ingest_reason: str,
     output_dir: Path,
 ) -> str:
+    from engine.pipeline.editorial_report import (
+        normalize_ij_body_html,
+        write_editorial_quality_bundle,
+    )
+    from engine.pipeline.editorial_scorecard import score_editorial_rewrite
+    from engine.pipeline.rewrite_validate import validate_ij_editorial_rewrite
+
     output_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(tz=KST).strftime("%Y%m%d_%H%M%S")
-    path = output_dir / f"editorial_compare_{ts}.md"
-
     variant = next((v for v in result.get("variants", []) if v.get("prefix") == "IJ_"), {})
-    packet = editorial_ctx.packet if editorial_ctx else {}
-    evidence = editorial_ctx.evidence if editorial_ctx else []
+    if not variant or variant.get("status") != "SUCCESS":
+        path = output_dir / f"editorial_compare_{ts}.md"
+        path.write_text(
+            f"# 비교 리포트 (IJ 미생성)\n\n- URL: {article.get('url')}\n",
+            encoding="utf-8",
+        )
+        return str(path)
 
-    lines = [
-        "# 원문 vs 패킷 기반 IJ 기사 비교",
-        "",
-        f"- 생성(KST): {datetime.now(tz=KST).strftime('%Y-%m-%d %H:%M:%S')}",
-        f"- URL: {article.get('url')}",
-        f"- 원문수집: {ingest_reason} | ingest_source: {article.get('ingest_source', '?')}",
-        f"- 본문 길이: {len(article.get('body') or '')}자",
-        f"- 라우팅: {getattr(editorial_ctx, 'assigned_site', '?')} | "
-        f"publish_grade: {getattr(editorial_ctx, 'publish_grade', '?')} | "
-        f"배치: {editorial_ctx.placement.slot if editorial_ctx else '?'} "
-        f"({editorial_ctx.placement.total if editorial_ctx else 0}점)",
-        f"- 공식 증거(발췌 80자+): {packet.get('official_evidence_count', 0)}건",
-        "",
-        "## 수집된 증거 (fetch ok, 발췌)",
-        "",
-    ]
-    ok_ev = [e for e in evidence if e.get("fetch_status") == "ok"]
-    for e in ok_ev[:8]:
-        ex = (e.get("body_excerpt") or "")[:200]
-        lines.append(f"- [{e.get('evidence_type')}] {e.get('title') or e.get('url')}")
-        lines.append(f"  - 발췌({len(ex)}자): {ex or '(없음)'}")
-    if not ok_ev:
-        lines.append("- (없음)")
-
-    lines.extend(
-        [
-            "",
-            "## 원문 (전문)",
-            "",
-            f"**제목:** {article.get('title')}",
-            "",
-            (article.get("body") or "")[:6000],
-            "",
-            "## 리서치 패킷",
-            "",
-            f"- main_claim: {packet.get('main_claim', '')}",
-            f"- key_facts: {packet.get('key_facts', [])}",
-            f"- risk_flags: {packet.get('risk_flags', [])}",
-            "",
-            "## IJ 재작성",
-            "",
-            f"**제목:** {variant.get('title', '(없음)')}",
-            "",
-            f"**리드문:** {variant.get('excerpt', '')}",
-            "",
-            _plain(variant.get("body", ""))[:3500] or "(없음)",
-            "",
-        ]
+    body_html = normalize_ij_body_html(variant.get("body", ""))
+    ok_val, val_msg = validate_ij_editorial_rewrite(
+        variant.get("title", ""),
+        body_html,
+        editorial_ctx.packet if editorial_ctx else {},
+        article,
     )
-    path.write_text("\n".join(lines), encoding="utf-8")
-    return str(path)
+    score = score_editorial_rewrite(
+        variant.get("title", ""),
+        variant.get("excerpt", ""),
+        body_html,
+        article,
+        editorial_ctx.packet if editorial_ctx else {},
+        qa_score=variant.get("qa_score"),
+        evidence=editorial_ctx.evidence if editorial_ctx else None,
+    )
+    score["validation_ok"] = ok_val
+    score["validation_msg"] = val_msg
+    score["passes"] = bool(score["passes"] and ok_val)
+
+    paths = write_editorial_quality_bundle(
+        output_dir,
+        ts=ts,
+        article=article,
+        editorial_ctx=editorial_ctx,
+        variant={**variant, "body": body_html},
+        score=score,
+        ingest_reason=ingest_reason,
+        attempt=1,
+    )
+    return paths["compare"]
 
 
 def main() -> int:
@@ -141,6 +128,12 @@ def main() -> int:
         action="store_true",
         help="live 원문 fetch 필수, 합성 HTML 미사용",
     )
+    parser.add_argument(
+        "--url",
+        metavar="URL",
+        help="기본 cached_source.json 대신 이 URL로 live fetch (제목은 페이지에서 추출)",
+    )
+    parser.add_argument("--title", metavar="TITLE", help="--url 사용 시 RSS 제목 힌트(선택)")
     args = parser.parse_args()
 
     if args.purpose:
@@ -150,7 +143,7 @@ def main() -> int:
         print("UPSTAGE_API_KEY 또는 GEMINI_API_KEY 필요 (~/.env.erum_infra)")
         return 1
 
-    article = build_article_from_fixture_url()
+    article = build_article_from_fixture_url(url=args.url, title=args.title)
     print(f"📰 대상: {article['title'][:70]}")
     print(f"   URL: {article['url']}")
 

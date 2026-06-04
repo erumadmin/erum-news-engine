@@ -134,6 +134,8 @@ class ResearchPacket:
     placement_hint: str
     evidence_count: int
     official_evidence_count: int
+    reader_utility: dict[str, Any] = field(default_factory=dict)
+    research_meta: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -622,6 +624,14 @@ def build_research_packet(
     if "thin_source_body" in risk_flags and publish_grade in ("A", "B"):
         publish_grade = "C"
 
+    from engine.pipeline.reader_utility import build_reader_utility
+
+    reader_utility = build_reader_utility(raw_source, evidence_items)
+    research_meta = {
+        "packet_version": 2,
+        "ingest_source": (raw_source.get("ingest_source") or "").strip(),
+    }
+
     placement_hint = "ledger"
     if publish_grade == "A":
         placement_hint = "secondary_lead"
@@ -645,6 +655,8 @@ def build_research_packet(
         placement_hint=placement_hint,
         evidence_count=len([e for e in evidence_items if e.fetch_status == "ok"]),
         official_evidence_count=substantive_official_count,
+        reader_utility=reader_utility,
+        research_meta=research_meta,
     )
 
 
@@ -707,6 +719,12 @@ def run_research_pipeline(
                 )
             packet = build_research_packet(raw_source, evidence_items, assigned_site=assigned_site)
             evidence_dicts = [asdict(e) for e in evidence_items]
+    packet_dict = packet.to_dict()
+    if assigned_site == "IJ":
+        from engine.pipeline.target_engine import enrich_packet_target, is_target_engine_enabled
+
+        if is_target_engine_enabled():
+            packet_dict = enrich_packet_target(raw_source, packet_dict, evidence_dicts)
     return {
         "plan": {
             "assigned_site": plan.assigned_site,
@@ -716,6 +734,6 @@ def run_research_pipeline(
             "notes": plan.notes,
         },
         "evidence": evidence_dicts,
-        "packet": packet.to_dict(),
+        "packet": packet_dict,
         "readiness": assess_research_readiness(packet),
     }

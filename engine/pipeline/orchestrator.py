@@ -66,8 +66,9 @@ def run_pre_publish_pipeline(
     if not ok:
         print(f"   🚫 [원문수집] 실패 — 파이프라인 중단 ({ingest_reason})")
         return None
+    enriched_copy = dict(enriched)
     article.clear()
-    article.update(enriched)
+    article.update(enriched_copy)
 
     raw = enrich_raw_source(article)
     route = route_primary(raw)
@@ -111,6 +112,15 @@ def run_pre_publish_pipeline(
     )
 
     use_packet = should_use_ij_editorial_rewrite(assigned)
+    skip_rewrite = False
+    skip_rewrite_reason = ""
+    if assigned == "IJ" and use_packet:
+        from engine.pipeline.target_engine import should_skip_rewrite
+
+        if should_skip_rewrite(packet):
+            skip_rewrite = True
+            skip_rewrite_reason = "research_insufficient"
+            print("   ⏭️ [Target] 조사 부족 — IJ 재작성 스킵 (research_insufficient)")
 
     raw_id: Optional[int] = None
     packet_id: Optional[int] = None
@@ -130,4 +140,6 @@ def run_pre_publish_pipeline(
         use_packet_writing=use_packet,
         raw_source_id=raw_id,
         research_packet_id=packet_id,
+        skip_rewrite=skip_rewrite,
+        skip_rewrite_reason=skip_rewrite_reason,
     )

@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
+import os
 import sys
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+os.environ["IJ_TARGET_ENGINE"] = "0"
 
 from engine.pipeline.rewrite_validate import (
+    DEFAULT_LIMITATION_SENTENCE,
     build_rewrite_correction_suffix,
+    cap_watch_phrase_repetition,
     temporal_hint_from_source,
     validate_ij_editorial_rewrite,
+    validate_limitation_paragraph,
 )
 
 
@@ -29,10 +34,14 @@ class TestRewriteValidate(unittest.TestCase):
 
     def test_url_and_limitation_required(self):
         body = (
-            "<p>변화 내용입니다 충분히 깁니다.</p>"
-            "<p>배경 설명입니다 충분히 깁니다.</p>"
-            "<p>작동 방식입니다 https://online.kepco.co.kr 안내.</p>"
-            "<p>다만 6개월 비교 후 12월 선택 조건이 남습니다.</p>"
+            "<p>정부는 다음 달 1일부터 소규모 자영업자 전기요금 부담 완화 제도를 시행한다. "
+            "일반용(갑)Ⅱ 등 대상이다.</p>"
+            "<p>그동안 시간대별 요금제로 특정 시간대 사용이 몰리면 부담이 커질 수 있다는 우려가 있었다. "
+            "기후부와 한전이 요금 구조 개편을 추진한다.</p>"
+            "<p>한전은 고지서에 시간대별·단일 요금을 각각 표기하고 유리한 요금을 자동 적용한다. "
+            "https://online.kepco.co.kr 에서 확인한다.</p>"
+            "<p>다만 6개월 비교 후 12월부터 선택하며 법적 의무화가 아닌 고지 방식이다. "
+            "적용 범위와 남은 조건은 공식 안내를 확인해야 한다.</p>"
         )
         packet = {
             "risk_flags": ["official_evidence_missing"],
@@ -51,6 +60,33 @@ class TestRewriteValidate(unittest.TestCase):
 
     def test_correction_suffix_nonempty(self):
         self.assertIn("4개", build_rewrite_correction_suffix("문단 수 부족"))
+
+    def test_inject_12월_from_source(self):
+        from engine.pipeline.rewrite_validate import inject_missing_source_anchors
+
+        body = (
+            "<p>다음 달 1일부터 시행한다. 11월분 비교한다.</p>"
+            "<p>그동안 부담 우려가 있었다.</p>"
+            "<p>고지서에 표기한다. https://online.kepco.co.kr</p>"
+            "<p>다만 조건을 확인해야 한다.</p>"
+        )
+        source = "12월부터 선택. 전기위원회. 11월분"
+        out = inject_missing_source_anchors(body, source)
+        self.assertIn("12월", out)
+
+    def test_default_limitation_sentence_valid(self):
+        ok, msg = validate_limitation_paragraph(DEFAULT_LIMITATION_SENTENCE)
+        self.assertTrue(ok, msg)
+
+    def test_cap_watch_phrase_repetition(self):
+        body = (
+            "<p>유리한 요금 유리한 요금 유리한 요금 안내.</p>"
+            "<p>그동안 부담 우려가 있었다.</p>"
+            "<p>고지서 표기와 한전 요금 선택.</p>"
+            "<p>다만 조건은 공식 안내를 확인한다.</p>"
+        )
+        fixed = cap_watch_phrase_repetition(body)
+        self.assertLessEqual(fixed.count("유리한 요금"), 2)
 
 
 if __name__ == "__main__":

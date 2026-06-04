@@ -60,3 +60,5 @@ class EditorialContext:
     use_packet_writing: bool
     raw_source_id: Optional[int] = None
     research_packet_id: Optional[int] = None
+    skip_rewrite: bool = False
+    skip_rewrite_reason: str = ""

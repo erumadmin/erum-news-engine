@@ -154,6 +154,8 @@ class TestResearchPacket(unittest.TestCase):
         packet = rc.build_research_packet(raw, evidence, assigned_site="IJ")
         self.assertIn(packet.publish_grade, ("A", "B"))
         self.assertGreaterEqual(packet.official_evidence_count, 2)
+        self.assertEqual(packet.research_meta.get("packet_version"), 2)
+        self.assertIn("primary_links", packet.reader_utility)
         readiness = rc.assess_research_readiness(packet)
         self.assertTrue(readiness["ready_for_writing"])
 

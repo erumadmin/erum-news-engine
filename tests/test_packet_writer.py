@@ -9,6 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+os.environ["IJ_TARGET_ENGINE"] = "0"
 
 from engine.pipeline.packet_writer import build_rewrite_user_message_from_editorial
 
@@ -48,9 +49,10 @@ class TestEditorialHybridRewrite(unittest.TestCase):
         self.assertIn("[추가 근거]", msg)
         self.assertIn("https://www.price.go.kr/", msg)
         self.assertIn("official_evidence_missing", msg)
+        self.assertIn("[독자 가치", msg)
         self.assertIn("[독자 확인 경로", msg)
         self.assertIn("https://www.price.go.kr/", msg)
-        self.assertIn("4개의 <p>", msg)
+        self.assertTrue("4개의 <p>" in msg or "정확히 4개" in msg)
         self.assertIn("effective_date=2026-06-01", msg)
 
 
