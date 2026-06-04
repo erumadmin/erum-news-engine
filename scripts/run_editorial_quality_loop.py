@@ -291,6 +291,7 @@ def main() -> int:
             image_probe=image_probe,
             score=score,
             review_mode=True,
+            image_required=(getattr(editorial_ctx, "assigned_site", None) == "IJ"),
         )
         last_paths = write_editorial_quality_bundle(
             out_dir,

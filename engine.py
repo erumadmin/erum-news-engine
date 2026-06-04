@@ -1452,6 +1452,24 @@ def write_review_report(records: List[dict]) -> str:
         f.write(_format_review_report(records))
     return path
 
+
+def write_image_skip_report(
+    skipped_articles: List[dict],
+    skipped_count: int,
+) -> str:
+    output_dir = _review_output_dir()
+    os.makedirs(output_dir, exist_ok=True)
+    filename = f"image_skip_report_{now_kst().strftime('%Y%m%d_%H%M%S')}.json"
+    path = os.path.join(output_dir, filename)
+    payload = {
+        "skipped_no_image": skipped_count,
+        "skipped_image_articles": skipped_articles,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    return path
+
 # ========================= [5. 워드프레스 연동] =========================
 
 def _auth_hdr(user, pw):
@@ -2009,9 +2027,20 @@ def process_article(
         best_cap = ij_img["caption"]
         best_img = ij_img["selected_url"]
         review_record["image_status"] = f"ok:{len(img_bytes)//1024}KB"
+        review_record["image_probe"] = {
+            "status": "download_ok",
+            "selected_url": best_img or "",
+            "selected_source": "ij_pipeline",
+            "caption": best_cap,
+            "download_ok": True,
+            "bytes_kb": len(img_bytes) // 1024,
+            "candidates": [],
+            "code": "",
+            "message": "",
+        }
         print(
             f"   ✅ [이미지] 캐시 사용 ({len(img_bytes)//1024}KB, "
-            f"{ij_img['selected_url'][:60]})"
+            f"{(ij_img.get('selected_url') or '')[:60]})"
         )
     elif review_mode and not EDITORIAL_IMAGE_PROBE:
         print("   🧪 리뷰 전용 모드: 이미지/발행 단계 생략")
@@ -2511,6 +2540,7 @@ def run():
         from engine.pipeline.ij_pipeline import run_ij_editorial_stages
 
     skipped_no_image = 0
+    skipped_image_articles: List[dict] = []
 
     for article in articles:
         if published >= remaining:
@@ -2534,9 +2564,16 @@ def run():
             if editorial_ctx is None:
                 if article.get("_skip_image_status"):
                     skipped_no_image += 1
+                    image_code = article.get("_skip_image_status", "")
+                    skipped_image_articles.append({
+                        "source_url": article.get("url", ""),
+                        "source_title": article.get("title", ""),
+                        "image_status": image_code,
+                        "image_code": image_code,
+                    })
                     print(
                         f"   🖼️ 이미지 없음 — 기사 스킵 "
-                        f"({article.get('_skip_image_status')})"
+                        f"({image_code})"
                     )
                 else:
                     print("   ⏭️ 편집 파이프라인 DROP — 다음 기사")
@@ -2662,7 +2699,9 @@ def run():
         report_path = write_review_report(review_records)
         print(f"\n📝 리뷰 리포트 저장: {report_path}")
         if skipped_no_image:
+            skip_path = write_image_skip_report(skipped_image_articles, skipped_no_image)
             print(f"   🖼️ 이미지 없음 스킵: {skipped_no_image}건")
+            print(f"   📝 이미지 스킵 리포트: {skip_path}")
         print("   (발행/DB 기록 없음)")
         return
 
@@ -2689,7 +2728,9 @@ def run():
     print(f"\n--- 실행 완료(KST): {now_kst().strftime('%H:%M:%S')} ---")
     print(f"📊 [작업 요약]")
     if skipped_no_image:
+        skip_path = write_image_skip_report(skipped_image_articles, skipped_no_image)
         print(f"   - 이미지 없음 스킵: {skipped_no_image}건")
+        print(f"   - 이미지 스킵 리포트: {skip_path}")
     for p, c in upload_counts.items():
         print(f"   - {p} 발행 성공: {c}건")
     for prefix, count in upload_counts.items():
