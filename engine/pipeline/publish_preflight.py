@@ -15,6 +15,7 @@ def build_publish_preflight(
     image_probe: dict[str, Any] | None,
     score: dict[str, Any],
     review_mode: bool = True,
+    image_required: bool = False,
 ) -> dict[str, Any]:
     placement = getattr(editorial_ctx, "placement", None) if editorial_ctx else None
     slot = getattr(placement, "slot", "ledger") if placement else "ledger"
@@ -38,6 +39,8 @@ def build_publish_preflight(
         blocked.append("HERO_IMAGE_MISSING")
     if img_status in ("error", "no_candidates", "download_failed") and layout in ("hero", "card"):
         blocked.append("IMAGE_WEAK_FOR_SLOT")
+    if image_required and img_status != "download_ok":
+        blocked.append("IMAGE_REQUIRED")
 
     live_blocked = list(blocked)
     if review_mode:

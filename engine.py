@@ -2001,7 +2001,19 @@ def process_article(
     review_record["layout_type"] = None
     review_record["publish_preflight"] = None
 
-    if review_mode and not EDITORIAL_IMAGE_PROBE:
+    ij_img = article.get("_ij_img_result") if getattr(editorial_ctx, "assigned_site", None) == "IJ" else None
+    if ij_img:
+        img_bytes = ij_img["img_bytes"]
+        img_content_type = ij_img["content_type"] or "image/jpeg"
+        fn = ij_img["filename"] or "img.jpg"
+        best_cap = ij_img["caption"]
+        best_img = ij_img["selected_url"]
+        review_record["image_status"] = f"ok:{len(img_bytes)//1024}KB"
+        print(
+            f"   ✅ [이미지] 캐시 사용 ({len(img_bytes)//1024}KB, "
+            f"{ij_img['selected_url'][:60]})"
+        )
+    elif review_mode and not EDITORIAL_IMAGE_PROBE:
         print("   🧪 리뷰 전용 모드: 이미지/발행 단계 생략")
     elif review_mode and EDITORIAL_IMAGE_PROBE:
         print("   🧪 리뷰 모드 + 이미지 프로브...", end="", flush=True)
@@ -2496,7 +2508,9 @@ def run():
     hidden_publish_results: List[dict] = []
     editorial_hooks = _editorial_db_hooks() if EDITORIAL_PIPELINE and EDITORIAL_PERSIST else None
     if EDITORIAL_PIPELINE:
-        from engine.pipeline.orchestrator import run_pre_publish_pipeline
+        from engine.pipeline.ij_pipeline import run_ij_editorial_stages
+
+    skipped_no_image = 0
 
     for article in articles:
         if published >= remaining:
@@ -2506,7 +2520,7 @@ def run():
             try:
                 # 리뷰 모드도 TARGET 직접 로드·purpose 테스트는 전문 fetch 필요
                 fetcher = fetch_with_retry
-                editorial_ctx = run_pre_publish_pipeline(
+                editorial_ctx = run_ij_editorial_stages(
                     article,
                     fetcher=fetcher,
                     persist=bool(editorial_hooks),
@@ -2518,7 +2532,14 @@ def run():
                     raise
                 editorial_ctx = None
             if editorial_ctx is None:
-                print("   ⏭️ 편집 파이프라인 DROP — 다음 기사")
+                if article.get("_skip_image_status"):
+                    skipped_no_image += 1
+                    print(
+                        f"   🖼️ 이미지 없음 — 기사 스킵 "
+                        f"({article.get('_skip_image_status')})"
+                    )
+                else:
+                    print("   ⏭️ 편집 파이프라인 DROP — 다음 기사")
                 continue
         try:
             result = process_article(
@@ -2640,6 +2661,8 @@ def run():
     if REVIEW_ONLY:
         report_path = write_review_report(review_records)
         print(f"\n📝 리뷰 리포트 저장: {report_path}")
+        if skipped_no_image:
+            print(f"   🖼️ 이미지 없음 스킵: {skipped_no_image}건")
         print("   (발행/DB 기록 없음)")
         return
 
@@ -2665,6 +2688,8 @@ def run():
 
     print(f"\n--- 실행 완료(KST): {now_kst().strftime('%H:%M:%S')} ---")
     print(f"📊 [작업 요약]")
+    if skipped_no_image:
+        print(f"   - 이미지 없음 스킵: {skipped_no_image}건")
     for p, c in upload_counts.items():
         print(f"   - {p} 발행 성공: {c}건")
     for prefix, count in upload_counts.items():

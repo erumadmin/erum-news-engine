@@ -39,6 +39,23 @@ class TestPublishPreflight(unittest.TestCase):
         self.assertFalse(pf["would_publish_api"])
         self.assertIn("TEXT_GATE", pf["blocked_reasons"])
 
+    def test_image_required_blocks_when_not_download_ok(self):
+        ctx = SimpleNamespace(placement=SimpleNamespace(slot="ledger"), publish_grade="B", assigned_site="IJ")
+        score = {"passes": True, "article_publish_ready": True}
+        variant = {"status": "SUCCESS", "title": "t", "body": "<p>x</p>"}
+        probe = {"status": "no_candidates", "selected_url": ""}
+        pf = build_publish_preflight(
+            variant=variant,
+            article={},
+            editorial_ctx=ctx,
+            image_probe=probe,
+            score=score,
+            review_mode=True,
+            image_required=True,
+        )
+        self.assertIn("IMAGE_REQUIRED", pf["blocked_reasons"])
+        self.assertFalse(pf["would_publish_api"])
+
 
 if __name__ == "__main__":
     unittest.main()
