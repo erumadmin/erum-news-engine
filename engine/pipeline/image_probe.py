@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from engine.pipeline.article_images import require_article_image
+from engine.pipeline.article_images import (
+    PipelineFailure,
+    download_best_image,
+    find_best_image,
+)
 
 
 def probe_article_images(article: dict[str, Any], *, download: bool = False) -> dict[str, Any]:
-    """Non-blocking wrapper around require_article_image for preflight/review."""
+    """Non-blocking image probe for preflight/review. Uses article_images functions."""
     out: dict[str, Any] = {
         "status": "pending",
         "candidates": [],
@@ -21,17 +25,50 @@ def probe_article_images(article: dict[str, Any], *, download: bool = False) -> 
         "message": "",
     }
     try:
-        result = require_article_image(article, download=download)
-        out["status"] = result["image_status"]
-        out["selected_url"] = result["selected_url"] or ""
-        out["caption"] = result.get("caption")
-        out["download_ok"] = result["image_status"] == "download_ok"
-        if result.get("img_bytes"):
-            out["bytes_kb"] = len(result["img_bytes"]) // 1024
+        candidates = find_best_image(article)
+    except PipelineFailure as failure:
+        out["status"] = "error"
+        out["code"] = failure.code
+        out["message"] = failure.message
+        return out
     except Exception as exc:
-        code = getattr(exc, "code", "IMAGE_PROBE_EXCEPTION")
-        message = getattr(exc, "message", str(exc))[:300]
-        out["status"] = "error" if "FETCH" in code or "EXCEPTION" in code else "download_failed"
-        out["code"] = code
-        out["message"] = message
+        out["status"] = "error"
+        out["code"] = "IMAGE_PROBE_EXCEPTION"
+        out["message"] = str(exc)[:300]
+        return out
+
+    if not candidates:
+        out["status"] = "no_candidates"
+        out["code"] = "NO_USABLE_IMAGE"
+        out["message"] = "이미지 후보 없음"
+        return out
+
+    out["candidates"] = [
+        {"url": c.url, "source": c.source, "score": c.score, "caption": c.caption}
+        for c in candidates[:8]
+    ]
+    best = candidates[0]
+    out["selected_url"] = best.url
+    out["selected_source"] = best.source
+    out["caption"] = best.caption
+    out["status"] = "candidates_ok"
+
+    if not download:
+        return out
+
+    try:
+        img_bytes, _ct, _fn, cap, url = download_best_image(candidates)
+        out["download_ok"] = True
+        out["bytes_kb"] = len(img_bytes) // 1024
+        out["selected_url"] = url or best.url
+        out["caption"] = cap or best.caption
+        out["status"] = "download_ok"
+    except PipelineFailure as failure:
+        out["status"] = "download_failed"
+        out["code"] = failure.code
+        out["message"] = failure.message
+    except Exception as exc:
+        out["status"] = "download_failed"
+        out["code"] = "IMAGE_DOWNLOAD_EXCEPTION"
+        out["message"] = str(exc)[:300]
     return out
