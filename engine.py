@@ -2331,9 +2331,29 @@ def process_article(
                     mid, _ = site.upload_image_bytes(img_bytes, fn, img_content_type, rw["title"], best_cap)
                     if not mid:
                         raise PipelineFailure("publish", "IMAGE_UPLOAD_FAIL", "이미지 업로드 실패", retryable=True)
+                publish_body_html = rw["body"]
+                if prefix == "IJ_" and editorial_ctx and editorial_ctx.use_packet_writing:
+                    from engine.pipeline.publish_body import prepare_ij_publish_body
+
+                    pub = prepare_ij_publish_body(
+                        rw["title"],
+                        rw.get("excerpt", ""),
+                        rw["body"],
+                        editorial_ctx.packet,
+                        article,
+                    )
+                    if not pub["publish_ready"]:
+                        raise PipelineFailure(
+                            "publish",
+                            "PUBLISH_V4_GATE",
+                            f"v4 게이트 미달: {pub['gate'].get('publish_validation', {}).get('message', '')}",
+                            retryable=False,
+                        )
+                    publish_body_html = pub["body_html"]
+                    variant_review["publish_body_html"] = publish_body_html
                 pid = site.create_post(
                     rw["title"],
-                    rw["body"],
+                    publish_body_html,
                     site.get_cat_id(rw["cat"]),
                     site.get_tag_ids(rw["tags"]),
                     mid,

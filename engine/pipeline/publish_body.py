@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html as _html
 from typing import Any
 
 from engine.pipeline.publish_validate import article_publish_ready, publish_sanitize_body
@@ -17,7 +18,9 @@ def render_sources_footer_html(footer: list[dict]) -> str:
         if not url:
             continue
         label = (entry.get("label") or url).strip()
-        items.append(f'<li><a href="{url}">{label}</a></li>')
+        items.append(
+            f'<li><a href="{_html.escape(url)}">{_html.escape(label)}</a></li>'
+        )
     if not items:
         return ""
     return (

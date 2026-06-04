@@ -15,6 +15,18 @@ class TestPublishBody(unittest.TestCase):
         # No links → no empty footer section emitted.
         self.assertEqual(render_sources_footer_html([]).strip(), "")
 
+    def test_render_sources_footer_escapes_html(self):
+        footer = [
+            {
+                "url": 'https://example.com/?a=1&b="x"',
+                "label": '<img onerror="alert(1)">',
+            }
+        ]
+        html = render_sources_footer_html(footer)
+        self.assertNotIn("<img onerror", html)
+        self.assertIn("&lt;img onerror", html)
+        self.assertIn("&amp;b=", html)
+
     def test_footer_appended_and_no_urls_in_paragraphs(self):
         # Behaviour we can assert WITHOUT depending on the gate verdict:
         # exposed URLs get moved out of paragraphs and into the footer block.

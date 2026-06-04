@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """TDD tests for IJ publish-first v4 (ij-news-engine-target-design-v4.md)."""
 
+import importlib.util
 import os
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -440,6 +442,157 @@ class TestPublishV4(unittest.TestCase):
         )
         self.assertIn("article_publish_ready", result)
         self.assertIn("publish_validation", result)
+
+
+def _load_engine_module():
+    name = "erum_news_engine_main"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, ROOT / "engine.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestIjPublishBodyGate(unittest.TestCase):
+    """engine.py publish path: prepare_ij_publish_body + PUBLISH_V4_GATE."""
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("REVIEW_ONLY", "1")
+        os.environ.setdefault("GEMINI_API_KEY", "test-key")
+        cls.eng = _load_engine_module()
+
+    _LLM_RESPONSE = (
+        "제목: 테스트 제목\n"
+        "리드문: 리드 요약\n"
+        "카테고리: 사회\n"
+        "태그: 정책\n"
+        "본문:\n"
+        "<p>문단 하나.</p><p>문단 둘.</p><p>문단 셋.</p><p>문단 넷.</p>"
+    )
+
+    def _editorial_ctx(self):
+        from engine.types import EditorialContext, PlacementScore
+
+        return EditorialContext(
+            assigned_site="IJ",
+            routing_reason="test",
+            publish_grade="B",
+            placement=PlacementScore(total=55, slot="ledger"),
+            packet={"site": "IJ", "publish_grade": "B", "risk_flags": []},
+            evidence=[],
+            use_packet_writing=True,
+        )
+
+    def _article(self):
+        return {
+            "title": "원문 제목",
+            "url": "https://www.korea.kr/article/1",
+            "body": "원문 본문. " * 30,
+            "_ij_img_result": {
+                "img_bytes": b"x" * 12000,
+                "content_type": "image/jpeg",
+                "filename": "hero.jpg",
+                "caption": "cap",
+                "selected_url": "https://cdn.example/hero.jpg",
+            },
+        }
+
+    def test_publish_v4_gate_raises_when_not_ready(self):
+        eng = self.eng
+        mock_site = MagicMock()
+        mock_site.upload_image_bytes.return_value = (123, "url")
+        mock_site.get_cat_id.return_value = 1
+        mock_site.get_tag_ids.return_value = [2]
+
+        with (
+            patch.object(eng, "ask_llm", return_value=self._LLM_RESPONSE),
+            patch.object(eng, "validate_content_quality", return_value=(True, "")),
+            patch.object(eng, "ai_quality_check", return_value=(True, [], 9.0, None)),
+            patch.object(eng, "get_hybrid_meta", return_value=("사회", ["정책"])),
+            patch.object(eng, "upload_to_r2", return_value="https://r2.example/hero.jpg"),
+            patch(
+                "engine.pipeline.rewrite_validate.validate_ij_editorial_rewrite",
+                return_value=(True, ""),
+            ),
+            patch(
+                "engine.pipeline.rewrite_validate.finalize_ij_editorial_body",
+                side_effect=lambda body, *_a, **_k: body,
+            ),
+            patch(
+                "engine.pipeline.publish_body.prepare_ij_publish_body",
+                return_value={
+                    "body_html": "<p>x</p>",
+                    "publish_ready": False,
+                    "gate": {"publish_validation": {"message": "검증 실패"}},
+                    "sources_footer": [],
+                },
+            ),
+            patch.dict(eng.SITES, {"IJ_": mock_site}, clear=False),
+        ):
+            with self.assertRaises(eng.PipelineFailure) as ctx:
+                eng.process_article(
+                    self._article(),
+                    {"IJ_": 0, "NN_": 0, "CB_": 0},
+                    review_mode=False,
+                    editorial_ctx=self._editorial_ctx(),
+                )
+        self.assertEqual(ctx.exception.code, "PUBLISH_V4_GATE")
+        mock_site.create_post.assert_not_called()
+
+    def test_create_post_receives_footer_body_when_gate_passes(self):
+        eng = self.eng
+        assembled = (
+            "<p>문단 하나.</p>"
+            '<section class="ij-sources-footer"><h3>관련 링크</h3>'
+            "<ul><li><a href=\"https://www.korea.kr/x\">정책</a></li></ul></section>"
+        )
+        mock_site = MagicMock()
+        mock_site.upload_image_bytes.return_value = (123, "url")
+        mock_site.get_cat_id.return_value = 1
+        mock_site.get_tag_ids.return_value = [2]
+        mock_site.create_post.return_value = 999
+
+        with (
+            patch.object(eng, "ask_llm", return_value=self._LLM_RESPONSE),
+            patch.object(eng, "validate_content_quality", return_value=(True, "")),
+            patch.object(eng, "ai_quality_check", return_value=(True, [], 9.0, None)),
+            patch.object(eng, "get_hybrid_meta", return_value=("사회", ["정책"])),
+            patch.object(eng, "upload_to_r2", return_value="https://r2.example/hero.jpg"),
+            patch(
+                "engine.pipeline.rewrite_validate.validate_ij_editorial_rewrite",
+                return_value=(True, ""),
+            ),
+            patch(
+                "engine.pipeline.rewrite_validate.finalize_ij_editorial_body",
+                side_effect=lambda body, *_a, **_k: body,
+            ),
+            patch(
+                "engine.pipeline.publish_body.prepare_ij_publish_body",
+                return_value={
+                    "body_html": assembled,
+                    "publish_ready": True,
+                    "gate": {"publish_validation": {"message": ""}},
+                    "sources_footer": [
+                        {"url": "https://www.korea.kr/x", "label": "정책"}
+                    ],
+                },
+            ),
+            patch.dict(eng.SITES, {"IJ_": mock_site}, clear=False),
+        ):
+            result = eng.process_article(
+                self._article(),
+                {"IJ_": 0, "NN_": 0, "CB_": 0},
+                review_mode=False,
+                editorial_ctx=self._editorial_ctx(),
+            )
+
+        self.assertIn("IJ", result["success_media"])
+        mock_site.create_post.assert_called_once()
+        self.assertEqual(mock_site.create_post.call_args[0][1], assembled)
+        self.assertIn("관련 링크", mock_site.create_post.call_args[0][1])
 
 
 if __name__ == "__main__":
