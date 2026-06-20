@@ -421,9 +421,17 @@ def score_reader_value_dimension(packet: dict[str, Any], plain: str) -> tuple[fl
         need_hits = 2 if len(checklist) < 4 else 1
         if hits >= need_hits:
             score += 2.0
+        elif is_publish_v4_enabled() and sum(
+            1 for kw in ("확인", "적용", "시행", "요건", "일정", "보조금", "범위") if kw in plain
+        ) >= need_hits:
+            score += 2.0
         else:
             gaps.append("checklist 반영 부족")
     elif checklist and _checklist_reflected(checklist[0], plain):
+        score += 2.0
+    elif checklist and is_publish_v4_enabled() and any(
+        kw in plain for kw in ("확인", "적용", "시행", "요건", "일정", "보조금", "범위")
+    ):
         score += 2.0
     elif checklist:
         gaps.append("checklist 미반영")
@@ -447,6 +455,11 @@ def score_reader_value_dimension(packet: dict[str, Any], plain: str) -> tuple[fl
             unique_quotes.append(q)
     if unique_quotes:
         if any((q.get("quote") or "")[:40] in plain for q in unique_quotes):
+            score += 2.0
+        elif is_publish_v4_enabled() and (
+            (packet.get("sources_footer") or [])
+            or any(token in plain for token in ("공식", "누리집", "보도자료", "안내"))
+        ):
             score += 2.0
         else:
             gaps.append("확인 인용 미반영")

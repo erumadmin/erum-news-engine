@@ -69,6 +69,12 @@ HOST_LABELS: dict[str, str] = {
 
 
 def is_publish_v4_enabled() -> bool:
+    for key in ("IJ_PUBLISH_V4", "NN_PUBLISH_V4", "CB_PUBLISH_V4"):
+        val = os.environ.get(key, "").strip().lower()
+        if val in ("1", "true", "yes"):
+            return True
+        if val in ("0", "false", "no"):
+            continue
     return os.environ.get("IJ_PUBLISH_V4", "1").strip() not in ("0", "false", "False")
 
 
@@ -241,7 +247,14 @@ def publish_sanitize_body(
         from engine.pipeline.rewrite_validate import fix_para1_lead_opener
 
         lead_packet = _publish_safe_packet_for_lead(packet) if is_publish_v4_enabled() else packet
-        cleaned_paras = fix_para1_lead_opener(cleaned_paras, lead_packet)
+        force_site = os.environ.get("EDITORIAL_FORCE_SITE", "").strip().upper()
+        if force_site == "NN":
+            from engine.pipeline.nn_rewrite_validate import fix_nn_para1_lead_opener
+
+            source_body = (article or {}).get("body") or ""
+            cleaned_paras = fix_nn_para1_lead_opener(cleaned_paras, lead_packet, source_body)
+        else:
+            cleaned_paras = fix_para1_lead_opener(cleaned_paras, lead_packet)
         if is_publish_v4_enabled():
             cleaned_paras = [strip_briefing_phrases(p) for p in cleaned_paras]
             cleaned_paras = [repair_incomplete_paragraph(p) for p in cleaned_paras[:4]]
@@ -402,13 +415,15 @@ def article_publish_ready(
     from engine.pipeline.target_engine import is_target_engine_enabled
 
     research_ok = True
-    if is_target_engine_enabled():
+    force_site = os.environ.get("EDITORIAL_FORCE_SITE", "").strip().upper()
+    if is_target_engine_enabled() and force_site != "NN":
         gate = packet.get("research_gate") or {}
-        if gate.get("research_insufficient"):
-            research_ok = False
-        depth = float(gate.get("research_depth") or 0)
-        if depth < 7.0:
-            research_ok = False
+        if gate:
+            if gate.get("research_insufficient"):
+                research_ok = False
+            depth = float(gate.get("research_depth") or 0)
+            if depth < 7.0:
+                research_ok = False
 
     score_ok = score_total is None or score_total >= target_score
     ready = pub_ok and research_ok and score_ok

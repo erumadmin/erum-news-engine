@@ -141,6 +141,9 @@ RETRYABLE_FAILURE_CODES = {
 DAILY_PUBLISH_LIMIT = 50
 PER_RUN_LIMIT = 15  # 1회 실행당 최대 발행 수
 RETRY_DAYS = int(os.environ.get('RETRY_DAYS', '0'))  # 0=당일만, N=N일 전까지 재시도
+RSS_FETCH_TIMEOUT_SECONDS = int(os.environ.get("RSS_FETCH_TIMEOUT_SECONDS", "8"))
+RSS_FETCH_MAX_RETRIES = int(os.environ.get("RSS_FETCH_MAX_RETRIES", "0"))
+POLICY_FEED_SCAN_LIMIT = int(os.environ.get("POLICY_FEED_SCAN_LIMIT", "10"))
 REVIEW_ONLY = os.environ.get("REVIEW_ONLY", "0") == "1"
 EDITORIAL_IMAGE_PROBE = os.environ.get("EDITORIAL_IMAGE_PROBE", "0") == "1"
 EDITORIAL_IMAGE_PROBE_DOWNLOAD = os.environ.get("EDITORIAL_IMAGE_PROBE_DOWNLOAD", "0") == "1"
@@ -156,6 +159,8 @@ EDITORIAL_PIPELINE = os.environ.get("EDITORIAL_PIPELINE", "1") == "1"
 # IJ + 편집 파이프라인: 수집 원문 전문 + 리서치 패킷·근거를 합쳐 재작성 (0이면 원문만)
 # IJ 작성: 원문 전문 + 리서치 패킷 + 근거 (하이브리드 유저 메시지). 0 = GitHub main처럼 원문만.
 IJ_PACKET_PIPELINE = os.environ.get("IJ_PACKET_PIPELINE", "1") != "0"
+NN_PACKET_PIPELINE = os.environ.get("NN_PACKET_PIPELINE", "0") == "1"
+CB_PACKET_PIPELINE = os.environ.get("CB_PACKET_PIPELINE", "0") == "1"
 EDITORIAL_PERSIST = os.environ.get("EDITORIAL_PERSIST", "0") == "1"
 MEDIA_PREFIXES = ["IJ_", "NN_", "CB_"]
 SITE_PREFIX_BY_CODE = {"IJ": "IJ_", "NN": "NN_", "CB": "CB_"}
@@ -1763,7 +1768,11 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, 
         print(f"      📡 [{source_name}] 스캔 중 (목표: {feed_limit}건)...", end="", flush=True)
         count = 0
         try:
-            resp = fetch_with_retry(url, timeout=20)
+            resp = fetch_with_retry(
+                url,
+                max_retries=RSS_FETCH_MAX_RETRIES,
+                timeout=RSS_FETCH_TIMEOUT_SECONDS,
+            )
             if not resp or resp.status_code != 200:
                 print(f" 오류(HTTP {getattr(resp, 'status_code', 'none')})")
                 return 0
@@ -1851,7 +1860,10 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, 
 
     def fetch_policy_feeds(lim):
         got = 0
-        for feed_url in RSS_FEEDS[:-1]:
+        policy_feeds = RSS_FEEDS[:-1]
+        if POLICY_FEED_SCAN_LIMIT > 0:
+            policy_feeds = policy_feeds[:POLICY_FEED_SCAN_LIMIT]
+        for feed_url in policy_feeds:
             feed_name = "정책브리핑-" + feed_url.split('/')[-1].replace('dept_', '').replace('.xml', '')
             found = fetch_feed(feed_url, feed_name, lim - got, is_newswire=False)
             got += found
@@ -1976,8 +1988,9 @@ def process_article(
     review_record["layout_type"] = None
     review_record["publish_preflight"] = None
 
-    ij_img = article.get("_ij_img_result") if getattr(editorial_ctx, "assigned_site", None) == "IJ" else None
-    if ij_img:
+    ij_img = article.get("_article_img_result") or article.get("_ij_img_result")
+    site = getattr(editorial_ctx, "assigned_site", None) if editorial_ctx else None
+    if ij_img and site in ("IJ", "NN"):
         img_bytes = ij_img["img_bytes"]
         img_content_type = ij_img["content_type"] or "image/jpeg"
         fn = ij_img["filename"] or "img.jpg"
@@ -1987,7 +2000,7 @@ def process_article(
         review_record["image_probe"] = {
             "status": "download_ok",
             "selected_url": best_img or "",
-            "selected_source": "ij_pipeline",
+            "selected_source": f"{site.lower()}_pipeline" if site else "editorial_pipeline",
             "caption": best_cap,
             "download_ok": True,
             "bytes_kb": len(img_bytes) // 1024,
@@ -2105,6 +2118,40 @@ def process_article(
                     article.get("editorial_score_gaps")
                 )
                 print(" [원문+리서치]", end="", flush=True)
+            elif (
+                editorial_ctx
+                and editorial_ctx.use_packet_writing
+                and prefix == "NN_"
+                and NN_PACKET_PIPELINE
+            ):
+                from engine.pipeline.nn_packet_writer import (
+                    build_nn_quality_retry_suffix,
+                    build_rewrite_user_message_for_nn,
+                )
+
+                rewrite_input = build_rewrite_user_message_for_nn(
+                    article,
+                    editorial_ctx.packet,
+                    editorial_ctx.evidence,
+                )
+                rewrite_input += build_nn_quality_retry_suffix(
+                    article.get("editorial_score_gaps")
+                )
+                print(" [원문+이웃패킷]", end="", flush=True)
+            elif (
+                editorial_ctx
+                and editorial_ctx.use_packet_writing
+                and prefix == "CB_"
+                and CB_PACKET_PIPELINE
+            ):
+                from engine.pipeline.cb_packet_writer import build_rewrite_user_message_for_cb
+
+                rewrite_input = build_rewrite_user_message_for_cb(
+                    article,
+                    editorial_ctx.packet,
+                    editorial_ctx.evidence,
+                )
+                print(" [원문+CSR패킷]", end="", flush=True)
             else:
                 rewrite_input = build_rewrite_user_message(article)
             rewrite_token_budgets = [UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS]
@@ -2121,7 +2168,29 @@ def process_article(
                 and prefix == "IJ_"
                 and IJ_PACKET_PIPELINE
             )
-            validation_attempts = int(os.environ.get("IJ_REWRITE_VALIDATION_ATTEMPTS", "3"))
+            nn_editorial = (
+                editorial_ctx
+                and editorial_ctx.use_packet_writing
+                and prefix == "NN_"
+                and NN_PACKET_PIPELINE
+            )
+            cb_editorial = (
+                editorial_ctx
+                and editorial_ctx.use_packet_writing
+                and prefix == "CB_"
+                and CB_PACKET_PIPELINE
+            )
+
+            validation_attempts = int(
+                os.environ.get(
+                    "CB_REWRITE_VALIDATION_ATTEMPTS"
+                    if cb_editorial
+                    else "NN_REWRITE_VALIDATION_ATTEMPTS"
+                    if nn_editorial
+                    else "IJ_REWRITE_VALIDATION_ATTEMPTS",
+                    "3",
+                )
+            )
             current_input = rewrite_input
             for attempt_idx in range(validation_attempts):
                 max_tokens = rewrite_token_budgets[min(attempt_idx, len(rewrite_token_budgets) - 1)]
@@ -2133,7 +2202,7 @@ def process_article(
                     stage="rewrite",
                 )
                 p = parse_llm_response(res)
-                if ij_editorial:
+                if ij_editorial or nn_editorial or cb_editorial:
                     from engine.pipeline.rewrite_validate import fix_ij_llm_body_markup
 
                     p["body"] = fix_ij_llm_body_markup(p.get("body") or "")
@@ -2152,6 +2221,36 @@ def process_article(
                         p["body"], editorial_ctx.packet, article
                     )
                     is_valid, msg = validate_ij_editorial_rewrite(
+                        p["title"],
+                        p["body"],
+                        editorial_ctx.packet,
+                        article,
+                    )
+                if is_valid and nn_editorial:
+                    from engine.pipeline.nn_rewrite_validate import (
+                        finalize_nn_editorial_body,
+                        validate_nn_editorial_rewrite,
+                    )
+
+                    p["body"] = finalize_nn_editorial_body(
+                        p["body"], editorial_ctx.packet, article
+                    )
+                    is_valid, msg = validate_nn_editorial_rewrite(
+                        p["title"],
+                        p["body"],
+                        editorial_ctx.packet,
+                        article,
+                    )
+                if is_valid and cb_editorial:
+                    from engine.pipeline.cb_rewrite_validate import (
+                        finalize_cb_editorial_body,
+                        validate_cb_editorial_rewrite,
+                    )
+
+                    p["body"] = finalize_cb_editorial_body(
+                        p["body"], editorial_ctx.packet, article
+                    )
+                    is_valid, msg = validate_cb_editorial_rewrite(
                         p["title"],
                         p["body"],
                         editorial_ctx.packet,
@@ -2188,6 +2287,48 @@ def process_article(
                 if is_valid:
                     break
                 if (
+                    nn_editorial
+                    and attempt_idx + 1 >= validation_attempts
+                    and any(tok in msg for tok in ("4문단", "community_axes", "기관명"))
+                ):
+                    from engine.pipeline.nn_rewrite_validate import (
+                        finalize_nn_editorial_body,
+                        validate_nn_editorial_rewrite,
+                    )
+
+                    p["body"] = finalize_nn_editorial_body(
+                        p["body"], editorial_ctx.packet, article
+                    )
+                    is_valid, msg = validate_nn_editorial_rewrite(
+                        p["title"],
+                        p["body"],
+                        editorial_ctx.packet,
+                        article,
+                    )
+                if is_valid:
+                    break
+                if (
+                    cb_editorial
+                    and attempt_idx + 1 >= validation_attempts
+                    and any(tok in msg for tok in ("4문단", "기업 실무", "확인 절차"))
+                ):
+                    from engine.pipeline.cb_rewrite_validate import (
+                        finalize_cb_editorial_body,
+                        validate_cb_editorial_rewrite,
+                    )
+
+                    p["body"] = finalize_cb_editorial_body(
+                        p["body"], editorial_ctx.packet, article
+                    )
+                    is_valid, msg = validate_cb_editorial_rewrite(
+                        p["title"],
+                        p["body"],
+                        editorial_ctx.packet,
+                        article,
+                    )
+                if is_valid:
+                    break
+                if (
                     best_rewrite_candidate
                     and best_rewrite_body_len >= 120
                     and plain_body_len < 50
@@ -2211,11 +2352,59 @@ def process_article(
                         )
                         if is_valid:
                             break
+                    if nn_editorial:
+                        from engine.pipeline.nn_rewrite_validate import (
+                            finalize_nn_editorial_body,
+                            validate_nn_editorial_rewrite,
+                        )
+
+                        p["body"] = finalize_nn_editorial_body(
+                            p["body"], editorial_ctx.packet, article
+                        )
+                        is_valid, msg = validate_nn_editorial_rewrite(
+                            p["title"],
+                            p["body"],
+                            editorial_ctx.packet,
+                            article,
+                        )
+                        if is_valid:
+                            break
+                    if cb_editorial:
+                        from engine.pipeline.cb_rewrite_validate import (
+                            finalize_cb_editorial_body,
+                            validate_cb_editorial_rewrite,
+                        )
+
+                        p["body"] = finalize_cb_editorial_body(
+                            p["body"], editorial_ctx.packet, article
+                        )
+                        is_valid, msg = validate_cb_editorial_rewrite(
+                            p["title"],
+                            p["body"],
+                            editorial_ctx.packet,
+                            article,
+                        )
+                        if is_valid:
+                            break
                 if attempt_idx + 1 >= validation_attempts or not should_retry_rewrite_validation(msg):
                     raise PipelineFailure("rewrite", "REWRITE_VALIDATION_FAIL", msg, retryable=False)
-                from engine.pipeline.rewrite_validate import build_rewrite_correction_suffix
+                if nn_editorial:
+                    from engine.pipeline.nn_rewrite_validate import build_nn_rewrite_correction_suffix
 
-                current_input = rewrite_input + build_rewrite_correction_suffix(msg)
+                    current_input = rewrite_input + build_nn_rewrite_correction_suffix(msg)
+                elif cb_editorial:
+                    current_input = rewrite_input + (
+                        f"\n\n[수정 요청 - CSR 브리핑] {msg}\n"
+                        "- 반드시 <p> 4개\n"
+                        "- 1문단은 기업·기관 실무 영향\n"
+                        "- 3문단은 적용 범위·일정·확인 절차\n"
+                        "- 4문단은 '다만' + 예외·유예·한계\n"
+                        "- 본문 URL 금지\n"
+                    )
+                else:
+                    from engine.pipeline.rewrite_validate import build_rewrite_correction_suffix
+
+                    current_input = rewrite_input + build_rewrite_correction_suffix(msg)
                 next_tokens = rewrite_token_budgets[min(attempt_idx + 1, len(rewrite_token_budgets) - 1)]
                 print(f" 재시도({msg}, {max_tokens}->{next_tokens} 토큰)...", end="", flush=True)
 
@@ -2304,6 +2493,44 @@ def process_article(
                             "publish",
                             "PUBLISH_V4_GATE",
                             f"v4 게이트 미달: {pub['gate'].get('publish_validation', {}).get('message', '')}",
+                            retryable=False,
+                        )
+                    publish_body_html = pub["body_html"]
+                    variant_review["publish_body_html"] = publish_body_html
+                elif prefix == "NN_" and editorial_ctx and NN_PACKET_PIPELINE:
+                    from engine.pipeline.publish_body import prepare_nn_publish_body
+
+                    pub = prepare_nn_publish_body(
+                        rw["title"],
+                        rw.get("excerpt", ""),
+                        rw["body"],
+                        editorial_ctx.packet,
+                        article,
+                    )
+                    if not pub["publish_ready"]:
+                        raise PipelineFailure(
+                            "publish",
+                            "PUBLISH_V4_GATE",
+                            f"NN v4 게이트 미달: {pub['gate'].get('publish_validation', {}).get('message', '')}",
+                            retryable=False,
+                        )
+                    publish_body_html = pub["body_html"]
+                    variant_review["publish_body_html"] = publish_body_html
+                elif prefix == "CB_" and editorial_ctx and CB_PACKET_PIPELINE:
+                    from engine.pipeline.publish_body import prepare_cb_publish_body
+
+                    pub = prepare_cb_publish_body(
+                        rw["title"],
+                        rw.get("excerpt", ""),
+                        rw["body"],
+                        editorial_ctx.packet,
+                        article,
+                    )
+                    if not pub["publish_ready"]:
+                        raise PipelineFailure(
+                            "publish",
+                            "PUBLISH_V4_GATE",
+                            f"CB v4 게이트 미달: {pub['gate'].get('publish_validation', {}).get('message', '')}",
                             retryable=False,
                         )
                     publish_body_html = pub["body_html"]
@@ -2436,6 +2663,8 @@ def run():
     if EDITORIAL_PIPELINE:
         print(
             f"   📰 편집 파이프라인: ON (1원문=1사이트, IJ패킷={'ON' if IJ_PACKET_PIPELINE else 'OFF'}, "
+            f"NN패킷={'ON' if NN_PACKET_PIPELINE else 'OFF'}, "
+            f"CB패킷={'ON' if CB_PACKET_PIPELINE else 'OFF'}, "
             f"DB영속={'ON' if EDITORIAL_PERSIST else 'OFF'})"
         )
     if TARGET_URL_IDS:
@@ -2514,7 +2743,7 @@ def run():
     hidden_publish_results: List[dict] = []
     editorial_hooks = _editorial_db_hooks() if EDITORIAL_PIPELINE and EDITORIAL_PERSIST else None
     if EDITORIAL_PIPELINE:
-        from engine.pipeline.ij_pipeline import run_ij_editorial_stages
+        from engine.pipeline.editorial_stages import run_editorial_stages
 
     skipped_no_image = 0
     skipped_image_articles: List[dict] = []
@@ -2527,7 +2756,7 @@ def run():
             try:
                 # 리뷰 모드도 TARGET 직접 로드·purpose 테스트는 전문 fetch 필요
                 fetcher = fetch_with_retry
-                editorial_ctx = run_ij_editorial_stages(
+                editorial_ctx = run_editorial_stages(
                     article,
                     fetcher=fetcher,
                     persist=bool(editorial_hooks),

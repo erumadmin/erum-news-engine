@@ -1,7 +1,12 @@
 import unittest
 from unittest.mock import patch
 
-from engine.pipeline.publish_body import prepare_ij_publish_body, render_sources_footer_html
+from engine.pipeline.publish_body import (
+    prepare_cb_publish_body,
+    prepare_ij_publish_body,
+    prepare_nn_publish_body,
+    render_sources_footer_html,
+)
 from engine.pipeline.publish_validate import article_publish_ready, publish_sanitize_body
 
 
@@ -54,6 +59,24 @@ class TestPublishBody(unittest.TestCase):
         gate = article_publish_ready("제목", "리드", sanitized, packet, article={})
         self.assertEqual(out["publish_ready"], gate["article_publish_ready"])
 
+    def test_publish_ready_without_research_gate_does_not_fail_by_default(self):
+        body = (
+            "<p>상장사 ESG 담당자는 2027년부터 공시 기준 변경을 반영해야 한다. 준비 일정 조정이 필요하다.</p>"
+            "<p>기존에는 항목 해석이 제각각이어서 비교 가능성이 낮았다. 비교 가능성을 높이려는 조치다.</p>"
+            "<p>기업은 적용 범위와 제출 시점을 먼저 확인해야 한다. 내부 검증 절차도 점검해야 한다.</p>"
+            "<p>다만 세부 지침은 추가 공지에 따라 바뀔 수 있다. 예외 범위도 함께 확인해야 한다.</p>"
+        )
+        packet = {
+            "reader_utility": {"primary_links": [{"url": "https://example.test/cb", "label": "개정안"}]}
+        }
+        with patch.dict(
+            "os.environ",
+            {"CB_PUBLISH_V4": "1", "CB_TARGET_ENGINE": "1", "EDITORIAL_FORCE_SITE": "CB"},
+            clear=False,
+        ):
+            gate = article_publish_ready("제목 테스트", "리드", body, packet, article={"url": "https://example.test/cb"}, score_total=9.6)
+        self.assertTrue(gate["research_ok"])
+
     @patch("engine.pipeline.publish_body.article_publish_ready")
     def test_publish_ready_false_when_gate_fails(self, mock_ready):
         mock_ready.return_value = {
@@ -68,3 +91,35 @@ class TestPublishBody(unittest.TestCase):
         mock_ready.assert_called_once()
         sanitized, _ = publish_sanitize_body(body, packet, article={})
         self.assertEqual(mock_ready.call_args[0][2], sanitized)
+
+    def test_prepare_nn_publish_body_footer_class(self):
+        body = (
+            "<p>청년 창업자는 국공유재산 사용료가 줄어든다. 적용은 2026년부터다.</p>"
+            "<p>그동안 임대료 부담이 컸다. 소규모 사업자 지원 목적이다.</p>"
+            "<p>신청은 구청 누리집에서 한다. 3월부터 접수한다.</p>"
+            "<p>다만 지역·업종별 조건이 다를 수 있다.</p>"
+        )
+        packet = {
+            "risk_flags": [],
+            "reader_utility": {
+                "primary_links": [{"url": "https://www.korea.kr/x", "label": "정책브리핑"}]
+            },
+        }
+        out = prepare_nn_publish_body("제목", "리드", body, packet, article={"url": "https://korea.kr/x"})
+        self.assertIn("nn-sources-footer", out["body_html"])
+
+    def test_prepare_cb_publish_body_footer_class(self):
+        body = (
+            "<p>상장사 ESG 담당자는 2027년부터 공시 기준 변경을 반영해야 한다.</p>"
+            "<p>기존에는 항목 해석이 제각각이어서 비교 가능성이 낮았다.</p>"
+            "<p>기업은 적용 범위와 제출 시점을 먼저 확인해야 한다.</p>"
+            "<p>다만 세부 지침은 추가 공지에 따라 바뀔 수 있다.</p>"
+        )
+        packet = {
+            "risk_flags": [],
+            "reader_utility": {
+                "primary_links": [{"url": "https://example.test/cb", "label": "개정안"}]
+            },
+        }
+        out = prepare_cb_publish_body("제목", "리드", body, packet, article={"url": "https://example.test/cb"})
+        self.assertIn("cb-sources-footer", out["body_html"])

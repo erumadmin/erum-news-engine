@@ -84,6 +84,29 @@ class TestMediaPlan(unittest.TestCase):
         self.assertFalse(plan["NN_"]["enabled"])
         self.assertFalse(plan["CB_"]["enabled"])
 
+    def test_force_site_cb_keeps_cb_enabled(self):
+        from engine.pipeline.media_plan import build_media_plan_for_editorial
+        from engine.types import EditorialContext, PlacementScore
+
+        os.environ["EDITORIAL_FORCE_SITE"] = "CB"
+        ctx = EditorialContext(
+            assigned_site="CB",
+            routing_reason="forced",
+            publish_grade="B",
+            placement=PlacementScore(total=55, slot="ledger"),
+            packet={"site": "CB", "publish_grade": "B", "risk_flags": []},
+            evidence=[],
+            use_packet_writing=True,
+        )
+        plan = build_media_plan_for_editorial(
+            ctx,
+            assess_cb_article_fit=lambda _article: ("skip", "weak_signal"),
+            article={"title": "x", "body": "y"},
+        )
+        self.assertTrue(plan["CB_"]["enabled"])
+        self.assertEqual(plan["CB_"]["mode"], "forced")
+        os.environ.pop("EDITORIAL_FORCE_SITE", None)
+
 
 class TestOrchestrator(unittest.TestCase):
     def setUp(self):

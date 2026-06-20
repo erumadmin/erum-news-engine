@@ -21,6 +21,24 @@ def should_use_ij_editorial_rewrite(assigned_site: str) -> bool:
     return assigned_site == "IJ" and os.environ.get("IJ_PACKET_PIPELINE", "1") != "0"
 
 
+def should_use_nn_editorial_rewrite(assigned_site: str) -> bool:
+    """NN + NN_PACKET_PIPELINE=1: 원문 + 패킷 + community_brief 하이브리드 재작성."""
+    return assigned_site == "NN" and os.environ.get("NN_PACKET_PIPELINE", "0") == "1"
+
+
+def should_use_cb_editorial_rewrite(assigned_site: str) -> bool:
+    """CB + CB_PACKET_PIPELINE=1: 원문 + 패킷 + compliance_brief 하이브리드 재작성."""
+    return assigned_site == "CB" and os.environ.get("CB_PACKET_PIPELINE", "0") == "1"
+
+
+def should_use_packet_editorial_rewrite(assigned_site: str) -> bool:
+    return (
+        should_use_ij_editorial_rewrite(assigned_site)
+        or should_use_nn_editorial_rewrite(assigned_site)
+        or should_use_cb_editorial_rewrite(assigned_site)
+    )
+
+
 def source_hash(raw_source: dict[str, Any]) -> str:
     url = (raw_source.get("url") or raw_source.get("source_url") or "").strip()
     title = (raw_source.get("title") or raw_source.get("source_title") or "").strip()
@@ -76,7 +94,10 @@ def run_pre_publish_pipeline(
         print(f"   🚫 [라우팅] DROP ({route.reason}, score={route.score:.1f})")
         return None
 
-    assigned: SiteCode = route.site
+    force_site = os.environ.get("EDITORIAL_FORCE_SITE", "").strip().upper()
+    assigned: SiteCode = force_site if force_site in ("IJ", "NN", "CB") else route.site
+    if force_site in ("IJ", "NN", "CB") and force_site != route.site:
+        print(f"   🧭 [라우팅] FORCE {assigned} (auto={route.site})")
     profile = get_profile(assigned)
     cand = profile.candidate_filter(raw)
     print(
@@ -111,7 +132,16 @@ def run_pre_publish_pipeline(
         f"grade={publish_grade} hints={packet.get('placement_hint')}"
     )
 
-    use_packet = should_use_ij_editorial_rewrite(assigned)
+    if assigned == "NN" and os.environ.get("NN_TARGET_ENGINE", "0") == "1":
+        from engine.pipeline.nn_community_brief import build_community_brief
+
+        packet = {**packet, "community_brief": build_community_brief({**packet, "_raw_source": raw})}
+    if assigned == "CB" and os.environ.get("CB_TARGET_ENGINE", "0") == "1":
+        from engine.pipeline.cb_packet_writer import build_compliance_brief
+
+        packet = {**packet, "compliance_brief": build_compliance_brief(packet)}
+
+    use_packet = should_use_packet_editorial_rewrite(assigned)
     skip_rewrite = False
     skip_rewrite_reason = ""
     if assigned == "IJ" and use_packet:

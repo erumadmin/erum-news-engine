@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 MEDIA_PREFIXES = ("IJ_", "NN_", "CB_")
@@ -28,6 +29,14 @@ def build_media_plan_for_editorial(
         "reason": editorial_ctx.routing_reason,
     }
     if target_prefix == "CB_" and assess_cb_article_fit is not None and article is not None:
+        force_site = os.environ.get("EDITORIAL_FORCE_SITE", "").strip().upper()
+        if force_site == "CB":
+            media_plan["CB_"] = {
+                "enabled": True,
+                "mode": "forced",
+                "reason": "forced_site_cb",
+            }
+            return media_plan
         cb_mode, cb_reason = assess_cb_article_fit(article)
         media_plan["CB_"] = {
             "enabled": cb_mode != "skip",

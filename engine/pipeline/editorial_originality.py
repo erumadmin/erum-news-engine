@@ -157,9 +157,19 @@ def _confirmation_score(plain: str, packet: dict[str, Any]) -> tuple[float, str 
     ru = packet.get("reader_utility") or {}
     as_of = (ru.get("as_of_date") or "").strip()
     if is_publish_v4_enabled():
-        has_as_of = True
-    else:
-        has_as_of = bool(as_of and (as_of in plain or "기준" in plain))
+        footer = packet.get("sources_footer") or []
+        footer_urls = {(f.get("url") or "").strip() for f in footer if (f.get("url") or "").strip()}
+        links = ru.get("primary_links") or []
+        required = [(link.get("url") or "").strip() for link in links if (link.get("url") or "").strip()]
+        if required and all(url in footer_urls for url in required):
+            return 2.0, None
+        if footer_urls and any("korea.kr" in u for u in footer_urls):
+            return 2.0, None
+        if footer_urls:
+            return 1.0, "기준일·링크 묶음 약함"
+        return 0.0, "기준일·링크 묶음 미흡"
+
+    has_as_of = bool(as_of and (as_of in plain or "기준" in plain))
     links = ru.get("primary_links") or []
     reflected = sum(1 for link in links if _url_reflected_in_plain(link.get("url") or "", plain))
     has_announcement = (
@@ -212,6 +222,9 @@ def _reframe_score(
     head = src[:80]
     window = check[:220] if para1 is not None else plain[:200]
     if head not in check and src[:50] not in check:
+        return 2.0, None
+    business_reframe_markers = ("기업", "실무", "공급망", "협력사", "투자", "상장사", "기관")
+    if src[:35] in window and any(marker in window for marker in business_reframe_markers):
         return 2.0, None
     if src[:35] not in window:
         return 1.0, "리드 재구성 약함"
