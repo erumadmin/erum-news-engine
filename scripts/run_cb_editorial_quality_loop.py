@@ -26,11 +26,16 @@ os.environ.setdefault("MIN_IMAGE_WIDTH", "720")
 
 from engine.pipeline.cb_rewrite_validate import validate_cb_editorial_rewrite  # noqa: E402
 from engine.pipeline.cb_scorecard import TARGET_SCORE, score_cb_editorial_rewrite  # noqa: E402
-from engine.pipeline.editorial_report import normalize_ij_body_html  # noqa: E402
+from engine.pipeline.editorial_report import (  # noqa: E402
+    normalize_ij_body_html,
+    write_editorial_quality_bundle,
+)
+from engine.pipeline.publish_body import prepare_cb_publish_body  # noqa: E402
+from engine.pipeline.publish_preflight import build_publish_preflight  # noqa: E402
 
 FIXTURE_URL = os.environ.get(
     "FIXTURE_URL",
-    "https://www.korea.kr/news/policyNewsView.do?newsId=148965573&call_from=rsslink",
+    "https://www.korea.kr/news/policyNewsView.do?newsId=148962669&call_from=rsslink",
 )
 MAX_ATTEMPTS = int(os.environ.get("CB_EDITORIAL_QUALITY_MAX_ATTEMPTS", "12"))
 KST = ZoneInfo("Asia/Seoul")
@@ -157,6 +162,7 @@ def main() -> int:
         print(f"WARN: assigned_site={editorial_ctx.assigned_site} (expected CB)")
 
     upload_counts = {p: 0 for p in eng.MEDIA_PREFIXES}
+    out_dir = Path(eng._review_output_dir())
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         ts = datetime.now(tz=KST).strftime("%Y%m%d_%H%M%S")
@@ -197,11 +203,51 @@ def main() -> int:
             body_html = score["publish_body"]
             variant = {**variant, "body": body_html}
 
+        pub = prepare_cb_publish_body(
+            variant.get("title", ""),
+            variant.get("excerpt", ""),
+            body_html,
+            editorial_ctx.packet,
+            article,
+            score_total=score.get("total"),
+        )
+        body_html = pub["body_html"]
+        variant = {**variant, "body": body_html}
+
+        image_probe = result.get("image_probe")
+        publish_preflight = build_publish_preflight(
+            variant={**variant, "body": body_html, "status": "SUCCESS"},
+            article=article,
+            editorial_ctx=editorial_ctx,
+            image_probe=image_probe,
+            score=score,
+            review_mode=True,
+            image_required=True,
+        )
+        score["publish_preflight"] = publish_preflight
+
+        last_paths = write_editorial_quality_bundle(
+            out_dir,
+            ts=ts,
+            article=article,
+            editorial_ctx=editorial_ctx,
+            variant={**variant, "body": body_html, "prefix": "CB_"},
+            score=score,
+            ingest_reason=article.get("ingest_source", "live"),
+            attempt=attempt,
+            image_probe=image_probe,
+            publish_preflight=publish_preflight,
+            site_code="CB",
+            report_label="CB",
+            body_prefix="editorial_cb_body",
+        )
+
         print(
             f"score={score['total']} pass={score['passes']} "
             f"publish_ready={score.get('article_publish_ready')} "
             f"gaps={score.get('gaps')}"
         )
+        print(f"Artifacts: {last_paths}")
         if ok_val and score.get("passes"):
             print(f"PASS: CB editorial review bundle ready ({ts})")
             return 0
@@ -215,4 +261,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

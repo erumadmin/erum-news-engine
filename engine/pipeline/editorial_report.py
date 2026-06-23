@@ -35,6 +35,9 @@ def write_editorial_quality_bundle(
     attempt: int = 1,
     image_probe: dict[str, Any] | None = None,
     publish_preflight: dict[str, Any] | None = None,
+    site_code: str = "IJ",
+    report_label: str = "IJ",
+    body_prefix: str = "editorial_ij_body",
 ) -> dict[str, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
     body_html = normalize_ij_body_html(variant.get("body", ""))
@@ -88,6 +91,7 @@ def write_editorial_quality_bundle(
             body_html,
             paras,
             score,
+            report_label=report_label,
             ingest_reason=ingest_reason,
             attempt=attempt,
             image_probe=image_probe,
@@ -96,7 +100,7 @@ def write_editorial_quality_bundle(
         encoding="utf-8",
     )
 
-    body_path = output_dir / f"editorial_ij_body_{ts}.html"
+    body_path = output_dir / f"{body_prefix}_{ts}.html"
     body_path.write_text(body_html, encoding="utf-8")
 
     return {
@@ -115,6 +119,7 @@ def _build_compare_markdown(
     paras: list[str],
     score: dict[str, Any],
     *,
+    report_label: str,
     ingest_reason: str,
     attempt: int,
     image_probe: dict[str, Any] | None = None,
@@ -123,7 +128,7 @@ def _build_compare_markdown(
     packet = editorial_ctx.packet if editorial_ctx else {}
     evidence = editorial_ctx.evidence if editorial_ctx else []
     lines = [
-        "# 원문 vs 패킷 기반 IJ 기사 비교 (채점 산출물)",
+        f"# 원문 vs 패킷 기반 {report_label} 기사 비교 (채점 산출물)",
         "",
         f"- 생성(KST): {datetime.now(tz=KST).strftime('%Y-%m-%d %H:%M:%S')}",
         f"- 시도: {attempt}",
@@ -259,7 +264,7 @@ def _build_compare_markdown(
     lines.extend(
         [
             "",
-            "## IJ 재작성 (채점·검증에 사용한 HTML)",
+            f"## {report_label} 재작성 (채점·검증에 사용한 HTML)",
             "",
             f"**제목:** {variant.get('title', '(없음)')}",
             "",
@@ -267,7 +272,7 @@ def _build_compare_markdown(
             "",
             body_html,
             "",
-            "## IJ 본문 (평문 4문단)",
+            f"## {report_label} 본문 (평문 4문단)",
             "",
         ]
     )

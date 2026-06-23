@@ -84,6 +84,28 @@ class TestCBPacketWriter(unittest.TestCase):
         self.assertIn("유턴 인정기준을 완화", brief["business_change"])
         self.assertNotIn("사진은 기사와 관련 없음", " ".join(brief["check_items"] + brief["remaining_limits"]))
 
+    def test_build_compliance_brief_prefers_business_actor_and_operational_lines(self):
+        packet = {
+            "who_is_affected": ["소비자", "기업"],
+            "main_claim": "앞으로 위생용품의 용량·개수 등을 줄일 경우 제품 포장과 판매장소 등에 3개월 이상 먼저 알리고, 변경 정보를 공개한다.",
+            "conditions": [
+                "이번 협약은 원자재 가격 상승과 공급망 불안 등으로 내용량 축소를 통한 사실상의 가격 인상 사례가 늘어나는 상황에서, 소비자 혼란을 줄이고 합리적인 선택을 지원하기 위해 추진됐다.",
+                "또한 위생용품의 단위 사양을 축소하는 경우 해당 상품명과 내용량 축소 사실을 한국소비자원에 제공하고, 자사 또는 판매처 홈페이지에 1개월 이상 게시해야 한다.",
+            ],
+            "action_items": ["참가격 확인: https://www.price.go.kr"],
+            "key_facts": [
+                "앞으로 위생용품의 용량·개수 등을 줄일 경우 제품 포장과 판매장소 등에 3개월 이상 먼저 알리고, 변경 정보를 공개한다.",
+                "협약에 따라 참여 기업은 위생용품의 용량·규격·중량·개수 등을 줄일 경우 해당 사실을 제품 포장, 홈페이지, 판매장소 등을 통해 최소 3개월 이상 소비자에게 알려야 한다.",
+            ],
+        }
+        brief = build_compliance_brief(packet)
+        self.assertEqual(brief["who_affected"], ["기업"])
+        self.assertIn("변경 정보를 공개", brief["business_change"])
+        self.assertTrue(any("한국소비자원에 제공" in item or "1개월 이상 게시" in item for item in brief["check_items"]))
+        self.assertTrue(any("3개월 이상" in item or "1개월 이상" in item for item in brief["remaining_limits"]))
+        self.assertFalse(any("http" in item for item in brief["check_items"]))
+        self.assertFalse(any("협약식 참여" in item for item in brief["check_items"]))
+
 
 class TestCBRewriteValidate(unittest.TestCase):
     def _sample_body(self):
@@ -251,6 +273,87 @@ class TestCBRewriteValidate(unittest.TestCase):
         self.assertTrue(score["sources_footer"])
         self.assertNotIn("확인 인용 미반영", score["gaps"])
         os.environ.pop("CB_PUBLISH_V4", None)
+
+    def test_finalize_v4_skips_inline_confirmation_quote(self):
+        os.environ["CB_PUBLISH_V4"] = "1"
+        article = {
+            "body": "상장사 ESG 담당자는 2027년부터 공시 기준 변경을 반영해야 한다. 적용 범위와 제출 절차는 공식 안내에서 확인할 수 있다.",
+        }
+        packet = {
+            "key_facts": ["2027년부터", "적용 범위", "제출 절차"],
+            "who_is_affected": ["상장사 ESG 담당자"],
+            "main_claim": "2027년부터 공시 기준 변경을 반영해야 한다",
+            "conditions": ["2027년부터", "상장사 적용"],
+            "action_items": ["개정안 확인"],
+            "risk_flags": [],
+            "reader_utility": {
+                "primary_links": [{"url": "https://www.korea.kr/briefing/example", "label": "정부 보도자료"}],
+                "evidence_quotes": [{"quote": "적용 범위와 제출 절차는 공식 안내에서 확인할 수 있다.", "used_for": "source_confirmation"}],
+                "source_confirmation_quotes": [{"quote": "적용 범위와 제출 절차는 공식 안내에서 확인할 수 있다.", "used_for": "source_confirmation"}],
+                "checklist": [{"step": "개정안 확인"}],
+                "scenarios": [],
+            },
+            "compliance_brief": {
+                "who_affected": ["상장사 ESG 담당자"],
+                "business_change": "2027년부터 공시 기준 변경을 반영해야 한다",
+                "check_items": ["개정안 확인", "적용 범위 점검"],
+                "remaining_limits": ["세부 지침 추가 공지 예정"],
+            },
+        }
+        body = (
+            "<p>상장사 ESG 담당자는 2027년부터 공시 기준 변경을 반영해야 한다. 준비 일정 조정이 필요하다.</p>"
+            "<p>기존 공시 항목 해석 차이를 줄이기 위한 조치다. 비교 가능성과 검증 가능성을 높이겠다는 취지다.</p>"
+            "<p>기업은 개정안 확인과 적용 범위 점검을 먼저 진행해야 한다. 제출 절차는 정부 보도자료를 통해 확인할 수 있다.</p>"
+            "<p>다만 세부 지침 추가 공지 예정이어서 예외 범위와 시행 시점을 계속 확인해야 한다.</p>"
+        )
+        fixed = finalize_cb_editorial_body(body, packet, article)
+        self.assertNotIn("공식 보도에 따르면", fixed)
+        os.environ.pop("CB_PUBLISH_V4", None)
+
+    def test_finalize_repairs_cb_prose_defects(self):
+        os.environ["CB_PUBLISH_V4"] = "1"
+        article = {
+            "body": "기업은 위생용품 용량 축소 시 사전 고지와 공개 의무를 따라야 한다. 공정거래위원회는 세부 고지 기준을 안내했다.",
+        }
+        packet = {
+            "key_facts": ["3개월 이상", "1개월 이상 게시", "한국소비자원 제공"],
+            "who_is_affected": ["기업"],
+            "main_claim": "위생용품 용량 축소 시 사전 고지와 공개 의무를 따라야 한다",
+            "conditions": ["3개월 이상 사전 고지", "1개월 이상 게시"],
+            "action_items": ["적용 범위 점검"],
+            "risk_flags": [],
+            "reader_utility": {
+                "primary_links": [{"url": "https://www.korea.kr/briefing/example", "label": "정부 보도자료"}],
+                "checklist": [{"step": "적용 범위 점검"}],
+                "scenarios": [],
+            },
+            "compliance_brief": {
+                "who_affected": ["기업"],
+                "business_change": "위생용품 용량 축소 시 사전 고지와 공개 의무를 따라야 한다",
+                "check_items": ["공정거래위원회는 세부 고지 기준을 안내했다."],
+                "remaining_limits": ["세부 예외 범위는 추가 안내에 따라 달라질 수 있다"],
+            },
+        }
+        body = (
+            "<p>기업은 위생용품 용량 축소 시 사전 고지와 공개 의무를 따라야 한다. "
+            "기업은 위생용품 용량 축소 시 사전 고지와 공개 의무를 따라야 한다.</p>"
+            "<p>이번 조치는 소비자 혼란을 줄이기 위한 협약에 따른 것이다. 고지 기준을 명확히 하려는 취지다.</p>"
+            "<p>기업은 공정거래위원회는 세부 고지 기준을 안내했다을 먼저 확인해야 한다. "
+            "1. 위생용품의 용량·규격·중량·개수 축소 여부를 함께 점검해야 한다.</p>"
+            "<p>다만 세부 예외 범위는 추가 안내에 따라 달라질 수 있다.</p>"
+        )
+        fixed = finalize_cb_editorial_body(body, packet, article)
+        first_para = fixed.split("</p>", 1)[0]
+        self.assertEqual(first_para.count("위생용품 용량 축소 시 사전 고지와 공개 의무를 따라야 한다"), 1)
+        self.assertNotIn("기업은 공정거래위원회는", fixed)
+        self.assertNotIn("1. 위생용품", fixed)
+        ok, msg = validate_cb_editorial_rewrite(
+            "위생용품 용량 축소 시 3개월 전 고지 의무화",
+            fixed,
+            packet,
+            article,
+        )
+        self.assertTrue(ok, msg)
 
 
 if __name__ == "__main__":

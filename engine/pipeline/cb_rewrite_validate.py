@@ -29,6 +29,85 @@ from research_collector import strip_html_tags
 
 CB_LEAD_KEYS = ("기업", "상장사", "기관", "협력사", "공급망", "실무자", "법무", "ESG", "CSR")
 CB_PARA3_KEYS = ("제출", "적용", "범위", "일정", "확인", "점검", "공시", "신고", "기준", "예외")
+CB_AGENCY_KEYS = ("공정거래위원회", "정부", "부처", "위원회", "당국")
+
+
+def _dedupe_repeated_opening_sentence(text: str) -> str:
+    parts = [part.strip() for part in re.split(r"(?<=[.!?])\s+", text or "") if part.strip()]
+    if len(parts) >= 2:
+        first = re.sub(r"\s+", " ", parts[0]).strip()
+        second = re.sub(r"\s+", " ", parts[1]).strip()
+        first = re.sub(r"^(기업|상장사|기관|협력사|실무자)(은|는)\s+", "", first)
+        second = re.sub(r"^(기업|상장사|기관|협력사|실무자)(은|는)\s+", "", second)
+        if first == second:
+            parts.pop(1)
+            return " ".join(parts).strip()
+    collapsed = re.sub(r"\s+", " ", text or "").strip()
+    duplicated_tail = re.match(
+        r"^(?P<tail>.+?다)\s+(?P<subject>(?:(?:기업|상장사|기관|협력사|실무자)(?:은|는)\s+)?)"
+        r"(?P=tail)(?:\s+(?P<rest>.*))?$",
+        collapsed,
+    )
+    if duplicated_tail:
+        subject = duplicated_tail.group("subject").strip()
+        lead = f"{subject} {duplicated_tail.group('tail').strip()}".strip() if subject else duplicated_tail.group("tail").strip()
+        rest = (duplicated_tail.group("rest") or "").strip()
+        return f"{lead}. {rest}".strip() if rest else f"{lead}."
+    tail_repeat = re.match(
+        r"^(?P<tail>.+?다)\s+(?P<subject>(?:기업|상장사|기관|협력사|실무자)(?:은|는))\s+(?P=tail)\.?$",
+        collapsed,
+    )
+    if tail_repeat:
+        return f"{tail_repeat.group('subject')} {tail_repeat.group('tail').strip()}."
+    single_line_repeat = re.match(
+        r"^(?P<a>(?:(?:기업|상장사|기관|협력사|실무자)(?:은|는)\s+)?.+?다)\s+"
+        r"(?P<b>(?:(?:기업|상장사|기관|협력사|실무자)(?:은|는)\s+)?.+?다)\.?$",
+        collapsed,
+    )
+    if single_line_repeat:
+        first = re.sub(r"^(기업|상장사|기관|협력사|실무자)(은|는)\s+", "", single_line_repeat.group("a")).strip()
+        second = re.sub(r"^(기업|상장사|기관|협력사|실무자)(은|는)\s+", "", single_line_repeat.group("b")).strip()
+        if first == second:
+            return f"{single_line_repeat.group('b').strip()}."
+    return collapsed
+
+
+def _strip_inline_number_marker(text: str) -> str:
+    cleaned = re.sub(r"(^|\s)\d+\.\s+(?=[가-힣A-Za-z])", r"\1", text or "")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _repair_invalid_business_anchor(text: str) -> str:
+    malformed = re.compile(
+        r"기업은\s+[^.]{0,140}?(?:"
+        + "|".join(map(re.escape, CB_AGENCY_KEYS))
+        + r")[^.]{0,140}?(?:밝혔|발표했|안내했|설명했|전했)[^.]{0,100}?을 먼저 확인해야 한다\.?",
+    )
+    if malformed.search(text or ""):
+        text = malformed.sub("기업은 관련 공지와 적용 범위를 먼저 확인해야 한다.", text)
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _ensure_cb_lead_min_length(text: str) -> str:
+    if len(text or "") >= MIN_PARAGRAPH_CHARS:
+        return text
+    extra = "적용 범위와 고지 시점을 함께 점검해야 한다."
+    if extra not in (text or ""):
+        return f"{(text or '').rstrip('.')} {extra}".strip()
+    return (text or "").strip()
+
+
+def _polish_cb_paragraphs(paras: list[str]) -> list[str]:
+    polished: list[str] = []
+    for idx, para in enumerate(paras):
+        text = re.sub(r"\s+", " ", (para or "")).strip()
+        if idx == 0:
+            text = _dedupe_repeated_opening_sentence(text)
+            text = _ensure_cb_lead_min_length(text)
+        text = _strip_inline_number_marker(text)
+        text = _repair_invalid_business_anchor(text)
+        polished.append(text)
+    return polished
 
 
 def validate_cb_paragraph_roles(paras: list[str]) -> tuple[bool, str]:
@@ -108,6 +187,8 @@ def repair_cb_lead(paras: list[str], packet: dict[str, Any], source_text: str = 
 def inject_cb_confirmation_quote(paras: list[str], packet: dict[str, Any]) -> list[str]:
     if len(paras) < 3:
         return paras
+    if is_cb_publish_v4_enabled():
+        return paras
     from engine.pipeline.reader_utility import is_irrelevant_evidence_snippet
 
     plain = " ".join(paras)
@@ -182,6 +263,7 @@ def finalize_cb_editorial_body(
         paras = repair_cb_lead(paras, packet, source_text)
         paras = inject_cb_business_anchors(paras, packet)
         paras = inject_cb_confirmation_quote(paras, packet)
+        paras = _polish_cb_paragraphs(paras)
         body = "".join(f"<p>{p}</p>" for p in paras[:4])
     body = sanitize_editorial_body(body, packet)
     body = pad_paragraph_min_length(body)
@@ -190,6 +272,9 @@ def finalize_cb_editorial_body(
         from engine.pipeline.publish_validate import publish_sanitize_body
 
         body, _footer = publish_sanitize_body(body, packet, article)
+        paras = _polish_cb_paragraphs(_paragraph_plain_blocks(body))
+        body = "".join(f"<p>{p}</p>" for p in paras[:4])
+        body = pad_paragraph_min_length(body)
         body = ensure_cb_limitation_paragraph(body, packet)
     return body
 
