@@ -32,6 +32,7 @@ import pymysql
 from bs4 import BeautifulSoup
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+import nh3
 
 def _load_env_file(path: str) -> None:
     try:
@@ -1116,6 +1117,12 @@ def limit_rewritten_body_text(text: str, max_chars: int = SOFT_REWRITTEN_BODY_CH
         return _trim_to_sentence_boundary(text, max_chars)
     return "\n".join(kept_lines).strip()
 
+ALLOWED_TAGS = {"p", "strong", "em", "br", "h3", "h4", "a", "ul", "ol", "li", "img", "blockquote"}
+ALLOWED_ATTRS = {
+    "a": {"href", "title", "rel"},
+    "img": {"src", "alt", "caption"},
+}
+
 def clean_body_html(text):
     if not text: return ""
     text = text.replace("본문:", "").replace("본문 :", "").replace("내용:", "").replace("내용 :", "")
@@ -1135,7 +1142,13 @@ def clean_body_html(text):
             formatted_lines.append(line)
         else:
             formatted_lines.append(f"<p>{line}</p>")
-    return "".join(formatted_lines)
+    sanitized = nh3.clean(
+        "".join(formatted_lines),
+        tags=ALLOWED_TAGS,
+        attributes=ALLOWED_ATTRS,
+        link_rel=None,
+    )
+    return sanitized
 
 def parse_llm_response(text):
     text = _strip_model_fences(text)
