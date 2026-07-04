@@ -86,7 +86,9 @@ ERUM_API_BASE = "https://erum-one.com"
 # 1) ERUM_API_KEY
 # 2) ADMIN_API_KEY
 # 3) 레거시 기본값(임시 호환용)
-ERUM_API_KEY = os.environ.get("ERUM_API_KEY") or os.environ.get("ADMIN_API_KEY") or "eRuM@AdminKey2026!"
+ERUM_API_KEY = os.environ.get("ERUM_API_KEY") or os.environ.get("ADMIN_API_KEY")
+if not ERUM_API_KEY:
+    raise RuntimeError("ERUM_API_KEY 또는 ADMIN_API_KEY 환경변수가 필요합니다.")
 ERUM_CFG = {
     "IJ_": {"site": "IJ", "gsc_site": "sc-domain:impactjournal.kr", "sitemap": "https://impactjournal.kr/sitemap-news.xml"},
     "NN_": {"site": "NN", "gsc_site": "sc-domain:neighbornews.kr", "sitemap": "https://neighbornews.kr/sitemap-news.xml"},
