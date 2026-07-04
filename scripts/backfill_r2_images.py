@@ -41,7 +41,9 @@ def load_env() -> None:
 load_env()
 
 API_BASE = os.environ.get("API_BASE", "https://erum-one.com").rstrip("/")
-API_KEY = os.environ.get("ERUM_API_KEY") or os.environ.get("ADMIN_API_KEY") or "eRuM@AdminKey2026!"
+API_KEY = os.environ.get("ERUM_API_KEY") or os.environ.get("ADMIN_API_KEY")
+if not API_KEY:
+    raise RuntimeError("ERUM_API_KEY 또는 ADMIN_API_KEY 환경변수가 필요합니다.")
 HEADERS = {"x-api-key": API_KEY, "Content-Type": "application/json"}
 
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
