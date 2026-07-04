@@ -85,7 +85,7 @@ ERUM_API_BASE = "https://erum-one.com"
 # 배포 환경 호환:
 # 1) ERUM_API_KEY
 # 2) ADMIN_API_KEY
-# 3) 레거시 기본값(임시 호환용)
+# 둘 중 하나는 반드시 설정되어야 함 (하드코딩 폴백 제거)
 ERUM_API_KEY = os.environ.get("ERUM_API_KEY") or os.environ.get("ADMIN_API_KEY")
 if not ERUM_API_KEY:
     raise RuntimeError("ERUM_API_KEY 또는 ADMIN_API_KEY 환경변수가 필요합니다.")
