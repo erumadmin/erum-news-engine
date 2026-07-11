@@ -118,6 +118,8 @@ UPSTAGE_QA_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_QA_MAX_OUTPUT_TOKENS"
 LLM_PROVIDER = (os.environ.get("LLM_PROVIDER", "upstage").strip().lower() or "upstage")
 REWRITE_PROVIDER = (os.environ.get("REWRITE_PROVIDER", LLM_PROVIDER).strip().lower() or LLM_PROVIDER)
 QA_PROVIDER = (os.environ.get("QA_PROVIDER", LLM_PROVIDER).strip().lower() or LLM_PROVIDER)
+REWRITE_MODEL = os.environ.get("REWRITE_MODEL", "").strip()
+QA_MODEL = os.environ.get("QA_MODEL", "").strip()
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_MODEL_REWRITE = os.environ.get("GEMINI_MODEL_REWRITE", GEMINI_MODEL)
 GEMINI_MODEL_QA = os.environ.get("GEMINI_MODEL_QA", GEMINI_MODEL)
@@ -125,8 +127,8 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_API_BASE = os.environ.get("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
 OPENROUTER_API_URL = os.environ.get("OPENROUTER_API_URL", f"{OPENROUTER_API_BASE.rstrip('/')}/chat/completions")
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "deepseek/deepseek-v4-pro")
-OPENROUTER_MODEL_REWRITE = os.environ.get("OPENROUTER_MODEL_REWRITE", OPENROUTER_MODEL)
-OPENROUTER_MODEL_QA = os.environ.get("OPENROUTER_MODEL_QA", "deepseek/deepseek-v4-flash")
+OPENROUTER_MODEL_REWRITE = os.environ.get("OPENROUTER_MODEL_REWRITE", REWRITE_MODEL or OPENROUTER_MODEL)
+OPENROUTER_MODEL_QA = os.environ.get("OPENROUTER_MODEL_QA", QA_MODEL or "deepseek/deepseek-v4-flash")
 OPENROUTER_REFERER = os.environ.get("OPENROUTER_REFERER", "https://erum-one.com")
 OPENROUTER_TITLE = os.environ.get("OPENROUTER_TITLE", "erum-news-engine")
 REWRITE_SOURCE_MAX_CHARS = int(os.environ.get("REWRITE_SOURCE_MAX_CHARS", "4000"))
@@ -1035,8 +1037,49 @@ def should_retry_rewrite_validation(message: str) -> bool:
             "라벨 잔재 발견",
             "본문 마지막 문자 비정상",
             "문단 수 부족",
+            "원문에 없는 수치",
         )
     )
+
+
+NUMERIC_FACT_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])\d+(?:[,.]\d+)?\s*(?:%|퍼센트|년|월|일|명|개|건|곳|회|원|억원|조원|만|㎞|km|MW|GW|kW|MWh|GWh|시간|분|차|단계)?",
+    flags=re.IGNORECASE,
+)
+
+
+def _numeric_fact_keys(text: str) -> set:
+    keys = set()
+    for match in NUMERIC_FACT_PATTERN.finditer(text or ""):
+        token = re.sub(r"\s+", "", match.group(0)).replace(",", "")
+        number = re.match(r"\d+(?:\.\d+)?", token)
+        if number:
+            keys.add(number.group(0))
+    return keys
+
+
+def validate_source_fidelity(parsed: dict, source_article: dict) -> Tuple[bool, str]:
+    source_published_at = to_kst_iso(source_article.get("source_published_at")) or ""
+    source_text = " ".join(
+        [
+            source_article.get("title", ""),
+            strip_html_tags(source_article.get("body", "")),
+            source_article.get("list_text", ""),
+            source_published_at,
+        ]
+    )
+    rewritten_text = " ".join(
+        [
+            parsed.get("title", ""),
+            parsed.get("excerpt", ""),
+            strip_html_tags(parsed.get("body", "")),
+        ]
+    )
+    source_nums = _numeric_fact_keys(source_text)
+    unsupported_nums = sorted(_numeric_fact_keys(rewritten_text) - source_nums)
+    if unsupported_nums:
+        return False, f"원문에 없는 수치 발견({', '.join(unsupported_nums[:5])})"
+    return True, "OK"
 
 CB_DIRECT_KEYWORDS: Tuple[str, ...] = (
     "과징금", "가산세", "감면", "지원금", "보조금", "수출바우처", "바우처", "수의계약",
@@ -2791,6 +2834,8 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
                 )
                 p = parse_llm_response(res)
                 is_valid, msg = validate_content_quality(p['title'], p['body'])
+                if is_valid:
+                    is_valid, msg = validate_source_fidelity(p, article)
                 if is_valid:
                     break
                 if attempt_idx + 1 >= len(rewrite_token_budgets) or not should_retry_rewrite_validation(msg):
