@@ -463,6 +463,10 @@ def _llm_failure(stage: str, exc: Exception) -> PipelineFailure:
 def _ask_gemini_rest(persona, user_text, model=None, max_output_tokens=None, stage="rewrite"):
     use_model = model if (model and str(model).startswith("gemini")) else (GEMINI_MODEL_QA if stage == "qa" else GEMINI_MODEL_REWRITE)
     output_tokens = max_output_tokens or (UPSTAGE_QA_MAX_OUTPUT_TOKENS if stage == "qa" else UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS)
+    if stage == "rewrite":
+        output_tokens = max(output_tokens, int(os.environ.get("GEMINI_REWRITE_MIN_OUTPUT_TOKENS", "8000")))
+    elif stage == "qa":
+        output_tokens = max(output_tokens, int(os.environ.get("GEMINI_QA_MIN_OUTPUT_TOKENS", "3000")))
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{use_model}:generateContent"
     try:
         response = requests.post(
