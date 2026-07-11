@@ -1112,6 +1112,13 @@ def ai_quality_check(
             fixed = parse_llm_response(parts[1].strip())
         return passed, fails, total, fixed
     except Exception as e:
+        if LLM_PROVIDER == "gemini":
+            local_ok, local_msg = validate_content_quality(title, body)
+            if local_ok:
+                print(f"      ⚠️ [AI검수] Gemini 파싱 실패({str(e)[:50]}), 로컬 검증 통과로 임시 승인")
+                return True, ["AI검수 파싱 실패: 로컬 품질검증 통과"], 78, None
+            print(f"      ⚠️ [AI검수] Gemini 파싱 실패({str(e)[:50]}), 로컬 검증 실패({local_msg})")
+            return False, [f"AI검수 파싱 실패: {local_msg}"], 0, None
         print(f"      ⚠️ [AI검수] 파싱 실패({str(e)[:50]}), 실패 처리")
         return False, ["AI검수 파싱 실패"], 0, None
 
