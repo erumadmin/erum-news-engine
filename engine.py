@@ -115,6 +115,7 @@ UPSTAGE_MODEL_QA = os.environ.get("UPSTAGE_MODEL_QA", UPSTAGE_MODEL)
 UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS", "1500"))
 UPSTAGE_REWRITE_RETRY_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_REWRITE_RETRY_MAX_OUTPUT_TOKENS", "2200"))
 UPSTAGE_QA_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_QA_MAX_OUTPUT_TOKENS", "900"))
+LLM_PROVIDER = (os.environ.get("LLM_PROVIDER", "upstage").strip().lower() or "upstage")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-pro")
 GEMINI_MODEL_REWRITE = os.environ.get("GEMINI_MODEL_REWRITE", GEMINI_MODEL)
 GEMINI_MODEL_QA = os.environ.get("GEMINI_MODEL_QA", GEMINI_MODEL)
@@ -165,8 +166,10 @@ if PUBLISH_STATUS not in {"PUBLISHED", "DRAFT"}:
     raise RuntimeError("PUBLISH_STATUS는 PUBLISHED 또는 DRAFT만 허용됩니다.")
 if HIDDEN_PUBLISH_TEST:
     PUBLISH_STATUS = "DRAFT"
-if not UPSTAGE_API_KEY and not (REVIEW_ONLY and GEMINI_API_KEY):
-    raise RuntimeError("UPSTAGE_API_KEY가 없습니다. 리뷰 전용 모드에서는 GEMINI_API_KEY가 필요합니다.")
+if LLM_PROVIDER == "gemini" and not GEMINI_API_KEY:
+    raise RuntimeError("LLM_PROVIDER=gemini에는 GEMINI_API_KEY가 필요합니다.")
+if not UPSTAGE_API_KEY and not GEMINI_API_KEY:
+    raise RuntimeError("UPSTAGE_API_KEY 또는 GEMINI_API_KEY가 필요합니다.")
 MEDIA_PREFIXES = ["IJ_", "NN_", "CB_"]
 KST = ZoneInfo("Asia/Seoul")
 TARGET_URL_IDS = {
@@ -498,8 +501,10 @@ def _ask_gemini_rest(persona, user_text, model=None, max_output_tokens=None, sta
         raise _llm_failure(stage, e)
 
 def ask_llm(persona, user_text, model=None, max_output_tokens=None, stage="rewrite"):
-    provider = "upstage"
-    if REVIEW_ONLY and not UPSTAGE_API_KEY and GEMINI_API_KEY:
+    provider = LLM_PROVIDER
+    if provider not in {"upstage", "gemini"}:
+        provider = "upstage"
+    if not UPSTAGE_API_KEY and GEMINI_API_KEY:
         provider = "gemini"
     if provider == "gemini":
         return _ask_gemini_rest(persona, user_text, model=model, max_output_tokens=max_output_tokens, stage=stage)
@@ -540,7 +545,11 @@ def ask_llm(persona, user_text, model=None, max_output_tokens=None, stage="rewri
     except PipelineFailure:
         raise
     except Exception as e:
-        raise _llm_failure(stage, e)
+        failure = _llm_failure(stage, e)
+        if GEMINI_API_KEY and failure.code in {f"{stage.upper()}_AUTH_401", f"{stage.upper()}_AUTH_403"}:
+            print(" Gemini fallback...", end="", flush=True)
+            return _ask_gemini_rest(persona, user_text, model=None, max_output_tokens=max_output_tokens, stage=stage)
+        raise failure
 
 # ========================= [3. DB 연동 (Vultr MariaDB)] =========================
 
