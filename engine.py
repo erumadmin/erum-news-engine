@@ -148,7 +148,7 @@ RETRYABLE_FAILURE_CODES = {
 
 DAILY_PUBLISH_LIMIT = 50
 PER_RUN_LIMIT = 15  # 1회 실행당 최대 발행 수
-RETRY_DAYS = int(os.environ.get('RETRY_DAYS', '0'))  # 0=당일만, N=N일 전까지 재시도
+RETRY_DAYS = int(os.environ.get('RETRY_DAYS', '3'))  # 0=당일만, N=N일 전까지 재시도
 REVIEW_ONLY = os.environ.get("REVIEW_ONLY", "0") == "1"
 HIDDEN_PUBLISH_TEST = os.environ.get("HIDDEN_PUBLISH_TEST", "0") == "1"
 KOREA_CRAWLER_ENABLED = os.environ.get("KOREA_CRAWLER_ENABLED", "1") != "0"
