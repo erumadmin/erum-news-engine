@@ -286,14 +286,17 @@ KOREA_POLICY_SOURCES = {
     "press": {
         "name": "정책브리핑-보도자료",
         "url": "https://www.korea.kr/briefing/pressReleaseList.do",
+        "fallback_urls": ["https://m.korea.kr/briefing/pressReleaseList.do"],
     },
     "briefing": {
         "name": "정책브리핑-브리핑자료",
         "url": "https://www.korea.kr/briefing/briefingHomeList.do",
+        "fallback_urls": ["https://m.korea.kr/briefing/briefingHomeList.do"],
     },
     "policy": {
         "name": "정책브리핑-정책뉴스",
         "url": "https://www.korea.kr/news/policyNewsList.do",
+        "fallback_urls": ["https://m.korea.kr/news/policyNewsList.do"],
     },
 }
 
@@ -2176,15 +2179,17 @@ def _is_korea_attachment_notice_body(text: str) -> bool:
 
 
 def _extract_korea_detail_title(soup: BeautifulSoup) -> str:
-    for selector in ("h1", ".view_title", ".tit", "title"):
+    og_title = soup.find("meta", attrs={"property": "og:title"}) or soup.find("meta", attrs={"name": "og:title"})
+    if og_title and og_title.get("content"):
+        title = _clean_korea_title(og_title.get("content", ""))
+        if title and title not in {"홈", "브리핑룸", "뉴스"}:
+            return title
+    for selector in (".view_title", ".tit_view", ".article_head", "h1", ".tit", "title"):
         node = soup.select_one(selector)
         if node:
             title = _clean_korea_title(node.get_text(" ", strip=True))
-            if title:
+            if title and title not in {"홈", "브리핑룸", "뉴스"}:
                 return title
-    og_title = soup.find("meta", attrs={"property": "og:title"}) or soup.find("meta", attrs={"name": "og:title"})
-    if og_title and og_title.get("content"):
-        return _clean_korea_title(og_title.get("content", ""))
     return ""
 
 
@@ -2516,13 +2521,19 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, 
                 for page in range(1, KOREA_CRAWLER_MAX_PAGES + 1):
                     if got >= lim:
                         break
-                    page_url = _korea_page_url(source_cfg["url"], page)
-                    resp = fetch_with_retry(page_url, timeout=KOREA_CRAWLER_TIMEOUT)
+                    resp = None
+                    page_base_url = source_cfg["url"]
+                    for candidate_base_url in [source_cfg["url"]] + source_cfg.get("fallback_urls", []):
+                        page_url = _korea_page_url(candidate_base_url, page)
+                        resp = fetch_with_retry(page_url, timeout=KOREA_CRAWLER_TIMEOUT)
+                        if resp and resp.status_code == 200:
+                            page_base_url = candidate_base_url
+                            break
+                        print(f" 목록 오류({urlparse(candidate_base_url).netloc}: HTTP {getattr(resp, 'status_code', 'none')})", end="")
                     if not resp or resp.status_code != 200:
-                        print(f" 목록 오류(HTTP {getattr(resp, 'status_code', 'none')})", end="")
                         continue
                     resp.encoding = "utf-8"
-                    items = _extract_korea_list_items(resp.text, source_cfg["url"], source_key)
+                    items = _extract_korea_list_items(resp.text, page_base_url, source_key)
                     stats["feed_entries"] += len(items)
                     for item in items:
                         if got >= lim:
