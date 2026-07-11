@@ -2457,15 +2457,17 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, 
         if not source_published_at:
             stats["skipped_missing_date"] += 1
             return False
-        article_date = source_published_at.date()
-        if RETRY_DAYS > 0:
-            if article_date < today - timedelta(days=RETRY_DAYS) or article_date > today:
-                stats["skipped_out_of_range"] += 1
-                return False
-        else:
-            if article_date != today:
-                stats["skipped_out_of_range"] += 1
-                return False
+        force_target = bool(TARGET_URL_IDS and curr_id in TARGET_URL_IDS)
+        if not force_target:
+            article_date = source_published_at.date()
+            if RETRY_DAYS > 0:
+                if article_date < today - timedelta(days=RETRY_DAYS) or article_date > today:
+                    stats["skipped_out_of_range"] += 1
+                    return False
+            else:
+                if article_date != today:
+                    stats["skipped_out_of_range"] += 1
+                    return False
         if is_newswire and not re.search('[가-힣]', title):
             stats["skipped_non_korean_newswire"] += 1
             return False
@@ -2569,7 +2571,8 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, 
                             continue
                         if not item.get("source_published_at"):
                             item["source_published_at"] = _extract_first_date(item.get("list_text", ""))
-                        if item.get("source_published_at"):
+                        force_target = bool(TARGET_URL_IDS and item["url_id"] in TARGET_URL_IDS)
+                        if item.get("source_published_at") and not force_target:
                             article_date = item["source_published_at"].date()
                             if RETRY_DAYS > 0:
                                 if article_date < today - timedelta(days=RETRY_DAYS) or article_date > today:
