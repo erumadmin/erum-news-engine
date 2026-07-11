@@ -116,9 +116,19 @@ UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_REWRITE_MAX_OUTP
 UPSTAGE_REWRITE_RETRY_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_REWRITE_RETRY_MAX_OUTPUT_TOKENS", "2200"))
 UPSTAGE_QA_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_QA_MAX_OUTPUT_TOKENS", "900"))
 LLM_PROVIDER = (os.environ.get("LLM_PROVIDER", "upstage").strip().lower() or "upstage")
+REWRITE_PROVIDER = (os.environ.get("REWRITE_PROVIDER", LLM_PROVIDER).strip().lower() or LLM_PROVIDER)
+QA_PROVIDER = (os.environ.get("QA_PROVIDER", LLM_PROVIDER).strip().lower() or LLM_PROVIDER)
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_MODEL_REWRITE = os.environ.get("GEMINI_MODEL_REWRITE", GEMINI_MODEL)
 GEMINI_MODEL_QA = os.environ.get("GEMINI_MODEL_QA", GEMINI_MODEL)
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_API_BASE = os.environ.get("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
+OPENROUTER_API_URL = os.environ.get("OPENROUTER_API_URL", f"{OPENROUTER_API_BASE.rstrip('/')}/chat/completions")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "deepseek/deepseek-v4-pro")
+OPENROUTER_MODEL_REWRITE = os.environ.get("OPENROUTER_MODEL_REWRITE", OPENROUTER_MODEL)
+OPENROUTER_MODEL_QA = os.environ.get("OPENROUTER_MODEL_QA", "deepseek/deepseek-v4-flash")
+OPENROUTER_REFERER = os.environ.get("OPENROUTER_REFERER", "https://erum-one.com")
+OPENROUTER_TITLE = os.environ.get("OPENROUTER_TITLE", "erum-news-engine")
 REWRITE_SOURCE_MAX_CHARS = int(os.environ.get("REWRITE_SOURCE_MAX_CHARS", "4000"))
 MIN_REWRITTEN_BODY_CHARS = int(os.environ.get("MIN_REWRITTEN_BODY_CHARS", "300"))
 SHORT_FORM_MIN_REWRITTEN_BODY_CHARS = int(os.environ.get("SHORT_FORM_MIN_REWRITTEN_BODY_CHARS", "220"))
@@ -166,10 +176,12 @@ if PUBLISH_STATUS not in {"PUBLISHED", "DRAFT"}:
     raise RuntimeError("PUBLISH_STATUS는 PUBLISHED 또는 DRAFT만 허용됩니다.")
 if HIDDEN_PUBLISH_TEST:
     PUBLISH_STATUS = "DRAFT"
-if LLM_PROVIDER == "gemini" and not GEMINI_API_KEY:
-    raise RuntimeError("LLM_PROVIDER=gemini에는 GEMINI_API_KEY가 필요합니다.")
-if not UPSTAGE_API_KEY and not GEMINI_API_KEY:
-    raise RuntimeError("UPSTAGE_API_KEY 또는 GEMINI_API_KEY가 필요합니다.")
+if (LLM_PROVIDER == "gemini" or REWRITE_PROVIDER == "gemini" or QA_PROVIDER == "gemini") and not GEMINI_API_KEY:
+    raise RuntimeError("Gemini provider 사용에는 GEMINI_API_KEY가 필요합니다.")
+if (LLM_PROVIDER == "openrouter" or REWRITE_PROVIDER == "openrouter" or QA_PROVIDER == "openrouter") and not OPENROUTER_API_KEY:
+    raise RuntimeError("OpenRouter provider 사용에는 OPENROUTER_API_KEY가 필요합니다.")
+if not UPSTAGE_API_KEY and not GEMINI_API_KEY and not OPENROUTER_API_KEY:
+    raise RuntimeError("UPSTAGE_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY 중 하나가 필요합니다.")
 MEDIA_PREFIXES = ["IJ_", "NN_", "CB_"]
 KST = ZoneInfo("Asia/Seoul")
 TARGET_URL_IDS = {
@@ -504,14 +516,64 @@ def _ask_gemini_rest(persona, user_text, model=None, max_output_tokens=None, sta
     except Exception as e:
         raise _llm_failure(stage, e)
 
+
+def _ask_openrouter(persona, user_text, model=None, max_output_tokens=None, stage="rewrite"):
+    use_model = model or (OPENROUTER_MODEL_QA if stage == "qa" else OPENROUTER_MODEL_REWRITE)
+    output_tokens = max_output_tokens or (UPSTAGE_QA_MAX_OUTPUT_TOKENS if stage == "qa" else UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS)
+    payload = {
+        "model": use_model,
+        "messages": [
+            {"role": "system", "content": persona},
+            {"role": "user", "content": user_text},
+        ],
+        "temperature": 0.2,
+        "max_tokens": output_tokens,
+        "stream": False,
+    }
+    if "deepseek-v4" in use_model.lower():
+        payload["reasoning"] = {"enabled": False}
+    try:
+        response = requests.post(
+            OPENROUTER_API_URL,
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": OPENROUTER_REFERER,
+                "X-Title": OPENROUTER_TITLE,
+                "User-Agent": "erum-news-engine/1.0",
+            },
+            json=payload,
+            timeout=180,
+        )
+        response.raise_for_status()
+        data = response.json()
+        choices = data.get("choices") or []
+        if not choices:
+            raise ValueError("OpenRouter 응답에 choices가 없음")
+        message = choices[0].get("message") or {}
+        content = message.get("content", "")
+        if isinstance(content, list):
+            content = "".join(
+                part.get("text", "") if isinstance(part, dict) else str(part)
+                for part in content
+            )
+        return (content or "").strip()
+    except PipelineFailure:
+        raise
+    except Exception as e:
+        raise _llm_failure(stage, e)
+
+
 def ask_llm(persona, user_text, model=None, max_output_tokens=None, stage="rewrite"):
-    provider = LLM_PROVIDER
-    if provider not in {"upstage", "gemini"}:
+    provider = QA_PROVIDER if stage == "qa" else REWRITE_PROVIDER
+    if provider not in {"upstage", "gemini", "openrouter"}:
         provider = "upstage"
-    if not UPSTAGE_API_KEY and GEMINI_API_KEY:
+    if not UPSTAGE_API_KEY and GEMINI_API_KEY and provider == "upstage":
         provider = "gemini"
     if provider == "gemini":
         return _ask_gemini_rest(persona, user_text, model=model, max_output_tokens=max_output_tokens, stage=stage)
+    if provider == "openrouter":
+        return _ask_openrouter(persona, user_text, model=model, max_output_tokens=max_output_tokens, stage=stage)
     use_model = model or (UPSTAGE_MODEL_QA if stage == "qa" else UPSTAGE_MODEL_REWRITE)
     output_tokens = max_output_tokens or (UPSTAGE_QA_MAX_OUTPUT_TOKENS if stage == "qa" else UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS)
     try:
@@ -1094,12 +1156,15 @@ def ai_quality_check(
     media_tone = MEDIA_TONE_DESC.get(media_prefix, "일반 뉴스")
     system_prompt = QA_SYSTEM_PROMPT.format(media_tone=media_tone)
     article_text = build_qa_user_message(source_article, title, excerpt, body)
-    raw = ask_llm(system_prompt, article_text, model=UPSTAGE_MODEL_QA, max_output_tokens=UPSTAGE_QA_MAX_OUTPUT_TOKENS, stage="qa")
+    raw = ask_llm(system_prompt, article_text, max_output_tokens=UPSTAGE_QA_MAX_OUTPUT_TOKENS, stage="qa")
     try:
         parts = raw.split("---", 1)
         json_part = parts[0]
         clean = re.sub(r"```json\s*", "", json_part)
         clean = re.sub(r"```\s*", "", clean).strip()
+        match = re.search(r"\{.*\}", clean, flags=re.DOTALL)
+        if match:
+            clean = match.group(0).strip()
         decoder = json.JSONDecoder()
         result, _ = decoder.raw_decode(clean)
         total = int(result.get("total", 0))
@@ -1112,12 +1177,12 @@ def ai_quality_check(
             fixed = parse_llm_response(parts[1].strip())
         return passed, fails, total, fixed
     except Exception as e:
-        if LLM_PROVIDER == "gemini":
+        if QA_PROVIDER in {"gemini", "openrouter"}:
             local_ok, local_msg = validate_content_quality(title, body)
             if local_ok:
-                print(f"      ⚠️ [AI검수] Gemini 파싱 실패({str(e)[:50]}), 로컬 검증 통과로 임시 승인")
+                print(f"      ⚠️ [AI검수] {QA_PROVIDER} 파싱 실패({str(e)[:50]}), 로컬 검증 통과로 임시 승인")
                 return True, ["AI검수 파싱 실패: 로컬 품질검증 통과"], 78, None
-            print(f"      ⚠️ [AI검수] Gemini 파싱 실패({str(e)[:50]}), 로컬 검증 실패({local_msg})")
+            print(f"      ⚠️ [AI검수] {QA_PROVIDER} 파싱 실패({str(e)[:50]}), 로컬 검증 실패({local_msg})")
             return False, [f"AI검수 파싱 실패: {local_msg}"], 0, None
         print(f"      ⚠️ [AI검수] 파싱 실패({str(e)[:50]}), 실패 처리")
         return False, ["AI검수 파싱 실패"], 0, None
@@ -2721,7 +2786,6 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
                 res = ask_llm(
                     PERSONA_DEFINITIONS[prefix],
                     rewrite_input,
-                    model=UPSTAGE_MODEL_REWRITE,
                     max_output_tokens=max_tokens,
                     stage="rewrite",
                 )
