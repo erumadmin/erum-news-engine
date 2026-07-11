@@ -20,6 +20,10 @@ import os
 import difflib
 import calendar
 import html
+import shutil
+import subprocess
+import tempfile
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta, timezone
 from typing import Dict, List, Optional, Tuple, Any
@@ -140,7 +144,7 @@ RETRYABLE_FAILURE_CODES = {
 
 DAILY_PUBLISH_LIMIT = 50
 PER_RUN_LIMIT = 15  # 1회 실행당 최대 발행 수
-RETRY_DAYS = int(os.environ.get('RETRY_DAYS', '0'))  # 0=당일만, N=N일 전까지 재시도
+RETRY_DAYS = int(os.environ.get('RETRY_DAYS', '3'))  # 0=당일만, N=N일 전까지 재시도
 RSS_FETCH_TIMEOUT_SECONDS = int(os.environ.get("RSS_FETCH_TIMEOUT_SECONDS", "8"))
 RSS_FETCH_MAX_RETRIES = int(os.environ.get("RSS_FETCH_MAX_RETRIES", "0"))
 POLICY_FEED_SCAN_LIMIT = int(os.environ.get("POLICY_FEED_SCAN_LIMIT", "10"))
@@ -148,6 +152,16 @@ REVIEW_ONLY = os.environ.get("REVIEW_ONLY", "0") == "1"
 EDITORIAL_IMAGE_PROBE = os.environ.get("EDITORIAL_IMAGE_PROBE", "0") == "1"
 EDITORIAL_IMAGE_PROBE_DOWNLOAD = os.environ.get("EDITORIAL_IMAGE_PROBE_DOWNLOAD", "0") == "1"
 HIDDEN_PUBLISH_TEST = os.environ.get("HIDDEN_PUBLISH_TEST", "0") == "1"
+KOREA_CRAWLER_ENABLED = os.environ.get("KOREA_CRAWLER_ENABLED", "1") != "0"
+KOREA_CRAWLER_SOURCES = [
+    x.strip().lower()
+    for x in os.environ.get("KOREA_CRAWLER_SOURCES", "policy,briefing,press").split(",")
+    if x.strip()
+]
+KOREA_POLICY_NEWS_ENABLED = os.environ.get("KOREA_POLICY_NEWS_ENABLED", "0") == "1"
+KOREA_CRAWLER_MAX_PAGES = max(1, int(os.environ.get("KOREA_CRAWLER_MAX_PAGES", "2")))
+KOREA_ATTACHMENT_PDF_ENABLED = os.environ.get("KOREA_ATTACHMENT_PDF_ENABLED", "1") != "0"
+KOREA_CRAWLER_TIMEOUT = int(os.environ.get("KOREA_CRAWLER_TIMEOUT", "20"))
 PUBLISH_STATUS = (os.environ.get("PUBLISH_STATUS", "PUBLISHED").strip() or "PUBLISHED").upper()
 if PUBLISH_STATUS not in {"PUBLISHED", "DRAFT"}:
     raise RuntimeError("PUBLISH_STATUS는 PUBLISHED 또는 DRAFT만 허용됩니다.")
@@ -256,6 +270,24 @@ RSS_FEEDS = [
     "https://www.korea.kr/rss/dept_moip.xml",
     "https://api.newswire.co.kr/rss/all",
 ]
+
+KOREA_POLICY_SOURCES = {
+    "press": {
+        "name": "정책브리핑-보도자료",
+        "url": "https://www.korea.kr/briefing/pressReleaseList.do",
+        "fallback_urls": ["https://m.korea.kr/briefing/pressReleaseList.do"],
+    },
+    "briefing": {
+        "name": "정책브리핑-브리핑자료",
+        "url": "https://www.korea.kr/briefing/briefingHomeList.do",
+        "fallback_urls": ["https://m.korea.kr/briefing/briefingHomeList.do"],
+    },
+    "policy": {
+        "name": "정책브리핑-정책뉴스",
+        "url": "https://www.korea.kr/news/policyNewsList.do",
+        "fallback_urls": ["https://m.korea.kr/news/policyNewsList.do"],
+    },
+}
 
 IMAGE_MASTER_MAX_WIDTH = int(os.environ.get("IMAGE_MASTER_MAX_WIDTH", "2000"))
 IMAGE_MASTER_WEBP_QUALITY = int(os.environ.get("IMAGE_MASTER_WEBP_QUALITY", "89"))
@@ -1736,8 +1768,270 @@ def classify_attempt_state(failure: PipelineFailure, prior_state: Optional[dict]
 
 # ========================= [8. 메인 파이프라인] =========================
 
+def _clean_korea_title(title: str) -> str:
+    title = re.sub(r"\s+", " ", title or "").strip()
+    title = re.sub(r"\s*-\s*(보도자료|브리핑룸|정책뉴스).*$", "", title).strip()
+    return title
+
+
+def _korea_page_url(base_url: str, page: int) -> str:
+    if page <= 1:
+        return base_url
+    sep = "&" if "?" in base_url else "?"
+    return f"{base_url}{sep}pageIndex={page}"
+
+
+def _extract_korea_list_items(html_text: str, base_url: str, source_key: str) -> List[dict]:
+    soup = BeautifulSoup(html_text, "html.parser")
+    items: List[dict] = []
+    seen: set = set()
+    for a in soup.select('a[href*="View.do?newsId="]'):
+        href = urljoin(base_url, a.get("href", ""))
+        if not href or href in seen:
+            continue
+        if source_key == "press" and "pressReleaseView.do" not in href:
+            continue
+        if source_key == "briefing" and "pressReleaseView.do" in href:
+            continue
+        if source_key == "policy" and "policyNewsView.do" not in href:
+            continue
+
+        container = a
+        for parent in a.parents:
+            if getattr(parent, "name", "") in ("li", "article"):
+                container = parent
+                break
+        raw_text = re.sub(r"\s+", " ", container.get_text(" ", strip=True)).strip()
+        title = _clean_korea_title(a.get_text(" ", strip=True))
+        if not title or len(title) < 5:
+            title = _clean_korea_title(raw_text[:180])
+        published_at = _extract_first_date(raw_text)
+        department = ""
+        spans = []
+        if hasattr(container, "select"):
+            spans = container.select("span, em")
+        for tag in spans:
+            text = re.sub(r"\s+", " ", tag.get_text(" ", strip=True)).strip()
+            if not text or text == title:
+                continue
+            if re.search(r"\d{4}[./-]\d{1,2}[./-]\d{1,2}", text):
+                continue
+            if 2 <= len(text) <= 30 and not any(x in text for x in ("조회", "등록일", "이동")):
+                department = text
+                break
+        items.append({
+            "url": href,
+            "url_id": extract_unique_id(href),
+            "title": title,
+            "list_text": raw_text,
+            "department": department,
+            "source_published_at": published_at,
+        })
+        seen.add(href)
+    return items
+
+
+def _is_korea_attachment_notice_body(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    if not compact:
+        return True
+    return (
+        len(compact) < 180
+        and "보도자료를전재하여제공" in compact
+    )
+
+
+def _extract_korea_detail_title(soup: BeautifulSoup) -> str:
+    og_title = soup.find("meta", attrs={"property": "og:title"}) or soup.find("meta", attrs={"name": "og:title"})
+    if og_title and og_title.get("content"):
+        title = _clean_korea_title(og_title.get("content", ""))
+        if title and title not in {"홈", "브리핑룸", "뉴스"}:
+            return title
+    for selector in (".view_title", ".tit_view", ".article_head", "h1", ".tit", "title"):
+        node = soup.select_one(selector)
+        if node:
+            title = _clean_korea_title(node.get_text(" ", strip=True))
+            if title and title not in {"홈", "브리핑룸", "뉴스"}:
+                return title
+    return ""
+
+
+def _extract_korea_detail_body(soup: BeautifulSoup) -> str:
+    body_node = (
+        soup.select_one(".view_cont")
+        or soup.select_one(".article-content")
+        or soup.select_one("#articleBody")
+        or soup.select_one("article")
+        or soup.select_one(".news_view")
+        or soup.select_one(".content")
+    )
+    if not body_node:
+        return ""
+    return body_node.get_text(separator="\n", strip=True)
+
+
+def _extract_korea_attachments(soup: BeautifulSoup, base_url: str) -> List[dict]:
+    attachments: List[dict] = []
+    seen: set = set()
+    for a in soup.select("a[href]"):
+        href = a.get("href", "")
+        text = re.sub(r"\s+", " ", a.get_text(" ", strip=True)).strip()
+        href_lower = href.lower()
+        text_lower = text.lower()
+        if "download.do" not in href_lower and not any(ext in href_lower for ext in (".pdf", ".hwpx", ".hwp")):
+            continue
+        kind = ""
+        combined = f"{href_lower} {text_lower}"
+        if ".pdf" in combined or "pdf" in combined:
+            kind = "pdf"
+        elif ".hwpx" in combined or "hwpx" in combined:
+            kind = "hwpx"
+        elif ".hwp" in combined or "hwp" in combined:
+            kind = "hwp"
+        if not kind:
+            continue
+        url = urljoin(base_url, href)
+        key = (url, kind)
+        if key in seen:
+            continue
+        seen.add(key)
+        attachments.append({"url": url, "kind": kind, "label": text})
+    order = {"pdf": 0, "hwpx": 1, "hwp": 2}
+    attachments.sort(key=lambda item: order.get(item["kind"], 9))
+    return attachments
+
+
+def _download_korea_attachment(url: str) -> bytes:
+    resp = fetch_with_retry(url, timeout=KOREA_CRAWLER_TIMEOUT)
+    if not resp or resp.status_code != 200:
+        return b""
+    return resp.content or b""
+
+
+def _extract_pdf_text_from_bytes(pdf_bytes: bytes) -> str:
+    if not pdf_bytes or not KOREA_ATTACHMENT_PDF_ENABLED:
+        return ""
+    pdftotext_bin = shutil.which("pdftotext")
+    if pdftotext_bin:
+        tmp_path = ""
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp.write(pdf_bytes)
+                tmp_path = tmp.name
+            result = subprocess.run(
+                [pdftotext_bin, tmp_path, "-"],
+                check=False,
+                capture_output=True,
+                timeout=20,
+            )
+            if result.returncode == 0 and result.stdout:
+                return result.stdout.decode("utf-8", errors="ignore").strip()
+        except Exception:
+            pass
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+    try:
+        from pypdf import PdfReader
+        import io as _io
+        reader = PdfReader(_io.BytesIO(pdf_bytes))
+        return "\n".join((page.extract_text() or "") for page in reader.pages).strip()
+    except Exception:
+        return ""
+
+
+def _extract_hwpx_text_from_bytes(hwpx_bytes: bytes) -> str:
+    if not hwpx_bytes:
+        return ""
+    try:
+        import io as _io
+        import xml.etree.ElementTree as ET
+        texts: List[str] = []
+        with zipfile.ZipFile(_io.BytesIO(hwpx_bytes)) as zf:
+            names = [name for name in zf.namelist() if name.lower().endswith(".xml")]
+            names.sort(key=lambda name: (0 if "contents/section" in name.lower() else 1, name))
+            for name in names[:40]:
+                raw = zf.read(name)
+                root = ET.fromstring(raw)
+                parts = []
+                for node in root.iter():
+                    tag = str(node.tag).lower()
+                    if (tag == "t" or tag.endswith("}t")) and node.text:
+                        parts.append(node.text.strip())
+                if parts:
+                    texts.append(" ".join(part for part in parts if part))
+        return re.sub(r"\s+", " ", "\n".join(texts)).strip()
+    except Exception:
+        return ""
+
+
+def _extract_korea_attachment_text(attachments: List[dict]) -> Tuple[str, str]:
+    for attachment in attachments:
+        kind = attachment.get("kind", "")
+        if kind == "hwp":
+            continue
+        data = _download_korea_attachment(attachment.get("url", ""))
+        if not data:
+            continue
+        text = ""
+        if kind == "pdf":
+            text = _extract_pdf_text_from_bytes(data)
+        elif kind == "hwpx":
+            text = _extract_hwpx_text_from_bytes(data)
+        text = re.sub(r"\n{3,}", "\n\n", text or "").strip()
+        if len(text) >= 300:
+            return text, kind
+    return "", ""
+
+
+def _fetch_korea_detail(item: dict, source_name: str) -> Optional[dict]:
+    resp = fetch_with_retry(item["url"], timeout=KOREA_CRAWLER_TIMEOUT)
+    if not resp or resp.status_code != 200:
+        print(f" 상세 오류(HTTP {getattr(resp, 'status_code', 'none')})", end="")
+        return None
+    resp.encoding = "utf-8"
+    soup = BeautifulSoup(resp.text, "html.parser")
+    title = _extract_korea_detail_title(soup) or item.get("title", "")
+    body = _extract_korea_detail_body(soup)
+    published_at = item.get("source_published_at")
+    if not published_at:
+        main_text = ""
+        main_node = soup.select_one("main.main") or soup.select_one("section.area_contents") or soup.select_one("main")
+        if main_node:
+            main_text = main_node.get_text(" ", strip=True)
+        published_at = _extract_first_date(main_text[:1500]) or _extract_first_date(soup.get_text(" ", strip=True)[:1500])
+
+    attachments = _extract_korea_attachments(soup, item["url"])
+    body_plain = re.sub(r"\s+", " ", body or "").strip()
+    if _is_korea_attachment_notice_body(body_plain) and attachments:
+        attachment_text, attachment_kind = _extract_korea_attachment_text(attachments)
+        if attachment_text:
+            body = attachment_text
+            print(f" 첨부본문({attachment_kind})", end="")
+
+    if not body or len(re.sub(r"\s+", "", body)) < 120:
+        fallback = item.get("list_text", "")
+        if len(fallback) > len(body or ""):
+            body = fallback
+
+    return {
+        "url": item["url"],
+        "url_id": item["url_id"],
+        "title": title[:1000],
+        "body": body[:40000],
+        "image": "",
+        "source_published_at": published_at,
+        "source_name": source_name,
+        "department": item.get("department", ""),
+    }
+
+
 def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, rules: Optional[dict] = None, review_mode: bool = False) -> list:
-    """RSS에서 기사를 수집하여 리스트로 반환 (시트 없이 메모리에서 직접 처리)"""
+    """정책브리핑 웹 목록과 RSS에서 기사를 수집하여 리스트로 반환."""
     current_kst = now_kst()
     today = current_kst.date()
     current_hour = current_kst.hour
@@ -1754,6 +2048,7 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, 
         "skipped_missing_date": 0,
         "skipped_out_of_range": 0,
         "skipped_non_korean_newswire": 0,
+        "skipped_short_body": 0,
         "kept": 0,
     }
     rule_blocked_ids = (rules or {}).get("blocked_ids", set())
@@ -1763,16 +2058,78 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, 
     rule_allowed_title_hashes = (rules or {}).get("allowed_title_hashes", set())
     rule_allowed_source_urls = (rules or {}).get("allowed_source_urls", set())
 
+    def keep_article(article: dict, is_newswire: bool = False) -> bool:
+        curr_id = article.get("url_id") or extract_unique_id(article.get("url", ""))
+        title = article.get("title", "")
+        source_url = article.get("url", "")
+        if not curr_id:
+            stats["skipped_missing_link"] += 1
+            return False
+        article["url_id"] = curr_id
+        if not review_mode and curr_id in ex_ids:
+            stats["skipped_existing_id"] += 1
+            return False
+        if TARGET_URL_IDS and curr_id not in TARGET_URL_IDS:
+            stats["skipped_target_filter"] += 1
+            return False
+        if not is_mainly_korean(title, threshold=0.5):
+            stats["skipped_non_korean_title"] += 1
+            return False
+        if not review_mode:
+            title_hash = hash_title_for_rule(title)
+            source_url_key = normalize_url_for_rule(source_url)
+            rule_allowed = (
+                curr_id in rule_allowed_ids
+                or title_hash in rule_allowed_title_hashes
+                or source_url_key in rule_allowed_source_urls
+            )
+            if (
+                curr_id in rule_blocked_ids
+                or title_hash in rule_blocked_title_hashes
+                or source_url_key in rule_blocked_source_urls
+            ):
+                if not rule_allowed:
+                    stats["skipped_rule_blocked"] += 1
+                    return False
+            if not rule_allowed and curr_id in blocked_ids:
+                stats["skipped_global_blocked"] += 1
+                return False
+            if is_semantic_duplicate(title, ex_titles, threshold=0.9):
+                stats["skipped_semantic_duplicate"] += 1
+                return False
+        source_published_at = article.get("source_published_at")
+        if not source_published_at:
+            stats["skipped_missing_date"] += 1
+            return False
+        force_target = bool(TARGET_URL_IDS and curr_id in TARGET_URL_IDS)
+        if not force_target:
+            article_date = source_published_at.date()
+            if RETRY_DAYS > 0:
+                if article_date < today - timedelta(days=RETRY_DAYS) or article_date > today:
+                    stats["skipped_out_of_range"] += 1
+                    return False
+            else:
+                if article_date != today:
+                    stats["skipped_out_of_range"] += 1
+                    return False
+        if is_newswire and not re.search('[가-힣]', title):
+            stats["skipped_non_korean_newswire"] += 1
+            return False
+        if len(strip_html_tags(article.get("body", ""))) < 120:
+            stats["skipped_short_body"] += 1
+            return False
+        articles.append(article)
+        ex_ids.add(curr_id)
+        ex_titles.add(title[:1000])
+        stats["kept"] += 1
+        return True
+
     def fetch_feed(url, source_name, feed_limit, is_newswire=False):
         if feed_limit <= 0: return 0
         print(f"      📡 [{source_name}] 스캔 중 (목표: {feed_limit}건)...", end="", flush=True)
         count = 0
         try:
-            resp = fetch_with_retry(
-                url,
-                max_retries=RSS_FETCH_MAX_RETRIES,
-                timeout=RSS_FETCH_TIMEOUT_SECONDS,
-            )
+            resp = fetch_with_retry(url, timeout=20)
             if not resp or resp.status_code != 200:
                 print(f" 오류(HTTP {getattr(resp, 'status_code', 'none')})")
                 return 0
@@ -1784,73 +2141,24 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, 
                 if not hasattr(e, 'link'):
                     stats["skipped_missing_link"] += 1
                     continue
-                curr_id = extract_unique_id(e.link)
-                if not review_mode and curr_id in ex_ids:
-                    stats["skipped_existing_id"] += 1
-                    continue
-                if TARGET_URL_IDS and curr_id not in TARGET_URL_IDS:
-                    stats["skipped_target_filter"] += 1
-                    continue
-                if not is_mainly_korean(e.title, threshold=0.5):
-                    stats["skipped_non_korean_title"] += 1
-                    continue
-                if not review_mode:
-                    title_hash = hash_title_for_rule(e.title)
-                    source_url_key = normalize_url_for_rule(e.link)
-                    rule_allowed = (
-                        curr_id in rule_allowed_ids
-                        or title_hash in rule_allowed_title_hashes
-                        or source_url_key in rule_allowed_source_urls
-                    )
-                    if (
-                        curr_id in rule_blocked_ids
-                        or title_hash in rule_blocked_title_hashes
-                        or source_url_key in rule_blocked_source_urls
-                    ):
-                        if not rule_allowed:
-                            stats["skipped_rule_blocked"] += 1
-                            continue
-                    if not rule_allowed and curr_id in blocked_ids:
-                        stats["skipped_global_blocked"] += 1
-                        continue
-                    if is_semantic_duplicate(e.title, ex_titles, threshold=0.9):
-                        stats["skipped_semantic_duplicate"] += 1
-                        continue
                 dt = e.get('published_parsed') or e.get('updated_parsed')
                 source_published_at = feed_time_to_kst(dt)
-                if not source_published_at:
-                    stats["skipped_missing_date"] += 1
-                    continue
-                article_date = source_published_at.date()
-                if RETRY_DAYS > 0:
-                    if article_date < today - timedelta(days=RETRY_DAYS) or article_date > today:
-                        stats["skipped_out_of_range"] += 1
-                        continue
-                else:
-                    if article_date != today:
-                        stats["skipped_out_of_range"] += 1
-                        continue
-                if is_newswire and not re.search('[가-힣]', e.title):
-                    stats["skipped_non_korean_newswire"] += 1
-                    continue
 
                 img_link = ""
                 if hasattr(e, 'media_content'):
                     for mc in e.media_content:
                         if 'image' in mc.get('type', ''): img_link = mc.get('url', ''); break
 
-                articles.append({
+                article = {
                     "url": e.link,
-                    "url_id": curr_id,
+                    "url_id": extract_unique_id(e.link),
                     "title": e.title[:1000],
                     "body": e.get('summary', '')[:30000],
                     "image": img_link,
                     "source_published_at": source_published_at,
-                })
-                ex_ids.add(curr_id)
-                ex_titles.add(e.title[:1000])
-                count += 1
-                stats["kept"] += 1
+                }
+                if keep_article(article, is_newswire=is_newswire):
+                    count += 1
             print(f" {count}건 확보")
         except Exception as err:
             print(f" 오류({err})")
@@ -1858,28 +2166,98 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, 
 
     total_remaining = limit
 
+    def fetch_korea_web_sources(lim):
+        if lim <= 0 or not KOREA_CRAWLER_ENABLED:
+            return 0
+        source_keys = list(KOREA_CRAWLER_SOURCES)
+        if KOREA_POLICY_NEWS_ENABLED and "policy" not in source_keys:
+            source_keys.append("policy")
+        got = 0
+        for source_key in source_keys:
+            if got >= lim:
+                break
+            source_cfg = KOREA_POLICY_SOURCES.get(source_key)
+            if not source_cfg:
+                continue
+            source_name = source_cfg["name"]
+            print(f"      🕸️ [{source_name}] 웹 목록 스캔 중 (목표: {lim - got}건)...", end="", flush=True)
+            before = got
+            seen_items: set = set()
+            try:
+                for page in range(1, KOREA_CRAWLER_MAX_PAGES + 1):
+                    if got >= lim:
+                        break
+                    resp = None
+                    page_base_url = source_cfg["url"]
+                    for candidate_base_url in [source_cfg["url"]] + source_cfg.get("fallback_urls", []):
+                        page_url = _korea_page_url(candidate_base_url, page)
+                        resp = fetch_with_retry(page_url, timeout=KOREA_CRAWLER_TIMEOUT)
+                        if resp and resp.status_code == 200:
+                            page_base_url = candidate_base_url
+                            break
+                        print(f" 목록 오류({urlparse(candidate_base_url).netloc}: HTTP {getattr(resp, 'status_code', 'none')})", end="")
+                    if not resp or resp.status_code != 200:
+                        continue
+                    resp.encoding = "utf-8"
+                    items = _extract_korea_list_items(resp.text, page_base_url, source_key)
+                    stats["feed_entries"] += len(items)
+                    for item in items:
+                        if got >= lim:
+                            break
+                        if item["url_id"] in seen_items:
+                            continue
+                        seen_items.add(item["url_id"])
+                        if not review_mode and item["url_id"] in ex_ids:
+                            stats["skipped_existing_id"] += 1
+                            continue
+                        if TARGET_URL_IDS and item["url_id"] not in TARGET_URL_IDS:
+                            stats["skipped_target_filter"] += 1
+                            continue
+                        if not item.get("source_published_at"):
+                            item["source_published_at"] = _extract_first_date(item.get("list_text", ""))
+                        force_target = bool(TARGET_URL_IDS and item["url_id"] in TARGET_URL_IDS)
+                        if item.get("source_published_at") and not force_target:
+                            article_date = item["source_published_at"].date()
+                            if RETRY_DAYS > 0:
+                                if article_date < today - timedelta(days=RETRY_DAYS) or article_date > today:
+                                    stats["skipped_out_of_range"] += 1
+                                    continue
+                            elif article_date != today:
+                                stats["skipped_out_of_range"] += 1
+                                continue
+                        article = _fetch_korea_detail(item, source_name)
+                        if article and keep_article(article, is_newswire=False):
+                            got += 1
+                print(f" {got - before}건 확보")
+            except Exception as err:
+                print(f" 오류({err})")
+        return got
+
     def fetch_policy_feeds(lim):
         got = 0
-        policy_feeds = RSS_FEEDS[:-1]
-        if POLICY_FEED_SCAN_LIMIT > 0:
-            policy_feeds = policy_feeds[:POLICY_FEED_SCAN_LIMIT]
-        for feed_url in policy_feeds:
+        for feed_url in RSS_FEEDS[:-1]:
             feed_name = "정책브리핑-" + feed_url.split('/')[-1].replace('dept_', '').replace('.xml', '')
             found = fetch_feed(feed_url, feed_name, lim - got, is_newswire=False)
             got += found
             if got >= lim: break
         return got
 
-    if current_hour < 18:
-        print("      ☀️ [주간 모드] '정책브리핑'의 모든 부처를 수집합니다.")
-        fetch_policy_feeds(total_remaining)
-    else:
-        print(f"      🌗 [야간 모드] '정책브리핑' 우선, 부족 시 '뉴스와이어'로 채웁니다.")
-        got_policy = fetch_policy_feeds(total_remaining)
-        total_remaining -= got_policy
-        if total_remaining > 0:
-            print(f"      👉 목표 미달({total_remaining}건 부족) -> 뉴스와이어 가동")
-            fetch_feed(RSS_FEEDS[-1], "뉴스와이어", total_remaining, is_newswire=True)
+    got_policy = fetch_korea_web_sources(total_remaining)
+    total_remaining -= got_policy
+
+    if total_remaining > 0 and not KOREA_CRAWLER_ENABLED:
+        if current_hour < 18:
+            print("      ☀️ [주간 모드] '정책브리핑' RSS의 모든 부처를 수집합니다.")
+            got_policy = fetch_policy_feeds(total_remaining)
+            total_remaining -= got_policy
+        else:
+            print(f"      🌗 [야간 모드] '정책브리핑' RSS 우선, 부족 시 '뉴스와이어'로 채웁니다.")
+            got_policy = fetch_policy_feeds(total_remaining)
+            total_remaining -= got_policy
+
+    if total_remaining > 0 and current_hour >= 18:
+        print(f"      👉 목표 미달({total_remaining}건 부족) -> 뉴스와이어 가동")
+        fetch_feed(RSS_FEEDS[-1], "뉴스와이어", total_remaining, is_newswire=True)
 
     if review_mode or TARGET_URL_IDS:
         print(
@@ -1889,13 +2267,13 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, 
             f"날짜 {stats['skipped_out_of_range']} / 비한글제목 {stats['skipped_non_korean_title']} / "
             f"ID중복 {stats['skipped_existing_id']} / 규칙차단 {stats['skipped_rule_blocked']} / "
             f"전역차단 {stats['skipped_global_blocked']} / 날짜누락 {stats['skipped_missing_date']} / "
-            f"뉴스와이어비한글 {stats['skipped_non_korean_newswire']}"
+            f"짧은본문 {stats['skipped_short_body']} / 뉴스와이어비한글 {stats['skipped_non_korean_newswire']}"
         )
 
     if articles and EDITORIAL_PIPELINE and os.environ.get("EDITORIAL_ENRICH_ON_COLLECT", "1") != "0":
         from engine.pipeline.ingest import enrich_articles_batch
 
-        print(f"   📥 [원문보강] RSS {len(articles)}건 → 전문 페이지 fetch 시도...")
+        print(f"   📥 [원문보강] 수집 기사 {len(articles)}건 → 전문 페이지 fetch 시도...")
         articles = enrich_articles_batch(articles, fetch_with_retry)
 
     return articles
