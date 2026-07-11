@@ -154,7 +154,7 @@ HIDDEN_PUBLISH_TEST = os.environ.get("HIDDEN_PUBLISH_TEST", "0") == "1"
 KOREA_CRAWLER_ENABLED = os.environ.get("KOREA_CRAWLER_ENABLED", "1") != "0"
 KOREA_CRAWLER_SOURCES = [
     x.strip().lower()
-    for x in os.environ.get("KOREA_CRAWLER_SOURCES", "press,briefing").split(",")
+    for x in os.environ.get("KOREA_CRAWLER_SOURCES", "press,briefing,policy").split(",")
     if x.strip()
 ]
 KOREA_POLICY_NEWS_ENABLED = os.environ.get("KOREA_POLICY_NEWS_ENABLED", "0") == "1"
