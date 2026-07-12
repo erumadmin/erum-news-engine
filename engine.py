@@ -129,6 +129,11 @@ OPENROUTER_API_URL = os.environ.get("OPENROUTER_API_URL", f"{OPENROUTER_API_BASE
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "deepseek/deepseek-v4-pro")
 OPENROUTER_MODEL_REWRITE = os.environ.get("OPENROUTER_MODEL_REWRITE", REWRITE_MODEL or OPENROUTER_MODEL)
 OPENROUTER_MODEL_QA = os.environ.get("OPENROUTER_MODEL_QA", QA_MODEL or "deepseek/deepseek-v4-flash")
+OPENROUTER_REWRITE_FALLBACK_MODELS = [
+    x.strip()
+    for x in os.environ.get("OPENROUTER_REWRITE_FALLBACK_MODELS", "deepseek/deepseek-v3.2").split(",")
+    if x.strip()
+]
 OPENROUTER_REFERER = os.environ.get("OPENROUTER_REFERER", "https://erum-one.com")
 OPENROUTER_TITLE = os.environ.get("OPENROUTER_TITLE", "erum-news-engine")
 REWRITE_SOURCE_MAX_CHARS = int(os.environ.get("REWRITE_SOURCE_MAX_CHARS", "4000"))
@@ -1038,6 +1043,7 @@ def should_retry_rewrite_validation(message: str) -> bool:
             "본문 마지막 문자 비정상",
             "문단 수 부족",
             "원문에 없는 수치",
+            "원문에 없는 구체화",
         )
     )
 
@@ -1056,6 +1062,46 @@ def _numeric_fact_keys(text: str) -> set:
         if number:
             keys.add(number.group(0))
     return keys
+
+
+UNSUPPORTED_DETAIL_PATTERNS: Tuple[Tuple[str, str], ...] = (
+    ("시범 운영", "시범 운영"),
+    ("시범 구축", "시범 구축"),
+    ("시범 사업", "시범 사업"),
+    ("확대 여부", "확대 여부"),
+    ("사업자 선정", "사업자 선정"),
+    ("비용 분담", "비용 분담"),
+    ("투자 비용", "투자 비용"),
+    ("전기요금", "전기요금"),
+    ("요금 반영", "요금 반영"),
+    ("설치 비용", "설치 비용"),
+    ("일부 발전소", "일부 발전소"),
+    ("전남·북", "전남·북"),
+    ("전남북", "전남북"),
+    ("전남", "전남"),
+    ("전북", "전북"),
+    ("주민", "주민"),
+    ("수혜", "수혜"),
+    ("손실", "손실"),
+    ("투자 위축", "투자 위축"),
+    ("수익 악화", "수익 악화"),
+    ("송전망 증설", "송전망 증설"),
+)
+
+
+def _compact_korean_text(text: str) -> str:
+    return re.sub(r"\s+", "", text or "")
+
+
+def _unsupported_detail_hits(source_text: str, rewritten_text: str) -> List[str]:
+    source_compact = _compact_korean_text(source_text)
+    rewritten_compact = _compact_korean_text(rewritten_text)
+    hits: List[str] = []
+    for label, pattern in UNSUPPORTED_DETAIL_PATTERNS:
+        compact_pattern = _compact_korean_text(pattern)
+        if compact_pattern and compact_pattern in rewritten_compact and compact_pattern not in source_compact:
+            hits.append(label)
+    return hits
 
 
 def validate_source_fidelity(parsed: dict, source_article: dict) -> Tuple[bool, str]:
@@ -1079,6 +1125,9 @@ def validate_source_fidelity(parsed: dict, source_article: dict) -> Tuple[bool, 
     unsupported_nums = sorted(_numeric_fact_keys(rewritten_text) - source_nums)
     if unsupported_nums:
         return False, f"원문에 없는 수치 발견({', '.join(unsupported_nums[:5])})"
+    unsupported_details = _unsupported_detail_hits(source_text, rewritten_text)
+    if unsupported_details:
+        return False, f"원문에 없는 구체화 발견({', '.join(unsupported_details[:5])})"
     return True, "OK"
 
 CB_DIRECT_KEYWORDS: Tuple[str, ...] = (
@@ -2825,10 +2874,24 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
 
             p = None
             msg = ""
-            for attempt_idx, max_tokens in enumerate(rewrite_token_budgets):
+            rewrite_models: List[Optional[str]] = [None]
+            if REWRITE_PROVIDER == "openrouter":
+                rewrite_models.extend(
+                    model for model in OPENROUTER_REWRITE_FALLBACK_MODELS
+                    if model and model != OPENROUTER_MODEL_REWRITE
+                )
+            rewrite_attempts = [
+                (model, max_tokens)
+                for model in rewrite_models
+                for max_tokens in rewrite_token_budgets
+            ]
+            for attempt_idx, (rewrite_model, max_tokens) in enumerate(rewrite_attempts):
+                if rewrite_model:
+                    print(f" fallback({rewrite_model})...", end="", flush=True)
                 res = ask_llm(
                     PERSONA_DEFINITIONS[prefix],
                     rewrite_input,
+                    model=rewrite_model,
                     max_output_tokens=max_tokens,
                     stage="rewrite",
                 )
@@ -2838,10 +2901,11 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
                     is_valid, msg = validate_source_fidelity(p, article)
                 if is_valid:
                     break
-                if attempt_idx + 1 >= len(rewrite_token_budgets) or not should_retry_rewrite_validation(msg):
+                if attempt_idx + 1 >= len(rewrite_attempts) or not should_retry_rewrite_validation(msg):
                     raise PipelineFailure("rewrite", "REWRITE_VALIDATION_FAIL", msg, retryable=False)
-                next_tokens = rewrite_token_budgets[attempt_idx + 1]
-                print(f" 재시도({msg}, {max_tokens}->{next_tokens} 토큰)...", end="", flush=True)
+                next_model, next_tokens = rewrite_attempts[attempt_idx + 1]
+                next_label = next_model or "same-model"
+                print(f" 재시도({msg}, 다음:{next_label}/{next_tokens} 토큰)...", end="", flush=True)
 
             if p is None:
                 raise PipelineFailure("rewrite", "REWRITE_VALIDATION_FAIL", msg or "재작성 결과 없음", retryable=False)
