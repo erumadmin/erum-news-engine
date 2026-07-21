@@ -328,6 +328,12 @@ def validate_nn_editorial_rewrite(
         if re.search(r"https?://|www\.", plain, re.I):
             return False, "본문 URL 노출(v4)"
 
+    from engine.pipeline.rewrite_validate import validate_source_fidelity
+
+    ok_fid, fid_msg = validate_source_fidelity(title, body, article)
+    if not ok_fid:
+        return False, fid_msg
+
     return True, "OK"
 
 

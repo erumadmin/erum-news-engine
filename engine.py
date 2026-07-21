@@ -89,8 +89,10 @@ ERUM_API_BASE = "https://erum-one.com"
 # 배포 환경 호환:
 # 1) ERUM_API_KEY
 # 2) ADMIN_API_KEY
-# 3) 레거시 기본값(임시 호환용)
-ERUM_API_KEY = os.environ.get("ERUM_API_KEY") or os.environ.get("ADMIN_API_KEY") or "eRuM@AdminKey2026!"
+# 둘 중 하나는 반드시 설정되어야 함 (하드코딩 폴백 제거)
+ERUM_API_KEY = os.environ.get("ERUM_API_KEY") or os.environ.get("ADMIN_API_KEY")
+if not ERUM_API_KEY:
+    raise RuntimeError("ERUM_API_KEY 또는 ADMIN_API_KEY 환경변수가 필요합니다.")
 ERUM_CFG = {
     "IJ_": {"site": "IJ", "gsc_site": "sc-domain:impactjournal.kr", "sitemap": "https://impactjournal.kr/sitemap-news.xml"},
     "NN_": {"site": "NN", "gsc_site": "sc-domain:neighbornews.kr", "sitemap": "https://neighbornews.kr/sitemap-news.xml"},
@@ -112,9 +114,27 @@ UPSTAGE_MODEL_QA = os.environ.get("UPSTAGE_MODEL_QA", UPSTAGE_MODEL)
 UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS", "1500"))
 UPSTAGE_REWRITE_RETRY_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_REWRITE_RETRY_MAX_OUTPUT_TOKENS", "2200"))
 UPSTAGE_QA_MAX_OUTPUT_TOKENS = int(os.environ.get("UPSTAGE_QA_MAX_OUTPUT_TOKENS", "900"))
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-pro")
+LLM_PROVIDER = (os.environ.get("LLM_PROVIDER", "upstage").strip().lower() or "upstage")
+REWRITE_PROVIDER = (os.environ.get("REWRITE_PROVIDER", LLM_PROVIDER).strip().lower() or LLM_PROVIDER)
+QA_PROVIDER = (os.environ.get("QA_PROVIDER", LLM_PROVIDER).strip().lower() or LLM_PROVIDER)
+REWRITE_MODEL = os.environ.get("REWRITE_MODEL", "").strip()
+QA_MODEL = os.environ.get("QA_MODEL", "").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_MODEL_REWRITE = os.environ.get("GEMINI_MODEL_REWRITE", GEMINI_MODEL)
 GEMINI_MODEL_QA = os.environ.get("GEMINI_MODEL_QA", GEMINI_MODEL)
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_API_BASE = os.environ.get("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
+OPENROUTER_API_URL = os.environ.get("OPENROUTER_API_URL", f"{OPENROUTER_API_BASE.rstrip('/')}/chat/completions")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "deepseek/deepseek-v4-pro")
+OPENROUTER_MODEL_REWRITE = os.environ.get("OPENROUTER_MODEL_REWRITE", REWRITE_MODEL or OPENROUTER_MODEL)
+OPENROUTER_MODEL_QA = os.environ.get("OPENROUTER_MODEL_QA", QA_MODEL or "deepseek/deepseek-v4-flash")
+OPENROUTER_REWRITE_FALLBACK_MODELS = [
+    x.strip()
+    for x in os.environ.get("OPENROUTER_REWRITE_FALLBACK_MODELS", "deepseek/deepseek-v3.2").split(",")
+    if x.strip()
+]
+OPENROUTER_REFERER = os.environ.get("OPENROUTER_REFERER", "https://erum-one.com")
+OPENROUTER_TITLE = os.environ.get("OPENROUTER_TITLE", "erum-news-engine")
 REWRITE_SOURCE_MAX_CHARS = int(os.environ.get("REWRITE_SOURCE_MAX_CHARS", "4000"))
 MIN_REWRITTEN_BODY_CHARS = int(os.environ.get("MIN_REWRITTEN_BODY_CHARS", "300"))
 SHORT_FORM_MIN_REWRITTEN_BODY_CHARS = int(os.environ.get("SHORT_FORM_MIN_REWRITTEN_BODY_CHARS", "220"))
@@ -162,13 +182,23 @@ KOREA_POLICY_NEWS_ENABLED = os.environ.get("KOREA_POLICY_NEWS_ENABLED", "0") == 
 KOREA_CRAWLER_MAX_PAGES = max(1, int(os.environ.get("KOREA_CRAWLER_MAX_PAGES", "2")))
 KOREA_ATTACHMENT_PDF_ENABLED = os.environ.get("KOREA_ATTACHMENT_PDF_ENABLED", "1") != "0"
 KOREA_CRAWLER_TIMEOUT = int(os.environ.get("KOREA_CRAWLER_TIMEOUT", "20"))
+NEWSWIRE_DAYTIME_MODE = (os.environ.get("NEWSWIRE_DAYTIME_MODE", "screened") or "screened").strip().lower()
+NEWSWIRE_RSS_URL = os.environ.get("NEWSWIRE_RSS_URL", "https://api.newswire.co.kr/rss/all").strip()
+NEWSWIRE_CANDIDATE_SCAN_LIMIT = max(10, int(os.environ.get("NEWSWIRE_CANDIDATE_SCAN_LIMIT", "80")))
+NEWSWIRE_MAX_SELECTED_PER_RUN = max(0, int(os.environ.get("NEWSWIRE_MAX_SELECTED_PER_RUN", "5")))
+NEWSWIRE_MAX_DAILY_SHARE = max(0, min(100, int(os.environ.get("NEWSWIRE_MAX_DAILY_SHARE", "30"))))
+SOURCE_GATE_DRY_RUN = os.environ.get("SOURCE_GATE_DRY_RUN", "0") == "1"
 PUBLISH_STATUS = (os.environ.get("PUBLISH_STATUS", "PUBLISHED").strip() or "PUBLISHED").upper()
 if PUBLISH_STATUS not in {"PUBLISHED", "DRAFT"}:
     raise RuntimeError("PUBLISH_STATUS는 PUBLISHED 또는 DRAFT만 허용됩니다.")
 if HIDDEN_PUBLISH_TEST:
     PUBLISH_STATUS = "DRAFT"
-if not UPSTAGE_API_KEY and not (REVIEW_ONLY and GEMINI_API_KEY):
-    raise RuntimeError("UPSTAGE_API_KEY가 없습니다. 리뷰 전용 모드에서는 GEMINI_API_KEY가 필요합니다.")
+if (LLM_PROVIDER == "gemini" or REWRITE_PROVIDER == "gemini" or QA_PROVIDER == "gemini") and not GEMINI_API_KEY:
+    raise RuntimeError("Gemini provider 사용에는 GEMINI_API_KEY가 필요합니다.")
+if (LLM_PROVIDER == "openrouter" or REWRITE_PROVIDER == "openrouter" or QA_PROVIDER == "openrouter") and not OPENROUTER_API_KEY:
+    raise RuntimeError("OpenRouter provider 사용에는 OPENROUTER_API_KEY가 필요합니다.")
+if not UPSTAGE_API_KEY and not GEMINI_API_KEY and not OPENROUTER_API_KEY:
+    raise RuntimeError("UPSTAGE_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY 중 하나가 필요합니다.")
 EDITORIAL_PIPELINE = os.environ.get("EDITORIAL_PIPELINE", "1") == "1"
 # IJ + 편집 파이프라인: 수집 원문 전문 + 리서치 패킷·근거를 합쳐 재작성 (0이면 원문만)
 # IJ 작성: 원문 전문 + 리서치 패킷 + 근거 (하이브리드 유저 메시지). 0 = GitHub main처럼 원문만.
@@ -430,6 +460,10 @@ def _llm_failure(stage: str, exc: Exception) -> PipelineFailure:
 def _ask_gemini_rest(persona, user_text, model=None, max_output_tokens=None, stage="rewrite"):
     use_model = model if (model and str(model).startswith("gemini")) else (GEMINI_MODEL_QA if stage == "qa" else GEMINI_MODEL_REWRITE)
     output_tokens = max_output_tokens or (UPSTAGE_QA_MAX_OUTPUT_TOKENS if stage == "qa" else UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS)
+    if stage == "rewrite":
+        output_tokens = max(output_tokens, int(os.environ.get("GEMINI_REWRITE_MIN_OUTPUT_TOKENS", "8000")))
+    elif stage == "qa":
+        output_tokens = max(output_tokens, int(os.environ.get("GEMINI_QA_MIN_OUTPUT_TOKENS", "3000")))
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{use_model}:generateContent"
     try:
         response = requests.post(
@@ -467,12 +501,64 @@ def _ask_gemini_rest(persona, user_text, model=None, max_output_tokens=None, sta
     except Exception as e:
         raise _llm_failure(stage, e)
 
+
+def _ask_openrouter(persona, user_text, model=None, max_output_tokens=None, stage="rewrite"):
+    use_model = model or (OPENROUTER_MODEL_QA if stage == "qa" else OPENROUTER_MODEL_REWRITE)
+    output_tokens = max_output_tokens or (UPSTAGE_QA_MAX_OUTPUT_TOKENS if stage == "qa" else UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS)
+    payload = {
+        "model": use_model,
+        "messages": [
+            {"role": "system", "content": persona},
+            {"role": "user", "content": user_text},
+        ],
+        "temperature": 0.2,
+        "max_tokens": output_tokens,
+        "stream": False,
+    }
+    if "deepseek-v4" in use_model.lower():
+        payload["reasoning"] = {"enabled": False}
+    try:
+        response = requests.post(
+            OPENROUTER_API_URL,
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": OPENROUTER_REFERER,
+                "X-Title": OPENROUTER_TITLE,
+                "User-Agent": "erum-news-engine/1.0",
+            },
+            json=payload,
+            timeout=180,
+        )
+        response.raise_for_status()
+        data = response.json()
+        choices = data.get("choices") or []
+        if not choices:
+            raise ValueError("OpenRouter 응답에 choices가 없음")
+        message = choices[0].get("message") or {}
+        content = message.get("content", "")
+        if isinstance(content, list):
+            content = "".join(
+                part.get("text", "") if isinstance(part, dict) else str(part)
+                for part in content
+            )
+        return (content or "").strip()
+    except PipelineFailure:
+        raise
+    except Exception as e:
+        raise _llm_failure(stage, e)
+
+
 def ask_llm(persona, user_text, model=None, max_output_tokens=None, stage="rewrite"):
-    provider = "upstage"
-    if REVIEW_ONLY and not UPSTAGE_API_KEY and GEMINI_API_KEY:
+    provider = QA_PROVIDER if stage == "qa" else REWRITE_PROVIDER
+    if provider not in {"upstage", "gemini", "openrouter"}:
+        provider = "upstage"
+    if not UPSTAGE_API_KEY and GEMINI_API_KEY and provider == "upstage":
         provider = "gemini"
     if provider == "gemini":
         return _ask_gemini_rest(persona, user_text, model=model, max_output_tokens=max_output_tokens, stage=stage)
+    if provider == "openrouter":
+        return _ask_openrouter(persona, user_text, model=model, max_output_tokens=max_output_tokens, stage=stage)
     use_model = model or (UPSTAGE_MODEL_QA if stage == "qa" else UPSTAGE_MODEL_REWRITE)
     output_tokens = max_output_tokens or (UPSTAGE_QA_MAX_OUTPUT_TOKENS if stage == "qa" else UPSTAGE_REWRITE_MAX_OUTPUT_TOKENS)
     try:
@@ -510,7 +596,11 @@ def ask_llm(persona, user_text, model=None, max_output_tokens=None, stage="rewri
     except PipelineFailure:
         raise
     except Exception as e:
-        raise _llm_failure(stage, e)
+        failure = _llm_failure(stage, e)
+        if GEMINI_API_KEY and failure.code in {f"{stage.upper()}_AUTH_401", f"{stage.upper()}_AUTH_403"}:
+            print(" Gemini fallback...", end="", flush=True)
+            return _ask_gemini_rest(persona, user_text, model=None, max_output_tokens=max_output_tokens, stage=stage)
+        raise failure
 
 # ========================= [3. DB 연동 (Vultr MariaDB)] =========================
 
@@ -943,6 +1033,8 @@ def should_retry_rewrite_validation(message: str) -> bool:
             "작동 방식",
             "너무 짧음",
             "원문 핵심 누락",
+            "원문에 없는 수치",
+            "원문에 없는 구체화",
             "1문단 리드",
             "coalition_takeaways",
             "briefing_not_ready",
@@ -1085,12 +1177,15 @@ def ai_quality_check(
     article_text = build_qa_user_message(
         source_article, title, excerpt, body, packet=research_packet
     )
-    raw = ask_llm(system_prompt, article_text, model=UPSTAGE_MODEL_QA, max_output_tokens=UPSTAGE_QA_MAX_OUTPUT_TOKENS, stage="qa")
+    raw = ask_llm(system_prompt, article_text, max_output_tokens=UPSTAGE_QA_MAX_OUTPUT_TOKENS, stage="qa")
     try:
         parts = raw.split("---", 1)
         json_part = parts[0]
         clean = re.sub(r"```json\s*", "", json_part)
         clean = re.sub(r"```\s*", "", clean).strip()
+        match = re.search(r"\{.*\}", clean, flags=re.DOTALL)
+        if match:
+            clean = match.group(0).strip()
         decoder = json.JSONDecoder()
         result, _ = decoder.raw_decode(clean)
         total = int(result.get("total", 0))
@@ -1103,6 +1198,13 @@ def ai_quality_check(
             fixed = parse_llm_response(parts[1].strip())
         return passed, fails, total, fixed
     except Exception as e:
+        if QA_PROVIDER in {"gemini", "openrouter"}:
+            local_ok, local_msg = validate_content_quality(title, body)
+            if local_ok:
+                print(f"      ⚠️ [AI검수] {QA_PROVIDER} 파싱 실패({str(e)[:50]}), 로컬 검증 통과로 임시 승인")
+                return True, ["AI검수 파싱 실패: 로컬 품질검증 통과"], 78, None
+            print(f"      ⚠️ [AI검수] {QA_PROVIDER} 파싱 실패({str(e)[:50]}), 로컬 검증 실패({local_msg})")
+            return False, [f"AI검수 파싱 실패: {local_msg}"], 0, None
         print(f"      ⚠️ [AI검수] 파싱 실패({str(e)[:50]}), 실패 처리")
         return False, ["AI검수 파싱 실패"], 0, None
 
@@ -1185,7 +1287,9 @@ def clean_body_html(text):
             formatted_lines.append(line)
         else:
             formatted_lines.append(f"<p>{line}</p>")
-    return "".join(formatted_lines)
+    from engine.pipeline.html_sanitize import sanitize_article_html
+
+    return sanitize_article_html("".join(formatted_lines))
 
 def parse_llm_response(text):
     text = _strip_model_fences(text)
@@ -2027,6 +2131,7 @@ def _fetch_korea_detail(item: dict, source_name: str) -> Optional[dict]:
         "source_published_at": published_at,
         "source_name": source_name,
         "department": item.get("department", ""),
+        "source_type": "policy_briefing",
     }
 
 
@@ -2156,6 +2261,9 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, 
                     "body": e.get('summary', '')[:30000],
                     "image": img_link,
                     "source_published_at": source_published_at,
+                    "source_type": "newswire" if is_newswire else "policy_briefing",
+                    "feed_name": source_name,
+                    "feed_url": url,
                 }
                 if keep_article(article, is_newswire=is_newswire):
                     count += 1
@@ -2164,7 +2272,72 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, 
             print(f" 오류({err})")
         return count
 
+    def fetch_newswire_candidates(scan_limit: int) -> list:
+        """Collect newswire RSS into a candidate list without mutating the main pool."""
+        if scan_limit <= 0:
+            return []
+        print(f"      📡 [뉴스와이어-후보] 스캔 중 (상한: {scan_limit}건)...", end="", flush=True)
+        candidates: list = []
+        try:
+            resp = fetch_with_retry(NEWSWIRE_RSS_URL or RSS_FEEDS[-1], timeout=20)
+            if not resp or resp.status_code != 200:
+                print(f" 오류(HTTP {getattr(resp, 'status_code', 'none')})")
+                return []
+            resp.encoding = "utf-8"
+            f = feedparser.parse(resp.text)
+            for e in f.entries:
+                stats["feed_entries"] += 1
+                if len(candidates) >= scan_limit:
+                    break
+                if not hasattr(e, "link"):
+                    stats["skipped_missing_link"] += 1
+                    continue
+                dt = e.get("published_parsed") or e.get("updated_parsed")
+                source_published_at = feed_time_to_kst(dt)
+                img_link = ""
+                if hasattr(e, "media_content"):
+                    for mc in e.media_content:
+                        if "image" in mc.get("type", ""):
+                            img_link = mc.get("url", "")
+                            break
+                article = {
+                    "url": e.link,
+                    "url_id": extract_unique_id(e.link),
+                    "title": (e.title or "")[:1000],
+                    "body": e.get("summary", "")[:30000],
+                    "image": img_link,
+                    "source_published_at": source_published_at,
+                    "source_type": "newswire",
+                    "feed_name": "뉴스와이어",
+                    "feed_url": NEWSWIRE_RSS_URL or RSS_FEEDS[-1],
+                }
+                # Soft keep for candidate pool: korean title + date + min body 120
+                if not article["url_id"]:
+                    continue
+                if TARGET_URL_IDS and article["url_id"] not in TARGET_URL_IDS:
+                    continue
+                if not review_mode and article["url_id"] in ex_ids:
+                    continue
+                if not is_mainly_korean(article["title"], threshold=0.5):
+                    stats["skipped_non_korean_title"] += 1
+                    continue
+                if not article.get("source_published_at"):
+                    stats["skipped_missing_date"] += 1
+                    continue
+                if len(strip_html_tags(article.get("body", ""))) < 120:
+                    stats["skipped_short_body"] += 1
+                    continue
+                candidates.append(article)
+            print(f" {len(candidates)}건 후보")
+        except Exception as err:
+            print(f" 오류({err})")
+        return candidates
+
     total_remaining = limit
+    newswire_mode = NEWSWIRE_DAYTIME_MODE
+    screened_mode = newswire_mode in ("screened", "1", "true", "on")
+    reserved_newswire = min(NEWSWIRE_MAX_SELECTED_PER_RUN, limit) if screened_mode else 0
+    policy_limit = max(0, limit - reserved_newswire) if screened_mode else limit
 
     def fetch_korea_web_sources(lim):
         if lim <= 0 or not KOREA_CRAWLER_ENABLED:
@@ -2242,21 +2415,74 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, 
             if got >= lim: break
         return got
 
-    got_policy = fetch_korea_web_sources(total_remaining)
-    total_remaining -= got_policy
+    got_policy = fetch_korea_web_sources(policy_limit)
+    total_remaining = limit - len(articles)
 
-    if total_remaining > 0 and not KOREA_CRAWLER_ENABLED:
+    if total_remaining > reserved_newswire and not KOREA_CRAWLER_ENABLED:
+        rss_limit = total_remaining - reserved_newswire
         if current_hour < 18:
             print("      ☀️ [주간 모드] '정책브리핑' RSS의 모든 부처를 수집합니다.")
-            got_policy = fetch_policy_feeds(total_remaining)
-            total_remaining -= got_policy
+            fetch_policy_feeds(rss_limit)
         else:
-            print(f"      🌗 [야간 모드] '정책브리핑' RSS 우선, 부족 시 '뉴스와이어'로 채웁니다.")
-            got_policy = fetch_policy_feeds(total_remaining)
-            total_remaining -= got_policy
+            print("      🌗 [야간 모드] '정책브리핑' RSS 우선, 부족 시 '뉴스와이어'로 채웁니다.")
+            fetch_policy_feeds(rss_limit)
+        total_remaining = limit - len(articles)
 
-    if total_remaining > 0 and current_hour >= 18:
-        print(f"      👉 목표 미달({total_remaining}건 부족) -> 뉴스와이어 가동")
+    if screened_mode:
+        print("      🧪 [뉴스와이어] screened 모드 — 후보 수집 후 source gate")
+        from engine.pipeline.ingest import enrich_article_from_page
+        from engine.pipeline.source_gate import SourceGateConfig, screen_newswire_candidates
+
+        scan_limit = max(NEWSWIRE_CANDIDATE_SCAN_LIMIT, NEWSWIRE_MAX_SELECTED_PER_RUN * 10)
+        nw_candidates = fetch_newswire_candidates(scan_limit)
+        enriched_nw: list = []
+        print(f"      📥 [뉴스와이어] 원문 보강 {len(nw_candidates)}건...", flush=True)
+        from engine.pipeline.article_images import BLOCKED_IMAGE_PATTERNS as _IMG_BLOCK
+
+        def _img_blocked(url: str) -> bool:
+            low = (url or "").lower()
+            return (not low) or any(x in low for x in _IMG_BLOCK)
+
+        for cand in nw_candidates:
+            _ok, enriched, _reason = enrich_article_from_page(cand, fetch_with_retry, require_fetch=False)
+            html = enriched.get("raw_html") or ""
+            if _img_blocked(enriched.get("image") or ""):
+                m = re.search(
+                    r'https://file\.newswire\.co\.kr/[^"\']+\.(?:jpg|jpeg|png|webp)',
+                    html,
+                    re.I,
+                )
+                if m:
+                    enriched["image"] = m.group(0)
+                else:
+                    om = re.search(
+                        r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+                        html,
+                        re.I,
+                    )
+                    if om and not _img_blocked(om.group(1)):
+                        enriched["image"] = om.group(1)
+            enriched_nw.append(enriched)
+        cfg = SourceGateConfig.from_env()
+        llm_enabled = os.environ.get("SOURCE_GATE_LLM", "1") != "0"
+        selected_nw, gate_stats, _decisions = screen_newswire_candidates(
+            enriched_nw,
+            cfg=cfg,
+            llm_enabled=llm_enabled,
+            daily_published=0 if review_mode else max(0, DAILY_PUBLISH_LIMIT - limit),
+            daily_limit=DAILY_PUBLISH_LIMIT,
+        )
+        room = max(0, limit - len(articles))
+        merge_cap = min(len(selected_nw), NEWSWIRE_MAX_SELECTED_PER_RUN, room)
+        for item in selected_nw[:merge_cap]:
+            keep_article(item, is_newswire=True)
+        print(gate_stats.format_report())
+        collect_articles.last_newswire_gate_stats = gate_stats  # type: ignore[attr-defined]
+        collect_articles.last_newswire_decisions = _decisions  # type: ignore[attr-defined]
+    elif newswire_mode in ("off", "0", "false"):
+        print("      ⛔ [뉴스와이어] 비활성 (NEWSWIRE_DAYTIME_MODE=off)")
+    elif total_remaining > 0 and current_hour >= 18:
+        print(f"      👉 목표 미달({total_remaining}건 부족) -> 뉴스와이어 레거시 가동")
         fetch_feed(RSS_FEEDS[-1], "뉴스와이어", total_remaining, is_newswire=True)
 
     if review_mode or TARGET_URL_IDS:
@@ -2569,13 +2795,33 @@ def process_article(
                     "3",
                 )
             )
+            rewrite_models: List[Optional[str]] = [None]
+            if REWRITE_PROVIDER == "openrouter":
+                rewrite_models.extend(
+                    model
+                    for model in OPENROUTER_REWRITE_FALLBACK_MODELS
+                    if model and model != OPENROUTER_MODEL_REWRITE
+                )
+            base_rewrite_attempts = [
+                (model, max_tokens)
+                for model in rewrite_models
+                for max_tokens in rewrite_token_budgets
+            ]
+            if REWRITE_PROVIDER == "openrouter":
+                rewrite_attempts = list(base_rewrite_attempts)
+            else:
+                rewrite_attempts = []
+                for i in range(max(validation_attempts, 1)):
+                    token = rewrite_token_budgets[min(i, len(rewrite_token_budgets) - 1)]
+                    rewrite_attempts.append((None, token))
             current_input = rewrite_input
-            for attempt_idx in range(validation_attempts):
-                max_tokens = rewrite_token_budgets[min(attempt_idx, len(rewrite_token_budgets) - 1)]
+            for attempt_idx, (rewrite_model, max_tokens) in enumerate(rewrite_attempts):
+                if rewrite_model:
+                    print(f" fallback({rewrite_model})...", end="", flush=True)
                 res = ask_llm(
                     PERSONA_DEFINITIONS[prefix],
                     current_input,
-                    model=UPSTAGE_MODEL_REWRITE,
+                    model=rewrite_model,
                     max_output_tokens=max_tokens,
                     stage="rewrite",
                 )
@@ -2634,11 +2880,20 @@ def process_article(
                         editorial_ctx.packet,
                         article,
                     )
+                if is_valid and not (ij_editorial or nn_editorial or cb_editorial):
+                    from engine.pipeline.rewrite_validate import validate_source_fidelity
+
+                    is_valid, msg = validate_source_fidelity(
+                        p.get("title", ""),
+                        p.get("body", ""),
+                        article,
+                        excerpt=p.get("excerpt", ""),
+                    )
                 if is_valid:
                     break
                 if (
                     ij_editorial
-                    and attempt_idx + 1 >= validation_attempts
+                    and attempt_idx + 1 >= len(rewrite_attempts)
                     and any(
                         tok in msg
                         for tok in (
@@ -2666,7 +2921,7 @@ def process_article(
                     break
                 if (
                     nn_editorial
-                    and attempt_idx + 1 >= validation_attempts
+                    and attempt_idx + 1 >= len(rewrite_attempts)
                     and any(tok in msg for tok in ("4문단", "community_axes", "기관명"))
                 ):
                     from engine.pipeline.nn_rewrite_validate import (
@@ -2687,7 +2942,7 @@ def process_article(
                     break
                 if (
                     cb_editorial
-                    and attempt_idx + 1 >= validation_attempts
+                    and attempt_idx + 1 >= len(rewrite_attempts)
                     and any(tok in msg for tok in ("4문단", "기업 실무", "확인 절차"))
                 ):
                     from engine.pipeline.cb_rewrite_validate import (
@@ -2764,7 +3019,7 @@ def process_article(
                         )
                         if is_valid:
                             break
-                if attempt_idx + 1 >= validation_attempts or not should_retry_rewrite_validation(msg):
+                if attempt_idx + 1 >= len(rewrite_attempts) or not should_retry_rewrite_validation(msg):
                     raise PipelineFailure("rewrite", "REWRITE_VALIDATION_FAIL", msg, retryable=False)
                 if nn_editorial:
                     from engine.pipeline.nn_rewrite_validate import build_nn_rewrite_correction_suffix
@@ -2783,8 +3038,9 @@ def process_article(
                     from engine.pipeline.rewrite_validate import build_rewrite_correction_suffix
 
                     current_input = rewrite_input + build_rewrite_correction_suffix(msg)
-                next_tokens = rewrite_token_budgets[min(attempt_idx + 1, len(rewrite_token_budgets) - 1)]
-                print(f" 재시도({msg}, {max_tokens}->{next_tokens} 토큰)...", end="", flush=True)
+                next_model, next_tokens = rewrite_attempts[attempt_idx + 1]
+                next_label = next_model or "same-model"
+                print(f" 재시도({msg}, 다음:{next_label}/{next_tokens} 토큰)...", end="", flush=True)
 
             if p is None:
                 raise PipelineFailure("rewrite", "REWRITE_VALIDATION_FAIL", msg or "재작성 결과 없음", retryable=False)

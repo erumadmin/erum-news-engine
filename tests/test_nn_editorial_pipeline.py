@@ -126,7 +126,12 @@ class TestNNRewriteValidate(unittest.TestCase):
     def test_finalize_and_validate(self):
         os.environ["NN_PUBLISH_V4"] = "1"
         article = {
-            "body": "청년 창업자 사용료 인하 2026년 신청 구청",
+            "body": (
+                "청년 창업자와 소상공인은 국공유재산 사용료 부담이 줄어든다. "
+                "2026년부터 서울·부산에서 먼저 적용된다. "
+                "신청은 거주지 구청 누리집에서 하며, 2026년 3월부터 접수한다. "
+                "제외 대상은 대형 법인이며 시범 운영 기간에는 일부 업종만 해당된다."
+            ),
         }
         packet = {
             "who_is_affected": ["청년 창업자", "소상공인"],

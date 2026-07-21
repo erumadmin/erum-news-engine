@@ -89,10 +89,20 @@ def run_pre_publish_pipeline(
     article.update(enriched_copy)
 
     raw = enrich_raw_source(article)
-    route = route_primary(raw)
-    if route.site == "DROP":
-        print(f"   🚫 [라우팅] DROP ({route.reason}, score={route.score:.1f})")
-        return None
+    gate_site = str(article.get("_source_gate_site") or "").strip().upper()
+    if gate_site in ("IJ", "NN", "CB"):
+        from engine.types import RouteScore
+
+        route = RouteScore(
+            gate_site,  # type: ignore[arg-type]
+            float((article.get("_source_gate") or {}).get("score") or 90.0),
+            article.get("_source_gate_reason") or f"source_gate:{gate_site}",
+        )
+    else:
+        route = route_primary(raw)
+        if route.site == "DROP":
+            print(f"   🚫 [라우팅] DROP ({route.reason}, score={route.score:.1f})")
+            return None
 
     force_site = os.environ.get("EDITORIAL_FORCE_SITE", "").strip().upper()
     assigned: SiteCode = force_site if force_site in ("IJ", "NN", "CB") else route.site
@@ -100,6 +110,10 @@ def run_pre_publish_pipeline(
         print(f"   🧭 [라우팅] FORCE {assigned} (auto={route.site})")
     profile = get_profile(assigned)
     cand = profile.candidate_filter(raw)
+    if not cand.accept and gate_site in ("IJ", "NN", "CB"):
+        from engine.types import CandidateDecision
+
+        cand = CandidateDecision(True, f"source_gate_override:{cand.reason}")
     print(
         f"   🔎 [후보필터] {assigned} "
         f"{'ACCEPT' if cand.accept else 'DROP'} ({cand.reason})"

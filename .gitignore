@@ -3,5 +3,7 @@ __pycache__/
 .env
 *.json
 !prompts/
+!tests/fixtures/**/*.json
 venv/
 .venv/
+.venv

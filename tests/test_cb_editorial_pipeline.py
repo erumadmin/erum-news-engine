@@ -313,7 +313,12 @@ class TestCBRewriteValidate(unittest.TestCase):
     def test_finalize_repairs_cb_prose_defects(self):
         os.environ["CB_PUBLISH_V4"] = "1"
         article = {
-            "body": "기업은 위생용품 용량 축소 시 사전 고지와 공개 의무를 따라야 한다. 공정거래위원회는 세부 고지 기준을 안내했다.",
+            "body": (
+                "기업은 위생용품 용량 축소 시 사전 고지와 공개 의무를 따라야 한다. "
+                "용량·개수 등을 줄일 경우 3개월 이상 먼저 알리고, "
+                "자사 또는 판매처 홈페이지에 1개월 이상 게시해야 한다. "
+                "공정거래위원회는 세부 고지 기준을 안내했다."
+            ),
         }
         packet = {
             "key_facts": ["3개월 이상", "1개월 이상 게시", "한국소비자원 제공"],

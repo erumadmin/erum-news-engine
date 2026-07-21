@@ -550,6 +550,98 @@ def _urls_required_from_packet(packet: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(hosts))
 
 
+NUMERIC_FACT_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])\d+(?:[,.]\d+)?\s*(?:%|퍼센트|년|월|일|명|개|건|곳|회|원|억원|조원|만|㎞|km|MW|GW|kW|MWh|GWh|시간|분|차|단계)?",
+    flags=re.IGNORECASE,
+)
+
+UNSUPPORTED_DETAIL_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("시범 운영", "시범 운영"),
+    ("시범 구축", "시범 구축"),
+    ("시범 사업", "시범 사업"),
+    ("확대 여부", "확대 여부"),
+    ("사업자 선정", "사업자 선정"),
+    ("비용 분담", "비용 분담"),
+    ("투자 비용", "투자 비용"),
+    ("투자 규모", "투자 규모"),
+    ("전기요금", "전기요금"),
+    ("요금 반영", "요금 반영"),
+    ("설치 비용", "설치 비용"),
+    ("사업비", "사업비"),
+    ("일부 발전소", "일부 발전소"),
+    ("전남·북", "전남·북"),
+    ("전남북", "전남북"),
+    ("전남", "전남"),
+    ("전북", "전북"),
+    ("주민", "주민"),
+    ("수혜", "수혜"),
+    ("손실", "손실"),
+    ("투자 위축", "투자 위축"),
+    ("수익 악화", "수익 악화"),
+    ("송전망 증설", "송전망 증설"),
+)
+
+
+def _numeric_fact_keys(text: str) -> set[str]:
+    keys: set[str] = set()
+    for match in NUMERIC_FACT_PATTERN.finditer(text or ""):
+        token = re.sub(r"\s+", "", match.group(0)).replace(",", "")
+        number = re.match(r"\d+(?:\.\d+)?", token)
+        if number:
+            keys.add(number.group(0))
+    return keys
+
+
+def _compact_korean_text(text: str) -> str:
+    return re.sub(r"\s+", "", text or "")
+
+
+def _unsupported_detail_hits(source_text: str, rewritten_text: str) -> list[str]:
+    source_compact = _compact_korean_text(source_text)
+    rewritten_compact = _compact_korean_text(rewritten_text)
+    hits: list[str] = []
+    for label, pattern in UNSUPPORTED_DETAIL_PATTERNS:
+        compact_pattern = _compact_korean_text(pattern)
+        if compact_pattern and compact_pattern in rewritten_compact and compact_pattern not in source_compact:
+            hits.append(label)
+    return hits
+
+
+def validate_source_fidelity(
+    title: str,
+    body: str,
+    article: dict[str, Any] | None = None,
+    *,
+    excerpt: str = "",
+) -> tuple[bool, str]:
+    """Reject rewrite numbers/details that are absent from the source article."""
+    article = article or {}
+    source_published_at = str(article.get("source_published_at") or "")
+    source_text = " ".join(
+        [
+            article.get("title", "") or "",
+            strip_html_tags(article.get("body", "") or ""),
+            article.get("list_text", "") or "",
+            source_published_at,
+        ]
+    )
+    rewritten_text = " ".join(
+        [
+            title or "",
+            excerpt or "",
+            strip_html_tags(body or ""),
+        ]
+    )
+    source_nums = _numeric_fact_keys(source_text)
+    unsupported_nums = sorted(_numeric_fact_keys(rewritten_text) - source_nums)
+    if unsupported_nums:
+        return False, f"원문에 없는 수치 발견({', '.join(unsupported_nums[:5])})"
+    unsupported_details = _unsupported_detail_hits(source_text, rewritten_text)
+    if unsupported_details:
+        return False, f"원문에 없는 구체화 발견({', '.join(unsupported_details[:5])})"
+    return True, "OK"
+
+
 def validate_ij_editorial_rewrite(
     title: str,
     body: str,
@@ -655,6 +747,10 @@ def validate_ij_editorial_rewrite(
         )
         if not ok_lim:
             return False, lim_msg
+
+    ok_fid, fid_msg = validate_source_fidelity(title, body, article)
+    if not ok_fid:
+        return False, fid_msg
 
     return True, "OK"
 

@@ -20,6 +20,13 @@ KOREA_KR_BODY_SELECTORS = (
     ".content",
 )
 
+NEWSWIRE_BODY_SELECTORS = (
+    ".release-body2",
+    ".news-read-column",
+    "section.article_column",
+    ".news-release2",
+)
+
 
 def parse_article_page(html: str, *, page_url: str = "") -> tuple[str, str, str]:
     """HTML -> (title, plain body, raw_html snippet for link discovery)."""
@@ -38,7 +45,10 @@ def parse_article_page(html: str, *, page_url: str = "") -> tuple[str, str, str]
             title = str(og.get("content", "")).strip()
 
     body_node = None
-    for sel in KOREA_KR_BODY_SELECTORS:
+    selectors = KOREA_KR_BODY_SELECTORS
+    if "newswire.co.kr" in (page_url or ""):
+        selectors = NEWSWIRE_BODY_SELECTORS + KOREA_KR_BODY_SELECTORS
+    for sel in selectors:
         body_node = soup.select_one(sel)
         if body_node:
             break

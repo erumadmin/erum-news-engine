@@ -47,7 +47,17 @@ class TestRewriteValidate(unittest.TestCase):
             "risk_flags": ["official_evidence_missing"],
             "action_items": ["한전 안내: https://online.kepco.co.kr"],
         }
-        article = {"body": "다음 달 1일부터 시행한다."}
+        article = {
+            "title": "자영업자 전기요금 개편",
+            "body": (
+                "정부는 다음 달 1일부터 소규모 자영업자 전기요금 부담 완화 제도를 시행한다. "
+                "일반용(갑)Ⅱ 등 대상이다. 그동안 시간대별 요금제로 특정 시간대 사용이 몰리면 "
+                "부담이 커질 수 있다는 우려가 있었다. 기후부와 한전이 요금 구조 개편을 추진한다. "
+                "한전은 고지서에 시간대별·단일 요금을 각각 표기하고 유리한 요금을 자동 적용한다. "
+                "https://online.kepco.co.kr 에서 확인한다. "
+                "다만 6개월 비교 후 12월부터 선택하며 법적 의무화가 아닌 고지 방식이다."
+            ),
+        }
         ok, msg = validate_ij_editorial_rewrite("자영업자 전기요금 개편", body, packet, article)
         self.assertTrue(ok, msg)
 

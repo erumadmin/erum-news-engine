@@ -262,6 +262,9 @@ def publish_sanitize_body(
             cleaned_paras[3] = strip_publish_metadata_leaks(cleaned_paras[3])
 
     body_out = "".join(f"<p>{p}</p>" for p in cleaned_paras[:4]) if cleaned_paras else body
+    from engine.pipeline.html_sanitize import sanitize_article_html
+
+    body_out = sanitize_article_html(body_out)
     footer = list(footer_map.values())
     packet["sources_footer"] = footer
     return body_out, footer

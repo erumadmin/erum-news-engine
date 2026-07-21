@@ -30,11 +30,12 @@ def build_media_plan_for_editorial(
     }
     if target_prefix == "CB_" and assess_cb_article_fit is not None and article is not None:
         force_site = os.environ.get("EDITORIAL_FORCE_SITE", "").strip().upper()
-        if force_site == "CB":
+        gate_site = str((article or {}).get("_source_gate_site") or "").strip().upper()
+        if force_site == "CB" or gate_site == "CB":
             media_plan["CB_"] = {
                 "enabled": True,
-                "mode": "forced",
-                "reason": "forced_site_cb",
+                "mode": "forced" if force_site == "CB" else "source_gate",
+                "reason": "forced_site_cb" if force_site == "CB" else "source_gate_cb",
             }
             return media_plan
         cb_mode, cb_reason = assess_cb_article_fit(article)
