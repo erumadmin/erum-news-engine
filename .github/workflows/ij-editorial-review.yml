@@ -30,8 +30,10 @@ jobs:
         run: python -m pytest tests/ -v --ignore=tests/fixtures -q
       - name: IJ dry-run (REVIEW_ONLY, no site publish)
         env:
-          FIXTURE_URL: https://www.korea.kr/news/policyNewsView.do?newsId=148965108&call_from=rsslink
+          # Avoid live korea.kr fetch from GitHub runners (often blocked).
+          FIXTURE_JSON: tests/fixtures/research/cached_source.json
           REVIEW_ONLY: "1"
+          EDITORIAL_QUALITY_MAX_ATTEMPTS: "2"
         run: python scripts/run_ij_full_pipeline.py --mode dry-run
       - name: Fail job if unit tests failed
         if: steps.unit.outcome == 'failure'
