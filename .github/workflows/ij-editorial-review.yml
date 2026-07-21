@@ -10,9 +10,22 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: "3.12" }
-      - run: pip install -r requirements.txt
-      - run: python -m pytest tests/ -v --ignore=tests/fixtures -q
-      - env:
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+      - name: Unit tests
+        id: unit
+        continue-on-error: true
+        run: python -m pytest tests/ -v --ignore=tests/fixtures -q
+      - name: IJ dry-run (REVIEW_ONLY, no site publish)
+        env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           FIXTURE_URL: https://www.korea.kr/news/policyNewsView.do?newsId=148965108&call_from=rsslink
+          REVIEW_ONLY: "1"
         run: python scripts/run_ij_full_pipeline.py --mode dry-run
+      - name: Fail job if unit tests failed
+        if: steps.unit.outcome == 'failure'
+        run: |
+          echo "Unit tests failed; dry-run still executed above for remote smoke."
+          exit 1
