@@ -3060,9 +3060,11 @@ def process_article(
                         article,
                     )
                 if is_valid and not (ij_editorial or nn_editorial or cb_editorial):
-                    from engine.pipeline.rewrite_validate import validate_source_fidelity
+                    from engine.pipeline.rewrite_validate import (
+                        validate_source_fidelity as validate_pipeline_source_fidelity,
+                    )
 
-                    is_valid, msg = validate_source_fidelity(
+                    is_valid, msg = validate_pipeline_source_fidelity(
                         p.get("title", ""),
                         p.get("body", ""),
                         article,
