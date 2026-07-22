@@ -36,6 +36,7 @@ import pymysql
 from bs4 import BeautifulSoup
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+import nh3
 
 def _load_env_file(path: str) -> None:
     try:
@@ -947,9 +948,11 @@ def is_semantic_duplicate(new_title, existing_titles, threshold=0.9):
 
 def extract_unique_id(url):
     if not url: return ""
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    if "korea.kr" in parsed.netloc and "newsId" in qs:
+        return f"korea.kr{parsed.path}?newsId={qs['newsId'][0]}"
     if "newswire.co.kr" in url:
-        parsed = urlparse(url)
-        qs = parse_qs(parsed.query)
         if 'no' in qs: return f"nw_{qs['no'][0]}"
     return url.replace("https://", "").replace("http://", "").replace("www.", "").strip().rstrip("/")
 
@@ -1050,6 +1053,91 @@ def should_retry_rewrite_validation(message: str) -> bool:
             "원문 확인",
         )
     )
+
+
+NUMERIC_FACT_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])\d+(?:[,.]\d+)?\s*(?:%|퍼센트|년|월|일|명|개|건|곳|회|원|억원|조원|만|㎞|km|MW|GW|kW|MWh|GWh|시간|분|차|단계)?",
+    flags=re.IGNORECASE,
+)
+
+
+def _numeric_fact_keys(text: str) -> set:
+    keys = set()
+    for match in NUMERIC_FACT_PATTERN.finditer(text or ""):
+        token = re.sub(r"\s+", "", match.group(0)).replace(",", "")
+        number = re.match(r"\d+(?:\.\d+)?", token)
+        if number:
+            keys.add(number.group(0))
+    return keys
+
+
+UNSUPPORTED_DETAIL_PATTERNS: Tuple[Tuple[str, str], ...] = (
+    ("시범 운영", "시범 운영"),
+    ("시범 구축", "시범 구축"),
+    ("시범 사업", "시범 사업"),
+    ("확대 여부", "확대 여부"),
+    ("사업자 선정", "사업자 선정"),
+    ("비용 분담", "비용 분담"),
+    ("투자 비용", "투자 비용"),
+    ("투자 규모", "투자 규모"),
+    ("전기요금", "전기요금"),
+    ("요금 반영", "요금 반영"),
+    ("설치 비용", "설치 비용"),
+    ("사업비", "사업비"),
+    ("일부 발전소", "일부 발전소"),
+    ("전남·북", "전남·북"),
+    ("전남북", "전남북"),
+    ("전남", "전남"),
+    ("전북", "전북"),
+    ("주민", "주민"),
+    ("수혜", "수혜"),
+    ("손실", "손실"),
+    ("투자 위축", "투자 위축"),
+    ("수익 악화", "수익 악화"),
+    ("송전망 증설", "송전망 증설"),
+)
+
+
+def _compact_korean_text(text: str) -> str:
+    return re.sub(r"\s+", "", text or "")
+
+
+def _unsupported_detail_hits(source_text: str, rewritten_text: str) -> List[str]:
+    source_compact = _compact_korean_text(source_text)
+    rewritten_compact = _compact_korean_text(rewritten_text)
+    hits: List[str] = []
+    for label, pattern in UNSUPPORTED_DETAIL_PATTERNS:
+        compact_pattern = _compact_korean_text(pattern)
+        if compact_pattern and compact_pattern in rewritten_compact and compact_pattern not in source_compact:
+            hits.append(label)
+    return hits
+
+
+def validate_source_fidelity(parsed: dict, source_article: dict) -> Tuple[bool, str]:
+    source_published_at = to_kst_iso(source_article.get("source_published_at")) or ""
+    source_text = " ".join(
+        [
+            source_article.get("title", ""),
+            strip_html_tags(source_article.get("body", "")),
+            source_article.get("list_text", ""),
+            source_published_at,
+        ]
+    )
+    rewritten_text = " ".join(
+        [
+            parsed.get("title", ""),
+            parsed.get("excerpt", ""),
+            strip_html_tags(parsed.get("body", "")),
+        ]
+    )
+    source_nums = _numeric_fact_keys(source_text)
+    unsupported_nums = sorted(_numeric_fact_keys(rewritten_text) - source_nums)
+    if unsupported_nums:
+        return False, f"원문에 없는 수치 발견({', '.join(unsupported_nums[:5])})"
+    unsupported_details = _unsupported_detail_hits(source_text, rewritten_text)
+    if unsupported_details:
+        return False, f"원문에 없는 구체화 발견({', '.join(unsupported_details[:5])})"
+    return True, "OK"
 
 CB_DIRECT_KEYWORDS: Tuple[str, ...] = (
     "과징금", "가산세", "감면", "지원금", "보조금", "수출바우처", "바우처", "수의계약",
@@ -1263,6 +1351,12 @@ def limit_rewritten_body_text(text: str, max_chars: int = SOFT_REWRITTEN_BODY_CH
         return _trim_to_sentence_boundary(text, max_chars)
     return "\n".join(kept_lines).strip()
 
+ALLOWED_TAGS = {"p", "strong", "em", "br", "h3", "h4", "a", "ul", "ol", "li", "img", "blockquote"}
+ALLOWED_ATTRS = {
+    "a": {"href", "title", "rel"},
+    "img": {"src", "alt", "caption"},
+}
+
 def clean_body_html(text):
     if not text: return ""
     text = text.replace("본문:", "").replace("본문 :", "").replace("내용:", "").replace("내용 :", "")
@@ -1446,6 +1540,18 @@ def load_review_articles_from_targets(target_ids: List[str]) -> List[dict]:
             print(f"   ⚠️ [리뷰 원문] 직접 fetch 실패: {url_id} (HTTP {getattr(resp, 'status_code', 'none')})")
             continue
         resp.encoding = "utf-8"
+        if "korea.kr" in source_url:
+            article = _fetch_korea_detail({
+                "url": source_url,
+                "url_id": extract_unique_id(source_url),
+                "title": db_title or url_id,
+                "list_text": "",
+                "department": "",
+                "source_published_at": db_source_published_at,
+            }, "정책브리핑-직접")
+            if article:
+                articles.append(article)
+                continue
         soup = BeautifulSoup(resp.text, "html.parser")
         title = ""
         h1 = soup.select_one("h1")
@@ -2412,6 +2518,73 @@ def collect_articles(ex_ids: set, ex_titles: set, blocked_ids: set, limit: int, 
                 print(f" 오류({err})")
         return got
 
+    def fetch_korea_web_sources(lim):
+        if lim <= 0 or not KOREA_CRAWLER_ENABLED:
+            return 0
+        source_keys = list(KOREA_CRAWLER_SOURCES)
+        if KOREA_POLICY_NEWS_ENABLED and "policy" not in source_keys:
+            source_keys.append("policy")
+        got = 0
+        for source_key in source_keys:
+            if got >= lim:
+                break
+            source_cfg = KOREA_POLICY_SOURCES.get(source_key)
+            if not source_cfg:
+                continue
+            source_name = source_cfg["name"]
+            print(f"      🕸️ [{source_name}] 웹 목록 스캔 중 (목표: {lim - got}건)...", end="", flush=True)
+            before = got
+            seen_items: set = set()
+            try:
+                for page in range(1, KOREA_CRAWLER_MAX_PAGES + 1):
+                    if got >= lim:
+                        break
+                    resp = None
+                    page_base_url = source_cfg["url"]
+                    for candidate_base_url in [source_cfg["url"]] + source_cfg.get("fallback_urls", []):
+                        page_url = _korea_page_url(candidate_base_url, page)
+                        resp = fetch_with_retry(page_url, timeout=KOREA_CRAWLER_TIMEOUT)
+                        if resp and resp.status_code == 200:
+                            page_base_url = candidate_base_url
+                            break
+                        print(f" 목록 오류({urlparse(candidate_base_url).netloc}: HTTP {getattr(resp, 'status_code', 'none')})", end="")
+                    if not resp or resp.status_code != 200:
+                        continue
+                    resp.encoding = "utf-8"
+                    items = _extract_korea_list_items(resp.text, page_base_url, source_key)
+                    stats["feed_entries"] += len(items)
+                    for item in items:
+                        if got >= lim:
+                            break
+                        if item["url_id"] in seen_items:
+                            continue
+                        seen_items.add(item["url_id"])
+                        if not review_mode and item["url_id"] in ex_ids:
+                            stats["skipped_existing_id"] += 1
+                            continue
+                        if TARGET_URL_IDS and item["url_id"] not in TARGET_URL_IDS:
+                            stats["skipped_target_filter"] += 1
+                            continue
+                        if not item.get("source_published_at"):
+                            item["source_published_at"] = _extract_first_date(item.get("list_text", ""))
+                        force_target = bool(TARGET_URL_IDS and item["url_id"] in TARGET_URL_IDS)
+                        if item.get("source_published_at") and not force_target:
+                            article_date = item["source_published_at"].date()
+                            if RETRY_DAYS > 0:
+                                if article_date < today - timedelta(days=RETRY_DAYS) or article_date > today:
+                                    stats["skipped_out_of_range"] += 1
+                                    continue
+                            elif article_date != today:
+                                stats["skipped_out_of_range"] += 1
+                                continue
+                        article = _fetch_korea_detail(item, source_name)
+                        if article and keep_article(article, is_newswire=False):
+                            got += 1
+                print(f" {got - before}건 확보")
+            except Exception as err:
+                print(f" 오류({err})")
+        return got
+
     def fetch_policy_feeds(lim):
         got = 0
         for feed_url in RSS_FEEDS[:-1]:
@@ -2895,6 +3068,8 @@ def process_article(
                         article,
                         excerpt=p.get("excerpt", ""),
                     )
+                if is_valid:
+                    is_valid, msg = validate_source_fidelity(p, article)
                 if is_valid:
                     break
                 if (
