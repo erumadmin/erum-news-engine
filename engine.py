@@ -352,6 +352,7 @@ CANONICAL_CATEGORY_SLUGS = {
 }
 
 CATEGORY_ALIASES = {
+    # Canonical Korean + English slugs
     "정치": "정치",
     "politics": "정치",
     "사회": "사회",
@@ -368,6 +369,59 @@ CATEGORY_ALIASES = {
     "international": "국제",
     "환경": "환경",
     "environment": "환경",
+    # Near-miss Korean / English labels (LLM often invents these)
+    # korea.kr policy/admin briefing → 정치 (not 사회)
+    "정책": "정치",
+    "행정": "정치",
+    "정부": "정치",
+    "국회": "정치",
+    "법안": "정치",
+    "여야": "정치",
+    "대선": "정치",
+    "총선": "정치",
+    "policy": "정치",
+    "government": "정치",
+    "복지": "사회",
+    "교육": "사회",
+    "의료": "사회",
+    "보건": "사회",
+    "노동": "사회",
+    "안전": "사회",
+    "welfare": "사회",
+    "education": "사회",
+    "산업": "경제",
+    "금융": "경제",
+    "재계": "경제",
+    "부동산": "경제",
+    "증시": "경제",
+    "무역": "경제",
+    "business": "경제",
+    "finance": "경제",
+    "industry": "경제",
+    "과학": "IT/과학",
+    "기술": "IT/과학",
+    "테크": "IT/과학",
+    "tech": "IT/과학",
+    "technology": "IT/과학",
+    "science": "IT/과학",
+    "ai": "IT/과학",
+    "it": "IT/과학",
+    "문화": "문화/생활",
+    "생활": "문화/생활",
+    "연예": "문화/생활",
+    "culture": "문화/생활",
+    "lifestyle": "문화/생활",
+    "외교": "국제",
+    "세계": "국제",
+    "해외": "국제",
+    "global": "국제",
+    "world": "국제",
+    "foreign": "국제",
+    "기후": "환경",
+    "탄소": "환경",
+    "esg": "환경",
+    "eco": "환경",
+    "climate": "환경",
 }
 
 
@@ -377,6 +431,19 @@ def normalize_category_name(name: Optional[str]) -> str:
         return DEFAULT_CATEGORY
     key = raw.lower().replace(" ", "")
     return CATEGORY_ALIASES.get(key, raw)
+
+
+def infer_category_from_keywords(title: Optional[str], body: Optional[str]) -> Optional[str]:
+    """Score KEYWORD_CATEGORIES_FALLBACK hits in title+body; return best category or None."""
+    text = f"{title or ''} {body or ''}".lower()
+    best_cat: Optional[str] = None
+    best_score = 0
+    for cat, keywords in KEYWORD_CATEGORIES_FALLBACK.items():
+        score = sum(1 for kw in keywords if kw.lower() in text)
+        if score > best_score:
+            best_score = score
+            best_cat = cat
+    return best_cat if best_score > 0 else None
 
 
 def get_canonical_category_pair(name: Optional[str]) -> Tuple[str, str]:
@@ -1480,14 +1547,20 @@ def parse_llm_response(text):
 
 def get_hybrid_meta(title, body, ai_cat, ai_tags):
     valid = KEYWORD_CATEGORIES_FALLBACK.keys()
-    cat = normalize_category_name(ai_cat.replace('[', '').replace(']', '').strip())
+    raw = (ai_cat or "").replace("[", "").replace("]", "").strip()
+    # Empty LLM category: skip normalize→DEFAULT so keyword fallback can run first.
+    cat = normalize_category_name(raw) if raw else ""
     if cat not in valid:
-        cat = DEFAULT_CATEGORY
+        inferred = infer_category_from_keywords(title, body)
+        cat = inferred if inferred in valid else DEFAULT_CATEGORY
     tags = ai_tags
     if not tags:
+        tags = []
         all_kw = {k for v in KEYWORD_CATEGORIES_FALLBACK.values() for k in v}
+        title_l = (title or "").lower()
+        body_l = (body or "").lower()
         for k in sorted(list(all_kw), key=len, reverse=True):
-            if k in title.lower() or k in body.lower():
+            if k in title_l or k in body_l:
                 tags.append(k)
             if len(tags) >= 5:
                 break
