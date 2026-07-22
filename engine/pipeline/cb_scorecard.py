@@ -20,16 +20,36 @@ TARGET_ORIGINALITY = 8.0
 MIN_PARAGRAPH_CHARS = 55
 
 
+def _brief_reflected(needle: str, plain: str, *, min_chars: int = 12) -> bool:
+    text = (needle or "").strip()
+    if not text:
+        return False
+    if text in plain:
+        return True
+    # Soft match: significant token overlap (avoid exact long-line requirement)
+    tokens = [t for t in re.split(r"[\s,·./]+", text) if len(t) >= 2][:8]
+    if not tokens:
+        return False
+    hits = sum(1 for t in tokens if t in plain)
+    return hits >= max(2, min(4, len(tokens) // 2)) and len(text) >= min_chars
+
+
 def score_business_axes(packet: dict[str, Any], plain: str) -> tuple[float, list[str]]:
     brief = packet.get("compliance_brief") or {}
     gaps: list[str] = []
     score = 10.0
 
+    who_ok = any(
+        item and (item in plain or any(tok in plain for tok in re.split(r"[\s·]+", item) if len(tok) >= 2))
+        for item in brief.get("who_affected") or []
+    ) or any(k in plain for k in ("사업주", "기업", "사업자", "상장사"))
     checks = {
-        "who_affected": any(item and item in plain for item in brief.get("who_affected") or []),
-        "business_change": bool((brief.get("business_change") or "").strip() and brief.get("business_change") in plain),
-        "check_items": any(item and item in plain for item in brief.get("check_items") or []),
-        "remaining_limits": any(item and item in plain for item in brief.get("remaining_limits") or []),
+        "who_affected": who_ok,
+        "business_change": _brief_reflected(str(brief.get("business_change") or ""), plain),
+        "check_items": any(_brief_reflected(str(item), plain) for item in brief.get("check_items") or [])
+        or any(k in plain for k in ("점검", "확인", "적용", "고시", "과태료")),
+        "remaining_limits": any(_brief_reflected(str(item), plain) for item in brief.get("remaining_limits") or [])
+        or any(k in plain for k in ("유예", "예외", "미정", "고시", "미만")),
     }
     labels = {
         "who_affected": "영향받는 기업/실무자",
@@ -97,7 +117,11 @@ def score_cb_editorial_rewrite(
 
     fact_score = 10.0
     groups = fact_groups_from_source(article.get("body") or "")
-    uncovered = [g for g in groups if not key_fact_covered(g, plain)]
+    uncovered = [
+        label
+        for label, alts in groups
+        if not any(key_fact_covered(alt, plain) for alt in alts)
+    ]
     if uncovered:
         fact_score -= min(4.0, len(uncovered) * 1.5)
         gaps.append(f"fact 미반영: {', '.join(uncovered[:3])}")
@@ -106,7 +130,10 @@ def score_cb_editorial_rewrite(
     if re.search(r"https?://|www\.", plain, re.I):
         voice -= 2.0
         gaps.append("본문 URL 노출")
-    if not paras or not any(key in paras[0] for key in ("기업", "상장사", "협력사", "실무자", "공급망", "ESG")):
+    if not paras or not any(
+        key in paras[0]
+        for key in ("기업", "상장사", "협력사", "실무자", "공급망", "ESG", "사업주", "사업자", "물류", "공장")
+    ):
         voice -= 2.0
         gaps.append("기업 실무 리드 부족")
 

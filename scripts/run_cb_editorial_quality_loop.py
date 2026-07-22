@@ -107,8 +107,12 @@ def main() -> int:
         }
         cached_img = os.environ.get(
             "FIXTURE_CACHED_IMAGE",
-            str(ROOT / "review_outputs" / "featured_20260605_091959.jpg"),
+            str(ROOT / "review_outputs" / "live_source_featured.jpg"),
         )
+        if not Path(cached_img).is_file():
+            alt = ROOT / "review_outputs" / "featured_20260605_091959.jpg"
+            if alt.is_file():
+                cached_img = str(alt)
         if Path(cached_img).is_file():
             _inject_cached_image(article, Path(cached_img))
         from engine.pipeline.fixture_fetcher import target_fixture_fetcher
@@ -134,7 +138,7 @@ def main() -> int:
         }
         cached_img = os.environ.get(
             "FIXTURE_CACHED_IMAGE",
-            str(ROOT / "review_outputs" / "featured_20260605_091959.jpg"),
+            str(ROOT / "review_outputs" / "live_source_featured.jpg"),
         )
         if Path(cached_img).is_file():
             _inject_cached_image(article, Path(cached_img))
@@ -184,14 +188,18 @@ def main() -> int:
             continue
 
         body_html = normalize_ij_body_html(variant.get("body", ""))
+        from engine.pipeline.cb_rewrite_validate import finalize_cb_title
+
+        variant_title = finalize_cb_title(variant.get("title", ""), article)
+        variant = {**variant, "title": variant_title}
         ok_val, val_msg = validate_cb_editorial_rewrite(
-            variant.get("title", ""),
+            variant_title,
             body_html,
             editorial_ctx.packet,
             article,
         )
         score = score_cb_editorial_rewrite(
-            variant.get("title", ""),
+            variant_title,
             variant.get("excerpt", ""),
             body_html,
             article,

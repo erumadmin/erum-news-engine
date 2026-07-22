@@ -60,8 +60,30 @@ class TestNNCommunityBrief(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("기관명", msg)
 
+    def test_validate_lead_rejects_hospital_일수록_subject(self):
+        ok, msg = validate_nn_lead(
+            [
+                "중증 환자와 소아 중환자를 많이 진료하는 상급종합병원일수록 더 많은 보상금을 받게 된다. "
+                "올해 하반기다."
+            ]
+        )
+        self.assertFalse(ok)
+        self.assertIn("공급자", msg)
+
+    def test_validate_lead_rejects_mohw_subject(self):
+        ok, msg = validate_nn_lead(
+            ["보건복지부는 중환자실 부하지수를 올해 하반기 도입한다. 환자 가족은 영향을 본다."]
+        )
+        self.assertFalse(ok)
+
     def test_validate_lead_accepts_person_subject(self):
         ok, _ = validate_nn_lead(["청년 창업자는 국공유재산 사용료 부담이 줄어든다. 2026년부터 적용된다."])
+        self.assertTrue(ok)
+
+    def test_validate_lead_accepts_patient_family_subject(self):
+        ok, _ = validate_nn_lead(
+            ["중증 환자 가족은 상급종합병원 중환자실 성과보상 체계가 바뀌면 진료 여건 변화를 체감할 수 있다."]
+        )
         self.assertTrue(ok)
 
     def test_forbidden_phrases(self):
@@ -192,7 +214,52 @@ class TestNNRewriteValidate(unittest.TestCase):
             "<p>다만 세부 적용 범위와 시행 일정, 예외 조건은 추가 공지에 따라 달라질 수 있다.</p>"
         )
         fixed = finalize_nn_editorial_body(body, packet, article)
-        self.assertIn("다음 달 공고", fixed)
+        from engine.pipeline.rewrite_validate import MIN_PARAGRAPH_CHARS, _paragraph_plain_blocks
+
+        paras = _paragraph_plain_blocks(fixed)
+        self.assertGreaterEqual(len(paras), 4)
+        self.assertTrue(
+            all(len(p) >= MIN_PARAGRAPH_CHARS for p in paras[:4]),
+            fixed,
+        )
+        os.environ.pop("NN_PUBLISH_V4", None)
+
+    def test_finalize_collapses_double_danman(self):
+        os.environ["NN_PUBLISH_V4"] = "1"
+        article = {
+            "body": (
+                "법령 유권해석으로 야구장 조리식품 이동판매를 허용하기로 했다. "
+                "배달앱 포장 제공 시 건강진단 제외."
+            )
+        }
+        packet = {
+            "main_claim": "야구장 관람객은 조리식품 이동판매를 이용할 수 있다",
+            "who_is_affected": ["야구장 관람객"],
+            "conditions": ["배달앱 포장 제공 시 건강진단 제외"],
+            "key_facts": ["건강진단 연 1회"],
+            "community_brief": {
+                "who_affected": ["야구장 관람객"],
+                "life_change": "관람석 조리식품 이동판매 허용",
+                "conditions": ["배달앱 포장 제공 시 건강진단 제외"],
+            },
+            "reader_utility": {},
+        }
+        body = (
+            "<p>야구장 관람객은 관람석에서 맥주 외 조리식품 이동판매가 허용되기로 했다. "
+            "체육시설 전반이 대상이다.</p>"
+            "<p>지금까지 국내에서는 맥주 외 조리식품 이동판매 가능 여부가 불분명했다. "
+            "유권해석으로 허용하기로 했다.</p>"
+            "<p>관람객은 식품용 용기와 운반 박스 위생을 보면 된다. "
+            "이동판매자는 연 1회 건강진단을 받아야 한다.</p>"
+            "<p>다만 다만, 배달앱을 통해 포장되어 제공하는 경우 건강진단 제외. "
+            "설사·복통이 있으면 판매 업무에서 배제된다.</p>"
+        )
+        fixed = finalize_nn_editorial_body(body, packet, article)
+        from engine.pipeline.rewrite_validate import _paragraph_plain_blocks
+
+        p4 = _paragraph_plain_blocks(fixed)[3]
+        self.assertTrue(p4.startswith("다만"), p4)
+        self.assertNotRegex(p4, r"다만\s*,?\s*다만")
         os.environ.pop("NN_PUBLISH_V4", None)
 
 

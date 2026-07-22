@@ -22,8 +22,10 @@ from engine.pipeline.rewrite_validate import (
     LIMITATION_MARKERS,
     REPEAT_POLICY_TERMS,
     REPEAT_WATCH_PHRASES,
+    _is_thin_source,
     _paragraph_plain_blocks,
     _urls_required_from_packet,
+    collect_source_fidelity_gaps,
     flatten_nested_paragraph_tags,
     temporal_hint_from_source,
 )
@@ -75,14 +77,35 @@ def score_editorial_rewrite(
         structure -= min(2.0, 0.5 * len(short))
         gaps.append(f"짧은 문단: {short}")
     if len(paras) >= 4:
-        from engine.pipeline.ij_paragraph_roles import BG_PARA2_KEYS, MECH_PARA3_KEYS
+        from engine.pipeline.ij_paragraph_roles import BG_PARA2_KEYS, MECH_STRUCTURE_KEYS
 
-        if not any(k in paras[1] for k in BG_PARA2_KEYS):
+        mech_in_2 = any(k in paras[1] for k in MECH_STRUCTURE_KEYS)
+        mech_in_3 = any(k in paras[2] for k in MECH_STRUCTURE_KEYS)
+        para2_has_bg = any(k in paras[1] for k in BG_PARA2_KEYS)
+        if not mech_in_2 and not para2_has_bg:
             structure -= 1.5
             gaps.append("2문단 배경·문제 약함")
-        if not any(k in paras[2] for k in MECH_PARA3_KEYS):
+        elif para2_has_bg and not mech_in_2 and _is_thin_source(article or {}, packet):
+            allow_blob = " ".join(
+                [
+                    source_body,
+                    " ".join(str(x) for x in (packet.get("key_facts") or [])),
+                    str(packet.get("main_claim") or ""),
+                ]
+            )
+            invented_bg = any(
+                term in paras[1]
+                for term in ("슈링크플레이션", "인플레이션", "물가 급등", "물가급등")
+            ) and not any(
+                term in allow_blob
+                for term in ("슈링크플레이션", "인플레이션", "물가 급등", "물가급등")
+            )
+            if invented_bg:
+                structure -= 1.5
+                gaps.append("2문단 근거 없는 배경")
+        if not (mech_in_2 or mech_in_3):
             structure -= 1.5
-            gaps.append("3문단 작동 방식 약함")
+            gaps.append("해법 문단 작동 구조 약함")
         if not paras[3].strip().startswith("다만") and not any(
             m in paras[3] for m in LIMITATION_MARKERS
         ):
@@ -108,6 +131,12 @@ def score_editorial_rewrite(
         if covered < min(3, len(kf)):
             facts -= 1.5
             gaps.append("key_facts 반영 부족")
+    fidelity_gaps = collect_source_fidelity_gaps(
+        title, body_norm, article, excerpt=excerpt or "", packet=packet
+    )
+    if fidelity_gaps:
+        facts -= min(3.0, 1.0 * len(fidelity_gaps))
+        gaps.extend(f"fidelity: {g}" for g in fidelity_gaps)
     facts = max(0.0, facts)
 
     # --- utility (0–10) ---
@@ -222,6 +251,8 @@ def score_editorial_rewrite(
             + qa_dim * 0.10
         )
     total = round(min(10.0, total), 2)
+    fidelity_ok = not fidelity_gaps
+    form_score = total
 
     passes_score = (
         total >= TARGET_SCORE
@@ -247,6 +278,7 @@ def score_editorial_rewrite(
                 and coalition_dim >= TARGET_COALITION_BRIEFING
                 and not (packet.get("research_gate") or {}).get("research_insufficient")
             )
+    passes_score = bool(passes_score and fidelity_ok)
 
     dims = {
         "structure": round(structure, 2),
@@ -269,6 +301,9 @@ def score_editorial_rewrite(
     result = {
         "publish_body": body_norm if is_publish_v4_enabled() else body,
         "total": total,
+        "form_score": form_score,
+        "fidelity_ok": fidelity_ok,
+        "fidelity_gaps": list(fidelity_gaps),
         "target": TARGET_SCORE,
         "target_reader_value": TARGET_READER_VALUE,
         "target_originality": TARGET_ORIGINALITY,

@@ -64,13 +64,37 @@ MECH_PARA3_KEYS = (
     "http",
 )
 
+# Desk North Star / Hard-Fail H1 — 해법 작동 구조 단서 (2문단 우선, 3문단도 허용)
+MECH_STRUCTURE_KEYS = MECH_PARA3_KEYS + (
+    "기준",
+    "산식",
+    "지수",
+    "보상",
+    "차등",
+    "도입",
+    "연계",
+    "산정",
+    "지표",
+    "등급",
+    "산출",
+    "배분",
+    "가중",
+    "반영",
+    "운영",
+    "체계",
+    "방식",
+    "단계",
+    "요건",
+    "조건",
+)
+
 
 def para_scores_background(para: str) -> int:
     return sum(1 for k in BG_PARA2_KEYS if k in para)
 
 
 def para_scores_mechanism(para: str) -> int:
-    return sum(1 for k in MECH_PARA3_KEYS if k in para)
+    return sum(1 for k in MECH_STRUCTURE_KEYS if k in para)
 
 
 def paragraphs_roles_swapped(paras: list[str]) -> bool:
@@ -83,9 +107,9 @@ def paragraphs_roles_swapped(paras: list[str]) -> bool:
 
 
 def reorder_paragraph_roles_paras(paras: list[str]) -> list[str]:
-    """Swap para 2↔3 when background/mechanism roles are inverted."""
-    if len(paras) < 4 or not paragraphs_roles_swapped(paras):
-        return paras
-    out = list(paras[:4])
-    out[1], out[2] = out[2], out[1]
-    return out
+    """Legacy helper: previously swapped 2↔3 when mech sat in para2.
+
+    Desk North Star (v10) puts 해법 작동 in para2, so swapping that shape is harmful.
+    Keep identity; do not reorder.
+    """
+    return paras

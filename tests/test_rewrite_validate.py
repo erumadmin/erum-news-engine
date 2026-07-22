@@ -12,6 +12,9 @@ from engine.pipeline.rewrite_validate import (
     DEFAULT_LIMITATION_SENTENCE,
     build_rewrite_correction_suffix,
     cap_watch_phrase_repetition,
+    ensure_danman_prefix,
+    normalize_danman_opener,
+    sanitize_editorial_limitation_paragraph,
     temporal_hint_from_source,
     validate_ij_editorial_rewrite,
     validate_limitation_paragraph,
@@ -19,6 +22,39 @@ from engine.pipeline.rewrite_validate import (
 
 
 class TestRewriteValidate(unittest.TestCase):
+    def test_normalize_danman_opener_collapses_repeats(self):
+        self.assertEqual(
+            normalize_danman_opener("다만 다만, 배달앱 포장은 건강진단 제외다."),
+            "다만 배달앱 포장은 건강진단 제외다.",
+        )
+        self.assertEqual(
+            normalize_danman_opener("다만, 다만 제외 대상이 있다."),
+            "다만 제외 대상이 있다.",
+        )
+        self.assertEqual(
+            ensure_danman_prefix("다만, 배달앱 제외다."),
+            "다만 배달앱 제외다.",
+        )
+        self.assertEqual(
+            ensure_danman_prefix("배달앱 제외다."),
+            "다만 배달앱 제외다.",
+        )
+
+    def test_sanitize_limitation_collapses_double_danman(self):
+        fixed = sanitize_editorial_limitation_paragraph(
+            "다만 다만, 배달앱을 통해 포장 제공 시 건강진단 제외. 예외 범위를 확인한다."
+        )
+        self.assertTrue(fixed.startswith("다만"))
+        self.assertNotRegex(fixed, r"다만\s*,?\s*다만")
+        self.assertIn("배달앱", fixed)
+
+    def test_validate_limitation_rejects_double_danman(self):
+        ok, msg = validate_limitation_paragraph(
+            "다만 다만, 제외 대상이 있다. 예외 범위를 유의해야 한다."
+        )
+        self.assertFalse(ok)
+        self.assertIn("다만", msg)
+
     def test_temporal_hint_next_month(self):
         self.assertEqual(
             temporal_hint_from_source("다음 달 1일부터 시행한다."),

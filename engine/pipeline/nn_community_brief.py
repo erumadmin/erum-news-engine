@@ -19,11 +19,24 @@ INSTITUTION_LEAD_MARKERS = (
     "협회는",
     "인사혁신처",
     "인사처",
-    "발표했다",
-    "밝혔다",
-    "공개했다",
+    "보건복지부가",
+    "보건복지부는",
+    "복지부가",
+    "복지부는",
+    "국토교통부가",
+    "국토교통부는",
+    "상급종합병원이",
+    "상급종합병원은",
+    "병원이",
+    "병원은",
 )
 
+# Hard-Fail H1: first sentence subject = agency / provider (not life reader)
+_NN_PROVIDER_SUBJECT_RE = re.compile(
+    r"^(?:[\w·]{0,24})?(보건복지부|복지부|국토교통부|정부|서울시|상급종합병원|병원|부처|"
+    r"위원회|규제합리화위원회|식품의약품안전처|안전처|혁신처)"
+    r"(가|는|이|은)\s"
+)
 NN_FORBIDDEN_PHRASES = (
     "도모",
     "제고",
@@ -204,9 +217,17 @@ def validate_nn_lead(paras: list[str]) -> tuple[bool, str]:
     lead = paras[0].strip()
     if len(lead) < 20:
         return False, "1문단 너무 짧음"
+    first = re.split(r"[.。]", lead, maxsplit=1)[0].strip()
     for marker in INSTITUTION_LEAD_MARKERS:
-        if lead.startswith(marker):
+        if lead.startswith(marker) or first.startswith(marker):
             return False, f"기관명 리드 ({marker})"
+    if re.search(r"(위원회|안전처|혁신처)(는|가)\s", first):
+        return False, "기관명 리드 (위원회·처)"
+    if _NN_PROVIDER_SUBJECT_RE.match(lead) or _NN_PROVIDER_SUBJECT_RE.match(first):
+        return False, "기관·공급자 리드"
+    # 「…상급종합병원일수록」= 공급자 비교 주어 → NN Hard-Fail H1
+    if re.search(r"상급종합병원(이|은|일수록)|(?<!상급종합)병원(이|은)\s", first):
+        return False, "기관·공급자 리드"
     return True, "OK"
 
 

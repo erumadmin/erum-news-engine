@@ -13,6 +13,7 @@ from engine.pipeline.packet_writer import (
     _format_action_items_block,
     _format_evidence_block,
     _format_required_facts_block,
+    slim_packet_for_rewrite,
 )
 from engine.pipeline.reader_utility import format_reader_utility_block
 from engine.pipeline.rewrite_validate import temporal_hint_from_source
@@ -22,16 +23,18 @@ CB_PUBLISH_V4_APPEND = """
 
 [CSR 브리핑 v4 - 본문 규칙]
 - 본문에 URL·전화번호(☎)를 직접 쓰지 않는다.
-- 1문단은 기업·기관 실무 영향으로 시작한다.
-- 3문단에는 확인 절차·적용 범위·일정·예외 중 최소 하나를 넣는다.
-- 4번째 <p>는 반드시 「다만」으로 시작하고 유예·한계·예외만 쓴다.
+- 1문단: **사업주·기업 의무/비용**으로 시작. 「국토부가/정부가 발표했다」 금지.
+- 2문단: 배경은 짧게. 해법·기준이 보이면 의무·기준을 우선.
+- 3문단: 일정·적용 범위·과태료·조달·계약·유예 중 **최소 둘**.
+- 4문단: 「다만」+ 유예·예외·미확정만 (비전·ESG 수사 금지).
 """
 
-CB_REWRITE_TEMPLATE = """당신은 **CSR 브리핑** 기자다. 기업 ESG, 공시, 대외협력, 공급망 실무자가 바로 읽고 판단할 수 있는 기사만 쓴다.
+CB_REWRITE_TEMPLATE = """당신은 **CSR 브리핑** 기자다. 기업이 당장 확인할 **의무·비용·일정**만 쓴다. ESG 수사·정책 평가 금지.
 
-- [수집 원문]이 1차 근거다. [리서치 패킷]과 [compliance_brief]는 구조화 보조다.
-- 세 곳 어디에도 없는 일정, 의무, 비용, 예외를 만들지 않는다.
-- 원문 순서 복사 금지. **기업 영향 → 배경 → 확인할 실무 항목 → 남은 제한** 순으로 재배열한다.
+- [수집 원문]이 1차 근거. 패킷은 보조.
+- 원문에 없는 과태료 금액·매출·관련주 추정 금지.
+- 원문에 「의무화」가 없으면 **의무화라고 쓰지 않는다.** 「맞춰야 한다·시정명령·과태료」만 사용.
+- 원문 순서 복사 금지. **의무·비용 → 배경 짧게 → 일정·범위·예외 → 다만** 순.
 
 [수집 원문]
 제목: {source_title}
@@ -41,7 +44,7 @@ URL: {source_url}
 본문:
 {original_text}
 
-[리서치 패킷]
+[리서치 패킷 — 사실만]
 {packet_json}
 
 [기업 실무 브리프 - compliance_brief]
@@ -65,12 +68,12 @@ URL: {source_url}
 편집 힌트: publish_grade={publish_grade} | risk_flags={risk_flags}
 시점: effective_date={effective_date} | why_now={why_now} | 통일 표기={temporal_hint}
 
-작성 체크리스트 (CSR 브리핑):
-- 1문단: 기업·기관 실무자에게 무엇이 바뀌는지
-- 2문단: 규제·배경·왜 중요한지
-- 3문단: 일정, 적용 범위, 제출·점검·확인 항목
-- 4문단: 「다만」+ 유예, 예외, 미확정 요소
-- 공급망, 공시, 규제, 예외, 제출, 점검 중 최소 3개 축이 본문에 드러날 것
+작성 체크리스트 (CSR 브리핑 / desk):
+- 1문단: 사업주·기업이 **무엇을 맞춰야/얼마·어떤 비용·리스크**인지. 기관 발표 리드 금지.
+- 2문단: 왜 바뀌는지 1~2문장만.
+- 3문단: 시행·대상·과태료·시정명령·조달·계약·유예 중 원문에 있는 축.
+- 4문단: 「다만」+ 유예·규모 미만·고시 미정 등 실질 한계.
+- 의무·비용·일정·예외 중 **최소 3축**이 본문에 보일 것.
 
 본문 650~1000자, HTML <p> 정확히 4개. JSON 금지.
 제목:
@@ -99,14 +102,21 @@ PHOTO_CAPTION_MARKERS = (
 GENERIC_WHO = {"기업", "기관", "중소벤처", "사업자"}
 BUSINESS_CHANGE_KEYS = ("완화", "지원", "보조금", "투자", "유턴", "복귀", "인정", "요건", "시행")
 BUSINESS_CHANGE_STRONG_KEYS = ("완화", "개편", "인정기준", "보조금", "지원체계", "투자")
-CHECK_ITEM_KEYS = ("확인", "점검", "적용", "요건", "보조금", "법령", "시행", "일정", "범위", "지원")
-LIMIT_KEYS = ("예정", "내년", "올해", "한도", "조건", "범위", "유예", "예외", "현행")
-ANNOUNCE_LEAD_RE = re.compile(r"^(정부|산업통상부|중기부|환경부|고용부|국토부|금융위|공정위|관계부처).{0,40}(발표|밝혔|회의)")
+OBLIGATION_CHANGE_KEYS = ("알려야", "공개", "고지", "게시", "제공해야", "맞춰야", "준수", "의무", "과태료")
+BACKGROUND_CHANGE_MARKERS = ("상황에서", "위해 추진", "취지다", "배경이다", "혼란을 줄이고")
+CHECK_ITEM_KEYS = ("확인", "점검", "적용", "요건", "보조금", "법령", "시행", "일정", "범위", "지원", "제공", "게시")
+LIMIT_KEYS = ("예정", "내년", "올해", "한도", "조건", "범위", "유예", "예외", "현행", "개월 이상")
+ANNOUNCE_LEAD_RE = re.compile(
+    r"^(정부|산업통상부|중기부|환경부|고용부|국토부|국토교통부|금융위|공정위|관계부처|"
+    r"보건복지부|복지부).{0,40}(발표|밝혔|회의)"
+)
 
 
 def _is_noisy_business_line(text: str) -> bool:
     t = (text or "").strip()
     if len(t) < 12:
+        return True
+    if re.search(r"https?://|www\.", t, re.I):
         return True
     return any(marker in t for marker in PHOTO_CAPTION_MARKERS)
 
@@ -134,33 +144,60 @@ def _candidate_business_lines(packet: dict[str, Any]) -> list[str]:
 
 def _pick_who_affected(packet: dict[str, Any]) -> list[str]:
     who = [str(item).strip() for item in packet.get("who_is_affected") or [] if str(item).strip()]
-    refined = [item for item in who if item not in GENERIC_WHO]
-    if refined:
-        return refined[:3]
+    enterprise = [
+        item
+        for item in who
+        if item in ("기업", "사업주", "사업자", "상장사") or "기업" in item or "사업" in item
+    ]
+    specific_enterprise = [item for item in enterprise if item not in GENERIC_WHO]
+    if specific_enterprise:
+        return specific_enterprise[:3]
     title = ((packet.get("_raw_source") or {}).get("title") or "").strip()
     title_match = re.search(r"([가-힣A-Za-z0-9·\-\s]{2,20}(?:기업|사업자|상장사|기관))", title)
-    if title_match:
+    # Prefer title-specific actor over bare 「기업」
+    if title_match and (enterprise or not who):
         return [title_match.group(1).strip()]
+    if enterprise:
+        return enterprise[:3]
+    refined = [item for item in who if item not in GENERIC_WHO and "소비자" not in item]
+    if refined:
+        return refined[:3]
     if who:
         return who[:1]
     return []
 
 
+def _is_background_change_line(text: str) -> bool:
+    return any(marker in (text or "") for marker in BACKGROUND_CHANGE_MARKERS)
+
+
 def _pick_business_change(packet: dict[str, Any], candidates: list[str]) -> str:
     main_claim = (packet.get("main_claim") or "").strip()
-    for text in candidates:
-        if ANNOUNCE_LEAD_RE.search(text):
+    key_facts = [str(item).strip() for item in (packet.get("key_facts") or []) if str(item).strip()]
+    prioritized = []
+    seen: set[str] = set()
+    for text in [main_claim, *key_facts, *candidates]:
+        if not text or text in seen:
             continue
+        seen.add(text)
+        prioritized.append(text)
+    usable = [
+        text
+        for text in prioritized
+        if not ANNOUNCE_LEAD_RE.search(text) and not _is_background_change_line(text)
+    ]
+    for text in usable:
+        if any(key in text for key in OBLIGATION_CHANGE_KEYS):
+            return text
+    for text in usable:
         if any(key in text for key in BUSINESS_CHANGE_STRONG_KEYS):
             return text
-    for text in candidates:
-        if ANNOUNCE_LEAD_RE.search(text):
-            continue
+    for text in usable:
         if any(key in text for key in BUSINESS_CHANGE_KEYS):
             return text
-    if main_claim and not ANNOUNCE_LEAD_RE.search(main_claim):
+    if main_claim and not ANNOUNCE_LEAD_RE.search(main_claim) and not _is_background_change_line(main_claim):
         return main_claim
-    return next((text for text in candidates if len(text) >= 20), main_claim)
+    return next((text for text in usable if len(text) >= 20), main_claim)
 
 
 def _pick_check_items(candidates: list[str]) -> list[str]:
@@ -226,7 +263,7 @@ def build_rewrite_user_message_for_cb(
         source_url=(article.get("url") or "").strip() or "미상",
         source_published_at=article.get("source_published_at") or "미상",
         original_text=original_text or "(본문 없음)",
-        packet_json=json.dumps(packet, ensure_ascii=False, indent=2),
+        packet_json=json.dumps(slim_packet_for_rewrite(packet), ensure_ascii=False, indent=2),
         compliance_brief_block=format_compliance_brief_block(packet),
         reader_utility_block=format_reader_utility_block(packet),
         originality_guidance_block=build_originality_guidance(

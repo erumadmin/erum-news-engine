@@ -216,6 +216,22 @@ def _strip_numbered_prefixes(paras: list[str]) -> list[str]:
     return out
 
 
+def resolve_publish_site(packet: dict[str, Any] | None) -> str:
+    """Desk for publish sanitize/validate — packet first, then FORCE_SITE, else IJ."""
+    packet = packet or {}
+    site = str(packet.get("site") or packet.get("assigned_site") or "").strip().upper()
+    if site in ("IJ", "NN", "CB"):
+        return site
+    force = (os.environ.get("EDITORIAL_FORCE_SITE") or "").strip().upper()
+    if force in ("IJ", "NN", "CB"):
+        return force
+    if packet.get("community_brief") is not None:
+        return "NN"
+    if packet.get("compliance_brief") is not None:
+        return "CB"
+    return "IJ"
+
+
 def publish_sanitize_body(
     body: str,
     packet: dict[str, Any],
@@ -247,12 +263,16 @@ def publish_sanitize_body(
         from engine.pipeline.rewrite_validate import fix_para1_lead_opener
 
         lead_packet = _publish_safe_packet_for_lead(packet) if is_publish_v4_enabled() else packet
-        force_site = os.environ.get("EDITORIAL_FORCE_SITE", "").strip().upper()
-        if force_site == "NN":
+        site = resolve_publish_site(packet)
+        source_body = (article or {}).get("body") or ""
+        if site == "NN":
             from engine.pipeline.nn_rewrite_validate import fix_nn_para1_lead_opener
 
-            source_body = (article or {}).get("body") or ""
             cleaned_paras = fix_nn_para1_lead_opener(cleaned_paras, lead_packet, source_body)
+        elif site == "CB":
+            from engine.pipeline.cb_rewrite_validate import repair_cb_lead
+
+            cleaned_paras = repair_cb_lead(cleaned_paras, lead_packet, source_body)
         else:
             cleaned_paras = fix_para1_lead_opener(cleaned_paras, lead_packet)
         if is_publish_v4_enabled():
@@ -328,6 +348,25 @@ def validate_publish_article(
         return False, "번호 문단 잔여 (P3)"
 
     ok_lead, lead_msg = validate_para1_lead(paras, packet, article)
+    site = resolve_publish_site(packet)
+    if site == "NN":
+        from engine.pipeline.nn_community_brief import validate_nn_lead
+
+        ok_lead, lead_msg = validate_nn_lead(paras)
+    elif site == "CB":
+        from engine.pipeline.cb_rewrite_validate import validate_cb_paragraph_roles
+
+        ok_roles, role_msg = validate_cb_paragraph_roles(paras)
+        if not ok_roles:
+            ok_lead, lead_msg = False, role_msg
+        else:
+            from engine.pipeline.cb_rewrite_validate import is_cb_agency_lead
+
+            if is_cb_agency_lead(paras[0] or ""):
+                ok_lead, lead_msg = False, "1문단 기관명 리드"
+            else:
+                ok_lead, lead_msg = True, "OK"
+
     if not ok_lead:
         return False, f"리드 부족 (P5): {lead_msg}"
 

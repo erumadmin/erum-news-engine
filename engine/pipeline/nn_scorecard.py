@@ -70,7 +70,11 @@ def score_nn_editorial_rewrite(
 
     fact_score = 10.0
     groups = fact_groups_from_source(article.get("body") or "")
-    uncovered = [g for g in groups if not key_fact_covered(g, plain)]
+    uncovered = [
+        label
+        for label, alts in groups
+        if not any(key_fact_covered(alt, plain) for alt in alts)
+    ]
     if uncovered:
         fact_score -= min(4.0, len(uncovered) * 1.5)
         gaps.append(f"fact 미반영: {', '.join(uncovered[:3])}")

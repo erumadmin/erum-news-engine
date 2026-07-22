@@ -336,34 +336,29 @@ def build_reader_utility(
 
 
 def format_reader_utility_block(packet: dict[str, Any]) -> str:
-    """Prompt block for rewrite (packet v2)."""
+    """Prompt block for rewrite (packet v2). Keep short — avoid drowning desk rules."""
     ru = packet.get("reader_utility") or {}
     if not ru:
         return "(reader_utility 없음 — 원문·action_items·증거만 사용)"
     lines = [f"기준일(as_of): {ru.get('as_of_date', '(미상)')}"]
     scenarios = ru.get("scenarios") or []
     if scenarios:
-        lines.append("시나리오 (원문 예시만):")
-        for s in scenarios:
-            lines.append(f"- {s.get('label', '')}: {s.get('body', '')}")
+        lines.append("시나리오 (원문 예시만, 최대 2):")
+        for s in scenarios[:2]:
+            body = (s.get("body") or "")[:160]
+            lines.append(f"- {s.get('label', '')}: {body}")
     checklist = ru.get("checklist") or []
     if checklist:
-        lines.append("체크리스트 (원문·증거 행동만):")
-        for c in checklist:
-            lines.append(f"- {c.get('step', '')}")
+        lines.append("체크리스트 (원문 행동만, 최대 3):")
+        for c in checklist[:3]:
+            step = (c.get("step") or "")[:120]
+            lines.append(f"- {step}")
     links = ru.get("primary_links") or []
     if links:
-        lines.append("공식·독자 링크:")
-        for link in links:
-            lines.append(f"- {link.get('label', '')}: {link.get('url', '')}")
-    quotes = ru.get("evidence_quotes") or []
-    if quotes:
-        lines.append("증거 발췌 (인용만):")
-        for q in quotes:
-            lines.append(f"- {q.get('url', '')}: {q.get('quote', '')[:200]}")
-    lines.append(
-        "위 블록에 있는 내용만 독자 가치로 추가한다. 없는 수치·표·FAQ는 쓰지 않는다."
-    )
+        lines.append("공식 링크 (본문 URL 금지, 내용만):")
+        for link in links[:2]:
+            lines.append(f"- {link.get('label', '')}")
+    lines.append("위 블록은 보조. 문단 역할(데스크 North Star)을 우선한다.")
     return "\n".join(lines)
 
 

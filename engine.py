@@ -1093,6 +1093,12 @@ def _keyword_hits(text: str, compact: str, keywords: Tuple[str, ...]) -> List[st
 
 
 def assess_cb_article_fit(article: dict) -> Tuple[str, str]:
+    from engine.pipeline.desk_fit import cb_is_nonfit
+
+    nonfit, nonfit_reason = cb_is_nonfit(article or {})
+    if nonfit:
+        return "skip", nonfit_reason
+
     title = re.sub(r"\s+", " ", (article.get("title") or "").strip())
     body = strip_html_tags(article.get("body", ""))[:5000]
     text = re.sub(r"\s+", " ", f"{title} {body}".lower()).strip()
@@ -1118,9 +1124,9 @@ def assess_cb_article_fit(article: dict) -> Tuple[str, str]:
 
 # [v23.0] AI 품질검수 시스템
 MEDIA_TONE_DESC = {
-    "IJ_": "솔루션 저널리즘 - 사회 문제의 구조적 해결책 제시, 수요자 중심 관점",
-    "NN_": "커뮤니티 저널리즘 - 어려운 뉴스를 쉽고 품격 있게, 지역·공동체 소식 중심",
-    "CB_": "비즈니스 분석 - 산업 트렌드와 ESG 시사점, 경영 전략 관점",
+    "IJ_": "제도 구조·대상·한계가 보이는 권위 있는 정책 기사 (솔루션 구조 중심)",
+    "NN_": "해당자가 바로 판단하는 생활 안내 기사 (커뮤니티·체감 중심)",
+    "CB_": "기업이 당장 확인할 의무·비용·일정 브리핑 (비적합이면 미작성)",
 }
 
 QA_SYSTEM_PROMPT = load_skill("qa_checker")

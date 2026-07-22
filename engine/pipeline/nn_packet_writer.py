@@ -15,6 +15,7 @@ from engine.pipeline.packet_writer import (
     _format_action_items_block,
     _format_evidence_block,
     _format_required_facts_block,
+    slim_packet_for_rewrite,
 )
 from engine.pipeline.reader_utility import format_reader_utility_block
 from engine.pipeline.rewrite_validate import temporal_hint_from_source
@@ -68,10 +69,11 @@ URL: {source_url}
 시점: effective_date={effective_date} | why_now={why_now} | 통일 표기={temporal_hint}
 
 작성 체크리스트 (이웃뉴스):
-- 1문단: **영향받는 사람·이용자**가 주어. 기관명으로 시작하지 않는다. 실제 변화를 첫 문장에.
-- 2문단: 왜 바뀌는지·기존 문제 (원문·조사만)
-- 3문단: 신청·이용 조건, 예외, 절차, 시행 시점, 수치 — reader_utility checklist·action_items 반영
-- 4문단: 「다만」+ 생활 영향·남은 제한·유예 (원문에 있을 때만)
+- 1문단: **영향받는 사람·이용자·환자 가족**이 주어. 「보건복지부가」「상급종합병원이」로 시작 금지.
+- 1문단 첫 문장은 자연스러운 생활 문장. 「X는 병원 보상 체계가…」처럼 어색한 치환 금지.
+- 2문단: 왜 바뀌는지·기존 문제 (원문만)
+- 3문단: 조건·수치·등급·기간 + **해당 여부 한 줄**(예: 상급종합만, 종합병원은 이번엔 제외)
+- 4문단: 「다만」+ 남은 제한 (템플릿 「세부 조건과 적용 범위는 발표 내용에 따른다」만으로 채우지 말 것)
 - 독자 4축(누구/변화/조건/할 일) 중 **최소 3개** 본문에 드러낼 것
 
 본문 650~1000자, HTML <p> 정확히 4개. JSON 금지.
@@ -114,7 +116,7 @@ def build_rewrite_user_message_for_nn(
         source_url=(article.get("url") or "").strip() or "미상",
         source_published_at=article.get("source_published_at") or "미상",
         original_text=original_text or "(본문 없음)",
-        packet_json=json.dumps(packet, ensure_ascii=False, indent=2),
+        packet_json=json.dumps(slim_packet_for_rewrite(packet), ensure_ascii=False, indent=2),
         community_brief_block=format_community_brief_block(packet),
         reader_utility_block=format_reader_utility_block(packet),
         originality_guidance_block=build_originality_guidance(

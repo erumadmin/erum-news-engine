@@ -225,7 +225,7 @@ class TestTargetEngine(unittest.TestCase):
         self.assertGreaterEqual(rv, 8.0, plain[:200])
         self.assertGreaterEqual(orig, 8.0)
 
-    def test_reorder_swapped_paragraph_roles(self):
+    def test_reorder_preserves_desk_v10_mechanism_in_para2(self):
         from engine.pipeline.ij_paragraph_roles import reorder_paragraph_roles_paras
         from engine.pipeline.rewrite_validate import _paragraph_plain_blocks
 
@@ -236,8 +236,9 @@ class TestTargetEngine(unittest.TestCase):
             "<p>다만 시행 범위는 제한적이다.</p>"
         )
         paras = reorder_paragraph_roles_paras(_paragraph_plain_blocks(body))
-        self.assertIn("보호무역", paras[1])
-        self.assertIn("신청", paras[2])
+        # Desk v10: do not swap mech-out of para2
+        self.assertIn("신청", paras[1])
+        self.assertIn("보호무역", paras[2])
 
     def test_coalition_takeaways_inject_and_validate(self):
         from engine.pipeline.coalition_takeaways import (

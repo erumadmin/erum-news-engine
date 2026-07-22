@@ -140,6 +140,15 @@ def _build_compare_markdown(
         f"originality≥{score.get('target_originality', 9.0)}, "
         f"{'통과' if score.get('passes') else '미통과'})",
     ]
+    if score.get("form_score") is not None or score.get("fidelity_ok") is not None:
+        fid = score.get("fidelity_ok")
+        fid_label = "OK" if fid else "FAIL"
+        lines.append(
+            f"- **form_score:** {score.get('form_score', score.get('total'))} | "
+            f"**fidelity:** {fid_label}"
+        )
+        if score.get("fidelity_gaps"):
+            lines.append(f"- **fidelity_gaps:** {', '.join(score['fidelity_gaps'])}")
     if score.get("briefing_ready") is not None:
         lines.append(f"- **briefing_ready:** {score.get('briefing_ready')}")
     gate = packet.get("research_gate") or {}

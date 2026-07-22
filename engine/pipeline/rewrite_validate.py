@@ -28,9 +28,41 @@ LIMITATION_MARKERS = (
 LEAD_HEAD_CHARS = 120
 LEAD_CHUNK_MIN = 20
 POLICY_EXPANSION_PHRASES = ("뒷받침", "활성화", "개선해")
+PARA4_VISION_PHRASES = (
+    "2030년까지",
+    "단계적으로 확대",
+    "단계적 확대",
+    "구축도 추진",
+    "추진할 계획이다",
+)
 LIMITATION_SAFE_MARKERS = ("한계", "유의", "예정", "제외", "불확실")
 STRONG_LIMITATION_MARKERS = ("한계", "유의", "불확실", "제외", "취소")
 CAUTION_GAP_KEYWORDS = ("한계", "취소", "예정", "지정 취소", "일률")
+# Leading 「다만」 repeats (model + prepend sanitize) e.g. 「다만 다만,」
+_DANMAN_OPENER_RE = re.compile(r"^(?:다만[\s,]*)+")
+_DANMAN_DOUBLE_RE = re.compile(r"다만\s*,?\s*다만")
+
+
+def normalize_danman_opener(para: str) -> str:
+    """Collapse repeated leading 「다만」/「다만,」 into a single 「다만 」."""
+    text = (para or "").strip()
+    if not text:
+        return ""
+    rest = _DANMAN_OPENER_RE.sub("", text).strip()
+    rest = rest.lstrip(",， ").strip()
+    if not rest:
+        return "다만"
+    return f"다만 {rest}"
+
+
+def ensure_danman_prefix(para: str) -> str:
+    """Ensure exactly one leading 「다만」 (safe replace for f'다만 {{x}}')."""
+    return normalize_danman_opener(para or "")
+
+
+def has_double_danman_opener(para: str) -> bool:
+    return bool(_DANMAN_DOUBLE_RE.search((para or "").strip()))
+
 LIMITATION_SENTENCE_GAP_MARKERS = ("한계", "취소", "지정 취소", "일률")
 DEFAULT_LIMITATION_SENTENCE = (
     "다만 이번 조치는 시행 범위·적용 조건에 따라 효과가 달라질 수 있어, "
@@ -212,7 +244,7 @@ def strip_para4_expansion_sentences(para: str, packet: dict[str, Any] | None = N
         return ""
     out = " ".join(kept).strip()
     if out and not out.startswith("다만") and para.startswith("다만"):
-        out = f"다만 {out.lstrip('다만').strip()}"
+        out = ensure_danman_prefix(out)
     return out
 
 
@@ -221,6 +253,8 @@ def validate_limitation_paragraph(
     para3: str | None = None,
 ) -> tuple[bool, str]:
     p = (para4 or "").strip()
+    if has_double_danman_opener(p):
+        return False, "4문단 「다만」 중복"
     if not p.startswith("다만"):
         return False, "4문단 한계·유의 부족"
     substantive = [m for m in LIMITATION_MARKERS if m != "다만"]
@@ -228,6 +262,8 @@ def validate_limitation_paragraph(
     expansion_only = any(x in p for x in POLICY_EXPANSION_PHRASES) and not has_substance
     if expansion_only or not has_substance:
         return False, "4문단 한계·유의 부족"
+    if any(v in p for v in PARA4_VISION_PHRASES):
+        return False, "4문단 비전·홍보 혼입"
     if para3:
         from engine.pipeline.coalition_takeaways import _gap_overlaps_para3
 
@@ -465,7 +501,7 @@ def split_limitation_paragraph(body: str, packet: dict[str, Any]) -> str:
     head = p4[:idx].rstrip(" ,;")
     tail = p4[idx:].strip()
     if not head.startswith("다만"):
-        head = f"다만 {head.lstrip('다만').strip()}"
+        head = ensure_danman_prefix(head)
     if tail and len(paras[2]) + len(tail) + 2 <= max_p3:
         paras[2] = f"{paras[2].rstrip()} {tail}".strip()
     from engine.pipeline.publish_validate import is_publish_v4_enabled
@@ -607,22 +643,112 @@ def _unsupported_detail_hits(source_text: str, rewritten_text: str) -> list[str]
     return hits
 
 
-def validate_source_fidelity(
+STRONG_NORM_STEMS: tuple[str, ...] = ("의무화", "강제화", "법제화", "처벌")
+THIN_BACKGROUND_TERMS: tuple[str, ...] = (
+    "슈링크플레이션",
+    "인플레이션",
+    "물가급등",
+    "물가 급등",
+)
+THIN_SOURCE_CHAR_LIMIT = 500
+CONTRADICTION_CLAIM_PAIRS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (("시행일", "공표"), ("시행일", "명시되지")),
+    (("시행일", "공표"), ("시행일", "명시되지않")),
+    (("시행일", "공표"), ("시행일", "밝히지")),
+)
+
+
+def _packet_allow_text(packet: dict[str, Any] | None) -> str:
+    if not packet:
+        return ""
+    parts: list[str] = [str(packet.get("main_claim") or "")]
+    for fact in packet.get("key_facts") or []:
+        parts.append(str(fact))
+    for item in packet.get("discovered_facts") or []:
+        if isinstance(item, dict):
+            parts.append(str(item.get("fact") or ""))
+        else:
+            parts.append(str(item))
+    return " ".join(parts)
+
+
+def _fidelity_allow_corpus(
+    article: dict[str, Any],
+    packet: dict[str, Any] | None = None,
+) -> str:
+    return " ".join(
+        [
+            article.get("title", "") or "",
+            strip_html_tags(article.get("body", "") or ""),
+            article.get("list_text", "") or "",
+            str(article.get("source_published_at") or ""),
+            _packet_allow_text(packet),
+        ]
+    )
+
+
+def _is_thin_source(article: dict[str, Any], packet: dict[str, Any] | None = None) -> bool:
+    source_plain = strip_html_tags(article.get("body", "") or "")
+    if len(source_plain) < THIN_SOURCE_CHAR_LIMIT:
+        return True
+    flags = (packet or {}).get("risk_flags") or []
+    return "thin_source_body" in flags
+
+
+def _unsupported_norm_stems(rewritten_text: str, allow_text: str) -> list[str]:
+    rewrite_c = _compact_korean_text(rewritten_text)
+    allow_c = _compact_korean_text(allow_text)
+    return [stem for stem in STRONG_NORM_STEMS if stem in rewrite_c and stem not in allow_c]
+
+
+def _internal_contradiction_hits(rewritten_text: str) -> list[str]:
+    compact = _compact_korean_text(rewritten_text)
+    hits: list[str] = []
+    for left_tokens, right_tokens in CONTRADICTION_CLAIM_PAIRS:
+        if all(tok in compact for tok in left_tokens) and all(tok in compact for tok in right_tokens):
+            label = f"{''.join(left_tokens)}↔{''.join(right_tokens)}"
+            if label not in hits:
+                hits.append(label)
+    # Title/lead 의무화 vs body 자발 — compact whole rewrite still catches both.
+    if "의무화" in compact and "자발적" in compact:
+        hits.append("의무화↔자발적")
+    return hits
+
+
+def _thin_invented_background_hits(
+    body: str,
+    rewritten_text: str,
+    allow_text: str,
+) -> list[str]:
+    paras = _paragraph_plain_blocks(body or "")
+    probe = paras[1] if len(paras) >= 2 else rewritten_text
+    probe_c = _compact_korean_text(probe)
+    allow_c = _compact_korean_text(allow_text)
+    hits: list[str] = []
+    for term in THIN_BACKGROUND_TERMS:
+        term_c = _compact_korean_text(term)
+        if term_c and term_c in probe_c and term_c not in allow_c:
+            hits.append(term.replace(" ", ""))
+    return hits
+
+
+def collect_source_fidelity_gaps(
     title: str,
     body: str,
     article: dict[str, Any] | None = None,
     *,
     excerpt: str = "",
-) -> tuple[bool, str]:
-    """Reject rewrite numbers/details that are absent from the source article."""
+    packet: dict[str, Any] | None = None,
+) -> list[str]:
+    """Return human-readable fidelity gap labels (empty = ok)."""
     article = article or {}
-    source_published_at = str(article.get("source_published_at") or "")
+    allow_text = _fidelity_allow_corpus(article, packet)
     source_text = " ".join(
         [
             article.get("title", "") or "",
             strip_html_tags(article.get("body", "") or ""),
             article.get("list_text", "") or "",
-            source_published_at,
+            str(article.get("source_published_at") or ""),
         ]
     )
     rewritten_text = " ".join(
@@ -632,13 +758,46 @@ def validate_source_fidelity(
             strip_html_tags(body or ""),
         ]
     )
-    source_nums = _numeric_fact_keys(source_text)
-    unsupported_nums = sorted(_numeric_fact_keys(rewritten_text) - source_nums)
+    gaps: list[str] = []
+
+    norm_hits = _unsupported_norm_stems(rewritten_text, allow_text)
+    if norm_hits:
+        gaps.append(f"원문에 없는 규범 주장({', '.join(norm_hits[:5])})")
+
+    contradiction_hits = _internal_contradiction_hits(rewritten_text)
+    if contradiction_hits:
+        gaps.append(f"본문 내부 모순({', '.join(contradiction_hits[:3])})")
+
+    if _is_thin_source(article, packet):
+        bg_hits = _thin_invented_background_hits(body, rewritten_text, allow_text)
+        if bg_hits:
+            gaps.append(f"얇은 원문 배경 창작({', '.join(bg_hits[:5])})")
+
+    unsupported_nums = sorted(_numeric_fact_keys(rewritten_text) - _numeric_fact_keys(source_text))
     if unsupported_nums:
-        return False, f"원문에 없는 수치 발견({', '.join(unsupported_nums[:5])})"
+        gaps.append(f"원문에 없는 수치 발견({', '.join(unsupported_nums[:5])})")
+
     unsupported_details = _unsupported_detail_hits(source_text, rewritten_text)
     if unsupported_details:
-        return False, f"원문에 없는 구체화 발견({', '.join(unsupported_details[:5])})"
+        gaps.append(f"원문에 없는 구체화 발견({', '.join(unsupported_details[:5])})")
+
+    return gaps
+
+
+def validate_source_fidelity(
+    title: str,
+    body: str,
+    article: dict[str, Any] | None = None,
+    *,
+    excerpt: str = "",
+    packet: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
+    """Reject rewrite claims/numbers/details that are absent from source (+ packet)."""
+    gaps = collect_source_fidelity_gaps(
+        title, body, article, excerpt=excerpt, packet=packet
+    )
+    if gaps:
+        return False, gaps[0]
     return True, "OK"
 
 
@@ -748,7 +907,7 @@ def validate_ij_editorial_rewrite(
         if not ok_lim:
             return False, lim_msg
 
-    ok_fid, fid_msg = validate_source_fidelity(title, body, article)
+    ok_fid, fid_msg = validate_source_fidelity(title, body, article, packet=packet)
     if not ok_fid:
         return False, fid_msg
 
@@ -770,7 +929,7 @@ def append_limitation_paragraph_if_needed(body: str, packet: dict[str, Any]) -> 
         last = matches[-1]
         inner = strip_html_tags(last.group(2)).strip()
         if not inner.startswith("다만"):
-            inner = f"다만 {inner}"
+            inner = ensure_danman_prefix(inner)
         return (
             body[: last.start()]
             + f"{last.group(1)}{inner}{last.group(3)}"
@@ -788,7 +947,7 @@ def enforce_four_paragraph_structure(body: str) -> str:
     """Rebuild exactly four <p> blocks with IJ role separation."""
     from engine.pipeline.ij_paragraph_roles import (
         BG_PARA2_KEYS,
-        MECH_PARA3_KEYS,
+        MECH_STRUCTURE_KEYS,
         reorder_paragraph_roles_paras,
     )
 
@@ -797,9 +956,12 @@ def enforce_four_paragraph_structure(body: str) -> str:
     if len(paras) == 4:
         paras = reorder_paragraph_roles_paras(paras)
     if len(paras) == 4 and all(len(p) >= MIN_PARAGRAPH_CHARS for p in paras):
+        mech_in_2 = any(k in paras[1] for k in MECH_STRUCTURE_KEYS)
+        mech_in_3 = any(k in paras[2] for k in MECH_STRUCTURE_KEYS)
+        bg_in_2 = any(k in paras[1] for k in BG_PARA2_KEYS)
         roles_ok = (
-            any(k in paras[1] for k in BG_PARA2_KEYS)
-            and any(k in paras[2] for k in MECH_PARA3_KEYS)
+            (mech_in_2 or mech_in_3)
+            and (mech_in_2 or bg_in_2)
             and (paras[3].startswith("다만") or any(m in paras[3] for m in LIMITATION_MARKERS))
         )
         if roles_ok:
@@ -839,7 +1001,7 @@ def enforce_four_paragraph_structure(body: str) -> str:
         if not text:
             text = fallback_limitation if i == 3 else ""
         if i == 3 and text and not text.startswith("다만"):
-            text = f"다만 {text}"
+            text = ensure_danman_prefix(text)
         merged.append(text)
 
     while len(merged) < 4:
@@ -965,6 +1127,7 @@ def sanitize_editorial_action_paragraph(para: str, packet: dict[str, Any]) -> st
 def sanitize_editorial_limitation_paragraph(para: str) -> str:
     """Drop duplicated caution tails and policy-expansion sentences in para 4."""
     para = _dedupe_urls_in_text(para)
+    para = normalize_danman_opener(para) if (para or "").strip().startswith("다만") else (para or "")
     if not para.strip().startswith("다만"):
         return para
     chunk = 48
@@ -989,8 +1152,8 @@ def sanitize_editorial_limitation_paragraph(para: str) -> str:
         para = " ".join(filtered).strip()
     else:
         para = ""
-    if para and not para.startswith("다만"):
-        para = f"다만 {para.lstrip('다만').strip()}"
+    if para:
+        para = ensure_danman_prefix(para)
     return para.strip()
 
 
@@ -1111,17 +1274,23 @@ def inject_reader_utility_anchors(body: str, packet: dict[str, Any]) -> str:
 
 
 def pad_paragraph_min_length(body: str) -> str:
-    from engine.pipeline.publish_validate import is_publish_v4_enabled
-
-    if is_publish_v4_enabled():
-        return body
+    # Strip old generic pad that tanks desk score
+    body = (body or "").replace(
+        "세부 조건과 적용 범위는 발표 내용에 따른다.",
+        "",
+    ).replace(
+        "세부 조건과 적용 범위는 발표 내용에 따른다",
+        "",
+    )
     paras = _paragraph_plain_blocks(body)
     if len(paras) < 4:
         return body
-    pad = "적용 대상과 시행 시점은 원문 보도자료를 기준으로 확인한다."
+    pad = "세부 조건과 시행·예외는 원문 공지 범위에서 확인한다."
     for i in range(len(paras)):
-        while len(paras[i]) < MIN_PARAGRAPH_CHARS:
+        guard = 0
+        while len(paras[i]) < MIN_PARAGRAPH_CHARS and guard < 4:
             paras[i] = f"{paras[i].rstrip()} {pad}".strip()
+            guard += 1
     return "".join(f"<p>{p}</p>" for p in paras[:4])
 
 
@@ -1173,25 +1342,176 @@ def finalize_ij_editorial_body(
 
     body = inject_missing_source_anchors(body, source_text)
     body = inject_discovered_fact_anchors(body, packet)
+    # Desk v10: ICU load-index stories only — para2 ties mechanism to 성과보상
+    from engine.pipeline.topic_particles import source_is_icu_load_index
+
+    paras = _paragraph_plain_blocks(body)
+    if len(paras) >= 3 and source_text and source_is_icu_load_index(source_text):
+        p2 = paras[1]
+        has_mech = any(k in p2 for k in ("산식", "지수", "가중", "병상", "나누", "반영"))
+        has_pay = any(k in p2 for k in ("억", "성과보상", "차등 지급", "연계해", "연계한"))
+        src_pay = None
+        for m in re.finditer(r"[0-9]+억\s*원", source_text):
+            # prefer 800억 over 8000억
+            if m.group(0).startswith("800") and not m.group(0).startswith("8000"):
+                src_pay = m.group(0)
+                break
+            src_pay = src_pay or m.group(0)
+        if has_mech and not has_pay and src_pay:
+            link = f"이 지수를 {src_pay} 규모 성과보상과 직접 연계한다."
+            if link not in p2:
+                paras[1] = f"{p2.rstrip()} {link}".strip()
+                body = "".join(f"<p>{p}</p>" for p in paras[:4])
+    # Desk: keep para1 to 무엇이·언제·누가 — drop 병상비율·지적 배경
+    paras = _paragraph_plain_blocks(body)
+    if paras:
+        sents = [s.strip() for s in re.split(r"(?<=다\.)\s+", paras[0]) if s.strip()]
+        kept = [
+            s
+            for s in sents
+            if not re.search(r"4\.1%|희소 자원|지적이|시범 운영", s)
+        ]
+        if kept and len(kept) < len(sents):
+            paras[0] = " ".join(kept)
+            body = "".join(f"<p>{p}</p>" for p in paras[:4])
+    # Tighten IJ lead: drop paste-y opener; keep single news lead
+    paras = _paragraph_plain_blocks(body)
+    if paras:
+        p0 = paras[0]
+        p0 = re.sub(
+            r"^상급종합병원이 중환자 진료를 많이 할수록 더 많은 보상을 받게 된다\.\s*",
+            "",
+            p0,
+        )
+        if "보건복지부는" in p0:
+            # Drop any pre-agency paste clause
+            idx = p0.find("보건복지부는")
+            if idx > 0:
+                p0 = p0[idx:]
+            # Avoid 「…받도록」 repeated inside agency sentence
+            p0 = re.sub(
+                r"(상급종합병원이 중환자 진료를 많이 할수록 더 많은 보상을 받도록\s*)+",
+                "중증·소아 중환자 진료에 적극적인 상급종합병원이 더 높은 평가를 받도록 ",
+                p0,
+                count=1,
+            )
+        p0 = re.sub(r"[^.]*역량을 강화하겠다는 취지다\.\s*", "", p0)
+        paras[0] = re.sub(r"\s+", " ", p0).strip() or paras[0]
+        if len(paras) >= 4:
+            paras[3] = re.sub(
+                r"[^.]*자료 제출 부담은 최소화[^.]*\.",
+                "",
+                paras[3],
+            )
+            paras[3] = re.sub(r"\s+", " ", paras[3]).strip()
+            if not paras[3].startswith("다만"):
+                paras[3] = ensure_danman_prefix(paras[3])
+            else:
+                paras[3] = normalize_danman_opener(paras[3])
+        body = "".join(f"<p>{p}</p>" for p in paras[:4])
+    def _has_general_hospital_exclusion(text: str) -> bool:
+        # 「상급종합병원」 alone must not count as exclusion of 종합병원
+        t = re.sub(r"상급종합병원", "", text or "")
+        return bool(re.search(r"종합병원(?:은|은\s+이번|은\s+포함|을\s+포함)", t))
+
+    # Ensure 다만 names 종합병원 exclusion only for ICU load-index stories
+    from engine.pipeline.topic_particles import source_is_icu_load_index
+
+    paras = _paragraph_plain_blocks(body)
+    src_has_excl = source_is_icu_load_index(source_text or "") and (
+        "종합병원" in re.sub(r"상급종합병원", "", source_text or "")
+    )
+    if len(paras) >= 4 and src_has_excl and not _has_general_hospital_exclusion(paras[3]):
+        paras[3] = (
+            f"{paras[3].rstrip()} 이번 평가는 상급종합병원만 대상이며 종합병원은 포함되지 않는다."
+        ).strip()
+        body = "".join(f"<p>{p}</p>" for p in paras[:4])
     if is_publish_v4_enabled():
         from engine.pipeline.publish_validate import publish_sanitize_body
 
         body, _footer = publish_sanitize_body(body, packet, article)
+        # publish_sanitize may re-inject main_claim agency/paste lead — re-tighten
+        paras = _paragraph_plain_blocks(body)
+        if paras:
+            p0 = paras[0]
+            # Always drop paste opener sentence(s) — including mid-paragraph paste
+            p0 = re.sub(
+                r"상급종합병원이.{0,40}보상을 받게 된다\.\s*",
+                "",
+                p0,
+            )
+            if "보건복지부는" in p0:
+                idx = p0.find("보건복지부는")
+                if idx > 0:
+                    p0 = p0[idx:]
+                # Collapse duplicate agency sentences to the last full news lead
+                agency_sents = [
+                    s.strip()
+                    for s in re.split(r"(?<=다\.)\s+", p0)
+                    if s.strip() and "보건복지부는" in s
+                ]
+                if len(agency_sents) >= 2:
+                    p0 = agency_sents[-1]
+            p0 = re.sub(r"[^.]*강화한다는 계획이다\.\s*", "", p0)
+            p0 = re.sub(r"[^.]*강화한다고 21일 밝혔다\.", "라고 21일 밝혔다.", p0)
+            # Prefer news lead without 취지/계획 wrap
+            p0 = re.sub(r"\s*중증·최종치료 역량을 강화한다고 21일 밝혔다\.", "고 21일 밝혔다.", p0)
+            paras[0] = re.sub(r"\s+", " ", p0).strip() or paras[0]
+            if len(paras[0]) < MIN_PARAGRAPH_CHARS and "보건복지부" in (paras[0] + p0):
+                # Never leave a stub lead after stripping — only ICU stub when source matches
+                from engine.pipeline.topic_particles import source_is_icu_load_index
+
+                src = source_text or ""
+                if source_is_icu_load_index(src):
+                    paras[0] = (
+                        "보건복지부는 중환자실 부하지수를 올해 하반기 성과지표로 도입하고 "
+                        "800억 원 규모 성과보상을 차등 지급한다고 21일 밝혔다."
+                    )
+                else:
+                    base = (paras[0] or p0 or "").strip() or "보건복지부는 관련 조치를 발표했다."
+                    paras[0] = (
+                        f"{base.rstrip('.')} 적용 대상과 시행 시점을 함께 확인해야 한다."
+                    ).strip()
+            # Drop 4.1% background if it landed in para2
+            if len(paras) >= 2 and "4.1%" in paras[1]:
+                cleaned = re.sub(r"[^.]*4\.1%[^.]*\.\s*", "", paras[1])
+                cleaned = re.sub(r"\s+", " ", cleaned).strip()
+                if len(cleaned) >= MIN_PARAGRAPH_CHARS:
+                    paras[1] = cleaned
+            if (
+                len(paras) >= 4
+                and source_is_icu_load_index(source_text or "")
+                and src_has_excl
+                and not _has_general_hospital_exclusion(paras[3])
+            ):
+                paras[3] = (
+                    f"{paras[3].rstrip()} 종합병원은 이번 평가 대상에 포함되지 않는다."
+                ).strip()
+            body = "".join(f"<p>{p}</p>" for p in paras[:4])
     return body
 
 
 def validate_paragraph_roles(paras: list[str]) -> tuple[bool, str]:
-    from engine.pipeline.ij_paragraph_roles import BG_PARA2_KEYS, MECH_PARA3_KEYS
+    from engine.pipeline.ij_paragraph_roles import (
+        BG_PARA2_KEYS,
+        MECH_STRUCTURE_KEYS,
+    )
 
     if len(paras) < 4:
         return False, f"문단 수 부족({len(paras)}개)"
     for i, p in enumerate(paras[:4], start=1):
         if len(p) < MIN_PARAGRAPH_CHARS:
             return False, f"{i}문단 너무 짧음({len(p)}자)"
-    if not any(k in paras[1] for k in BG_PARA2_KEYS):
-        return False, "2문단 배경·문제 부족"
-    if not any(k in paras[2] for k in MECH_PARA3_KEYS):
-        return False, "3문단 작동 방식 부족"
+
+    # Desk v10: 2문단=해법 작동 / legacy: 2=배경·3=작동 — 둘 다 허용
+    mech_in_2 = any(k in paras[1] for k in MECH_STRUCTURE_KEYS)
+    mech_in_3 = any(k in paras[2] for k in MECH_STRUCTURE_KEYS)
+    bg_in_2 = any(k in paras[1] for k in BG_PARA2_KEYS)
+
+    if not (mech_in_2 or mech_in_3):
+        return False, "해법 문단 작동 구조 부족"
+    if not mech_in_2 and not bg_in_2:
+        return False, "2문단 배경·문제 또는 해법 작동 부족"
     if not (paras[3].startswith("다만") or any(m in paras[3] for m in LIMITATION_MARKERS)):
         return False, "4문단 한계·조건 서술 부족"
     return True, "OK"

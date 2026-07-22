@@ -248,6 +248,15 @@ def _hallucination_penalty(plain: str, source_body: str) -> float:
         and "비교표" not in plain
     ):
         penalty += 1.0
+    for term in ("슈링크플레이션", "인플레이션", "물가급등", "물가 급등"):
+        if term in plain and term not in (source_body or ""):
+            # Compact-space variant for 물가 급등
+            if term == "물가 급등" and "물가급등" in (source_body or ""):
+                continue
+            if term == "물가급등" and "물가 급등" in (source_body or ""):
+                continue
+            penalty += 2.0
+            break
     return penalty
 
 

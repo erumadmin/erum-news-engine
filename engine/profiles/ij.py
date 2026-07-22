@@ -41,7 +41,7 @@ class IJProfile(SiteProfile):
         source_type = raw_source.get("source_type") or ""
         score = 40.0 + hits * 8.0
         if source_type == "policy_briefing" or "korea.kr" in (raw_source.get("url") or ""):
-            score += 30.0
+            score += 18.0  # was +30; leave room for NN/CB desk fit
         reason = f"ij_signals={hits}"
         return RouteScore("IJ", score, reason)
 

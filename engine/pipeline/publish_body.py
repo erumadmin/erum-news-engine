@@ -73,6 +73,9 @@ def prepare_cb_publish_body(
     score_total: float | None = None,
 ) -> dict[str, Any]:
     """CSR Briefing publish body - same v4 gate as IJ, CB footer class."""
+    from engine.pipeline.cb_rewrite_validate import finalize_cb_title
+
+    title = finalize_cb_title(title, article)
     return _prepare_site_publish_body(
         title,
         excerpt,
