@@ -51,13 +51,14 @@ def score_editorial_rewrite(
 ) -> dict[str, Any]:
     source_body = (article or {}).get("body") or ""
     raw_body = body or ""
+    # Detect nested <p> on the rewrite input before v4 sanitize flattens it.
+    had_nested_p = bool(re.search(r"<p[^>]*>\s*<p", raw_body, flags=re.IGNORECASE))
     if is_publish_v4_enabled():
         raw_body, _ = publish_sanitize_body(raw_body, packet, article)
         body_norm = flatten_nested_paragraph_tags(raw_body)
         plain_probe = re.sub(r"\s+", " ", strip_html_tags(body_norm)).strip()
         if "연대·보고" in plain_probe:
             raw_body, _ = publish_sanitize_body(raw_body, packet, article)
-    had_nested_p = bool(re.search(r"<p[^>]*>\s*<p", raw_body, flags=re.IGNORECASE))
     body_norm = flatten_nested_paragraph_tags(raw_body)
     paras = _paragraph_plain_blocks(body_norm)
     p_count = len(paras)

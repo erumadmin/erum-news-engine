@@ -14,6 +14,23 @@ from engine.pipeline.rewrite_validate import finalize_ij_editorial_body
 
 
 class TestEditorialScorecard(unittest.TestCase):
+    def setUp(self):
+        # Default IJ_PUBLISH_V4 is on when unset; other suites pop the flag.
+        self._prev_v4 = os.environ.get("IJ_PUBLISH_V4")
+        self._prev_target = os.environ.get("IJ_TARGET_ENGINE")
+        os.environ["IJ_PUBLISH_V4"] = "0"
+        os.environ["IJ_TARGET_ENGINE"] = "0"
+
+    def tearDown(self):
+        if self._prev_v4 is None:
+            os.environ.pop("IJ_PUBLISH_V4", None)
+        else:
+            os.environ["IJ_PUBLISH_V4"] = self._prev_v4
+        if self._prev_target is None:
+            os.environ.pop("IJ_TARGET_ENGINE", None)
+        else:
+            os.environ["IJ_TARGET_ENGINE"] = self._prev_target
+
     def test_high_score_well_structured(self):
         source = (
             "다음 달 1일부터 시행한다. 전기위원회 서면 심의. 6월부터 11월분까지 고지서에 표기. "
