@@ -78,15 +78,19 @@ if load_dotenv is None:
 
 UPSTAGE_API_KEY = os.environ.get("UPSTAGE_API_KEY", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-DB_HOST = os.environ["DB_HOST"]
+
+from erum_pipeline.staging_guards import assert_required_engine_env, resolve_r2_key, resolve_erum_env
+
+_engine_env = assert_required_engine_env()
+DB_HOST = _engine_env["DB_HOST"]
 DB_USER = os.environ["DB_USER"]
 DB_PASSWORD = os.environ["DB_PASSWORD"]
-DB_NAME = os.environ["DB_NAME"]
+DB_NAME = _engine_env["DB_NAME"]
+ERUM_ENV = _engine_env["ERUM_ENV"]
+ERUM_API_BASE = _engine_env["ERUM_API_BASE"]
 
-WP_CFG = {}  # WP 발행 완전 폐기 — 전 사이트 erum-one.com API 사용
+WP_CFG = {}  # WP 발행 완전 폐기 — Erum central API만 사용
 
-# 전 사이트 erum-one.com API로 발행
-ERUM_API_BASE = "https://erum-one.com"
 # 배포 환경 호환:
 # 1) ERUM_API_KEY
 # 2) ADMIN_API_KEY
@@ -95,17 +99,37 @@ ERUM_API_KEY = os.environ.get("ERUM_API_KEY") or os.environ.get("ADMIN_API_KEY")
 if not ERUM_API_KEY:
     raise RuntimeError("ERUM_API_KEY 또는 ADMIN_API_KEY 환경변수가 필요합니다.")
 ERUM_CFG = {
-    "IJ_": {"site": "IJ", "gsc_site": "sc-domain:impactjournal.kr", "sitemap": "https://impactjournal.kr/sitemap-news.xml"},
-    "NN_": {"site": "NN", "gsc_site": "sc-domain:neighbornews.kr", "sitemap": "https://neighbornews.kr/sitemap-news.xml"},
-    "CB_": {"site": "CB", "gsc_site": "sc-domain:csrbriefing.kr", "sitemap": "https://csrbriefing.kr/sitemap-news.xml"},
+    "IJ_": {
+        "site": "IJ",
+        "gsc_site": os.environ.get("IJ_GSC_SITE", "sc-domain:impactjournal.kr"),
+        "sitemap": os.environ.get("IJ_SITEMAP_URL", "https://impactjournal.kr/sitemap-news.xml"),
+    },
+    "NN_": {
+        "site": "NN",
+        "gsc_site": os.environ.get("NN_GSC_SITE", "sc-domain:neighbornews.kr"),
+        "sitemap": os.environ.get("NN_SITEMAP_URL", "https://neighbornews.kr/sitemap-news.xml"),
+    },
+    "CB_": {
+        "site": "CB",
+        "gsc_site": os.environ.get("CB_GSC_SITE", "sc-domain:csrbriefing.kr"),
+        "sitemap": os.environ.get("CB_SITEMAP_URL", "https://csrbriefing.kr/sitemap-news.xml"),
+    },
 }
+if ERUM_ENV == "staging":
+    # Staging / canary runner: never submit GSC for production properties.
+    for _cfg in ERUM_CFG.values():
+        _cfg["gsc_site"] = None
+        _cfg["sitemap"] = None
 
-# Cloudflare R2
+# Cloudflare R2 — no silent production bucket/public URL defaults
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
-R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "erum-news-images")
-R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "https://pub-dd677a54d7cf4d8cabd2c3238f4558c9.r2.dev")
+R2_BUCKET_NAME = (os.environ.get("R2_BUCKET_NAME") or "").strip()
+R2_PUBLIC_URL = (os.environ.get("R2_PUBLIC_URL") or "").strip().rstrip("/")
+if not R2_BUCKET_NAME or not R2_PUBLIC_URL:
+    # Allow missing R2 only when uploads are unused; upload_to_r2 will fail closed.
+    pass
 # [모델 설정]
 UPSTAGE_API_BASE = os.environ.get("UPSTAGE_API_BASE", "https://api.upstage.ai/v1")
 UPSTAGE_API_URL = os.environ.get("UPSTAGE_API_URL", f"{UPSTAGE_API_BASE.rstrip('/')}/chat/completions")
@@ -134,7 +158,7 @@ OPENROUTER_REWRITE_FALLBACK_MODELS = [
     for x in os.environ.get("OPENROUTER_REWRITE_FALLBACK_MODELS", "deepseek/deepseek-v3.2").split(",")
     if x.strip()
 ]
-OPENROUTER_REFERER = os.environ.get("OPENROUTER_REFERER", "https://erum-one.com")
+OPENROUTER_REFERER = os.environ.get("OPENROUTER_REFERER", ERUM_API_BASE)
 OPENROUTER_TITLE = os.environ.get("OPENROUTER_TITLE", "erum-news-engine")
 REWRITE_SOURCE_MAX_CHARS = int(os.environ.get("REWRITE_SOURCE_MAX_CHARS", "4000"))
 MIN_REWRITTEN_BODY_CHARS = int(os.environ.get("MIN_REWRITTEN_BODY_CHARS", "300"))
@@ -1789,7 +1813,7 @@ class Site:
 
 def upload_to_r2(img_bytes: bytes, filename: str, content_type: str) -> Optional[str]:
     """이미지를 WebP로 변환 후 Cloudflare R2에 업로드하고 퍼블릭 URL 반환. 실패 시 None."""
-    if not R2_ACCOUNT_ID or not R2_ACCESS_KEY_ID or not R2_SECRET_ACCESS_KEY:
+    if not R2_ACCOUNT_ID or not R2_ACCESS_KEY_ID or not R2_SECRET_ACCESS_KEY or not R2_BUCKET_NAME or not R2_PUBLIC_URL:
         print("\n      ⚠️ [R2 업로드 불가]: R2 환경변수 누락")
         return None
     variants: Dict[str, Tuple[bytes, str, str]]
@@ -1809,8 +1833,9 @@ def upload_to_r2(img_bytes: bytes, filename: str, content_type: str) -> Optional
             region_name="auto",
         )
         uploaded_urls: Dict[str, str] = {}
+        yyyymm = now_kst().strftime("%Y/%m")
         for variant_name, (variant_bytes, variant_content_type, variant_filename) in variants.items():
-            key = f"news/{now_kst().strftime('%Y/%m')}/{variant_filename}"
+            key = resolve_r2_key(variant_filename, yyyymm)
             s3.put_object(Bucket=R2_BUCKET_NAME, Key=key, Body=variant_bytes, ContentType=variant_content_type)
             uploaded_urls[variant_name] = f"{R2_PUBLIC_URL}/{key}"
         return uploaded_urls.get("master")
@@ -1820,7 +1845,7 @@ def upload_to_r2(img_bytes: bytes, filename: str, content_type: str) -> Optional
 
 
 class ErumSite:
-    """erum-one.com REST API를 통해 NN/CB 기사를 발행"""
+    """Erum central Article API를 통해 기사를 발행"""
     def __init__(self, site_code: str):
         self.site_code = site_code
         self.api_base = ERUM_API_BASE
