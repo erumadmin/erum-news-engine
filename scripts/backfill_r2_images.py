@@ -49,8 +49,8 @@ HEADERS = {"x-api-key": API_KEY, "Content-Type": "application/json"}
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
-R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "erum-news-images")
-R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "https://pub-dd677a54d7cf4d8cabd2c3238f4558c9.r2.dev").rstrip("/")
+R2_BUCKET_NAME = (os.environ.get("R2_BUCKET_NAME") or "").strip()
+R2_PUBLIC_URL = (os.environ.get("R2_PUBLIC_URL") or "").strip().rstrip("/")
 
 SITES = ("IJ", "NN", "CB")
 PAGE_SIZE = 100
