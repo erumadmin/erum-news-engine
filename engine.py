@@ -816,6 +816,35 @@ def db_record_success(url_id: str, title: str, media: str, source_published_at: 
     finally:
         conn.close()
 
+
+def promote_auto_news_draft(url_id: str, content_hash: str) -> dict:
+    """Approve + publish the DRAFT Article previously created for this source url_id."""
+    from erum_pipeline.draft_lifecycle import (
+        lookup_draft_by_source,
+        mark_draft_published,
+        promote_article_to_published,
+    )
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            row = lookup_draft_by_source(cur, url_id)
+            if not row:
+                raise RuntimeError(f"draft mapping not found for url_id={url_id}")
+            article_id = int(row["article_id"])
+        published = promote_article_to_published(
+            api_base=ERUM_API_BASE,
+            api_key=ERUM_API_KEY,
+            article_id=article_id,
+            content_hash=content_hash,
+        )
+        with conn.cursor() as cur:
+            mark_draft_published(cur, url_id)
+        conn.commit()
+        return published
+    finally:
+        conn.close()
+
 def db_ensure_table():
     conn = get_db_connection()
     try:
@@ -897,6 +926,8 @@ def db_ensure_table():
                 )
                 if not cur.fetchone()["cnt"]:
                     cur.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")
+            from erum_pipeline.draft_lifecycle import ensure_draft_tracking_table
+            ensure_draft_tracking_table(cur)
         conn.commit()
     finally:
         conn.close()
@@ -1809,15 +1840,17 @@ class ErumSite:
 
     def get_tag_ids(self, tags): return []
 
-    def create_post(self, title, body, cat_id, tag_ids, img_url=None, excerpt="", author=None, published_at: Optional[datetime] = None, source_published_at: Optional[datetime] = None, author_slug=None, image_caption=None, image_credit=None, image_source=None, image_rights_basis=None, image_is_fallback=None, source_url=None, idempotency_key=None, engine_commit=None, prompt_version=None, normalized_source_id=None):
+    def create_post(self, title, body, cat_id, tag_ids, img_url=None, excerpt="", author=None, published_at: Optional[datetime] = None, source_published_at: Optional[datetime] = None, author_slug=None, image_caption=None, image_credit=None, image_source=None, image_rights_basis=None, image_is_fallback=None, source_url=None, idempotency_key=None, engine_commit=None, prompt_version=None, normalized_source_id=None, status=None):
         from erum_pipeline.publish_contract import build_article_payload
         publish_dt = to_kst(published_at) or now_kst()
+        # Auto-news always creates DRAFT; promotion to PUBLISHED is a separate approve+publish step.
+        create_status = status or "DRAFT"
         payload = build_article_payload(
             site_code=self.site_code,
             title=title,
             body=body,
             cat_id=cat_id,
-            status=PUBLISH_STATUS,
+            status=create_status,
             img_url=img_url,
             excerpt=excerpt or "",
             author=author,
@@ -3011,16 +3044,70 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
                     mid, _ = site.upload_image_bytes(img_bytes, fn, img_content_type, rw["title"], best_cap)
                     if not mid:
                         raise PipelineFailure("publish", "IMAGE_UPLOAD_FAIL", "이미지 업로드 실패", retryable=True)
-                pid = site.create_post(
-                    rw["title"],
-                    rw["body"],
-                    site.get_cat_id(rw["cat"]),
-                    site.get_tag_ids(rw["tags"]),
-                    mid,
-                    excerpt=rw.get("excerpt", ""),
-                    published_at=published_at,
-                    source_published_at=source_published_at,
-                )
+                if is_erum:
+                    from erum_pipeline.draft_lifecycle import (
+                        engine_commit_sha,
+                        normalize_source_id,
+                        record_draft_mapping,
+                        resolve_author_for_site,
+                    )
+                    site_code = ERUM_CFG.get(prefix, {}).get("site", prefix.rstrip("_"))
+                    author_name, author_slug = resolve_author_for_site(site_code, rw.get("cat"))
+                    norm_source = normalize_source_id(str(article.get("url_id") or ""))
+                    commit_sha = engine_commit_sha()
+                    prompt_ver = os.environ.get("PROMPT_VERSION", "vnext-1")
+                    image_credit = (article.get("image_credit") or article.get("credit") or best_cap or None)
+                    pid = site.create_post(
+                        rw["title"],
+                        rw["body"],
+                        site.get_cat_id(rw["cat"]),
+                        site.get_tag_ids(rw["tags"]),
+                        mid,
+                        excerpt=rw.get("excerpt", ""),
+                        published_at=published_at,
+                        source_published_at=source_published_at,
+                        author=author_name,
+                        author_slug=author_slug,
+                        image_caption=best_cap,
+                        image_credit=image_credit,
+                        image_source=article.get("image_source") or article.get("url") or article.get("link"),
+                        image_rights_basis="PROVIDER" if mid else None,
+                        image_is_fallback=False if mid else True,
+                        source_url=article.get("url") or article.get("link"),
+                        idempotency_key=f"AUTO:{norm_source}",
+                        engine_commit=commit_sha,
+                        prompt_version=prompt_ver,
+                        normalized_source_id=norm_source,
+                        status="DRAFT",
+                    )
+                    conn = get_db_connection()
+                    try:
+                        with conn.cursor() as cur:
+                            record_draft_mapping(
+                                cur,
+                                url_id=norm_source,
+                                site=site_code,
+                                article_id=int(pid),
+                                content_hash=None,
+                                engine_commit=commit_sha,
+                                prompt_version=prompt_ver,
+                            )
+                        conn.commit()
+                    finally:
+                        conn.close()
+                    article_status = "DRAFT"
+                else:
+                    pid = site.create_post(
+                        rw["title"],
+                        rw["body"],
+                        site.get_cat_id(rw["cat"]),
+                        site.get_tag_ids(rw["tags"]),
+                        mid,
+                        excerpt=rw.get("excerpt", ""),
+                        published_at=published_at,
+                        source_published_at=source_published_at,
+                    )
+                    article_status = PUBLISH_STATUS
                 upload_counts[prefix] += 1
                 published_prefixes.append(prefix)
                 published_items.append({
@@ -3028,7 +3115,7 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
                     "site": ERUM_CFG.get(prefix, {}).get("site", prefix.rstrip("_")),
                     "id": pid,
                     "title": rw["title"],
-                    "status": PUBLISH_STATUS,
+                    "status": article_status,
                     "preview_url": f"{ERUM_API_BASE}/preview/articles/{pid}",
                 })
                 variant_review["publish_id"] = pid
@@ -3227,8 +3314,9 @@ def run():
                     continue
                 success_media = result.get("success_media", [])
                 media_value = ",".join(success_media) if success_media else "ALL"
-                # DRAFT must not finalize source as published success.
-                if PUBLISH_STATUS == "PUBLISHED":
+                # Only finalize source as published when every created article is PUBLISHED.
+                item_statuses = [item.get("status") for item in result.get("published_items", [])]
+                if item_statuses and all(status == "PUBLISHED" for status in item_statuses):
                     db_record_success(
                         article["url_id"],
                         article["title"],
