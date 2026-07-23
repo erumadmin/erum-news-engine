@@ -178,11 +178,18 @@ KOREA_POLICY_NEWS_ENABLED = os.environ.get("KOREA_POLICY_NEWS_ENABLED", "0") == 
 KOREA_CRAWLER_MAX_PAGES = max(1, int(os.environ.get("KOREA_CRAWLER_MAX_PAGES", "2")))
 KOREA_ATTACHMENT_PDF_ENABLED = os.environ.get("KOREA_ATTACHMENT_PDF_ENABLED", "1") != "0"
 KOREA_CRAWLER_TIMEOUT = int(os.environ.get("KOREA_CRAWLER_TIMEOUT", "20"))
-PUBLISH_STATUS = (os.environ.get("PUBLISH_STATUS", "PUBLISHED").strip() or "PUBLISHED").upper()
+_publish_status_raw = (os.environ.get("PUBLISH_STATUS") or "").strip().upper()
+if not _publish_status_raw:
+    raise RuntimeError("PUBLISH_STATUS 환경변수가 필요합니다 (PUBLISHED|DRAFT). 암묵적 PUBLISHED 기본값은 금지됩니다.")
+PUBLISH_STATUS = _publish_status_raw
 if PUBLISH_STATUS not in {"PUBLISHED", "DRAFT"}:
     raise RuntimeError("PUBLISH_STATUS는 PUBLISHED 또는 DRAFT만 허용됩니다.")
 if HIDDEN_PUBLISH_TEST:
     PUBLISH_STATUS = "DRAFT"
+ONE_SOURCE_ONE_SITE = os.environ.get("ONE_SOURCE_ONE_SITE", "1") == "1"
+ENABLE_SITE_IJ = os.environ.get("ENABLE_SITE_IJ", "1") != "0"
+ENABLE_SITE_NN = os.environ.get("ENABLE_SITE_NN", "1") != "0"
+ENABLE_SITE_CB = os.environ.get("ENABLE_SITE_CB", "1") != "0"
 if (LLM_PROVIDER == "gemini" or REWRITE_PROVIDER == "gemini" or QA_PROVIDER == "gemini") and not GEMINI_API_KEY:
     raise RuntimeError("Gemini provider 사용에는 GEMINI_API_KEY가 필요합니다.")
 if (LLM_PROVIDER == "openrouter" or REWRITE_PROVIDER == "openrouter" or QA_PROVIDER == "openrouter") and not OPENROUTER_API_KEY:
@@ -1802,21 +1809,32 @@ class ErumSite:
 
     def get_tag_ids(self, tags): return []
 
-    def create_post(self, title, body, cat_id, tag_ids, img_url=None, excerpt="", author=None, published_at: Optional[datetime] = None, source_published_at: Optional[datetime] = None):
+    def create_post(self, title, body, cat_id, tag_ids, img_url=None, excerpt="", author=None, published_at: Optional[datetime] = None, source_published_at: Optional[datetime] = None, author_slug=None, image_caption=None, image_credit=None, image_source=None, image_rights_basis=None, image_is_fallback=None, source_url=None, idempotency_key=None, engine_commit=None, prompt_version=None, normalized_source_id=None):
+        from erum_pipeline.publish_contract import build_article_payload
         publish_dt = to_kst(published_at) or now_kst()
-        payload = {
-            "site": self.site_code,
-            "title": title,
-            "content": body,
-            "excerpt": excerpt or "",
-            "status": PUBLISH_STATUS,
-            "categoryId": cat_id,
-            "featuredImageUrl": img_url,
-            "publishedAt": to_kst_iso(publish_dt),
-            "sourcePublishedAt": to_kst_iso(source_published_at) if source_published_at else None,
-        }
-        if payload["sourcePublishedAt"] is None:
-            payload.pop("sourcePublishedAt")
+        payload = build_article_payload(
+            site_code=self.site_code,
+            title=title,
+            body=body,
+            cat_id=cat_id,
+            status=PUBLISH_STATUS,
+            img_url=img_url,
+            excerpt=excerpt or "",
+            author=author,
+            author_slug=author_slug,
+            image_caption=image_caption,
+            image_credit=image_credit,
+            image_source=image_source,
+            image_rights_basis=image_rights_basis,
+            image_is_fallback=image_is_fallback if image_is_fallback is not None else (False if img_url else True),
+            source_url=source_url,
+            published_at=to_kst_iso(publish_dt),
+            source_published_at=to_kst_iso(source_published_at) if source_published_at else None,
+            idempotency_key=idempotency_key,
+            engine_commit=engine_commit,
+            prompt_version=prompt_version,
+            normalized_source_id=normalized_source_id,
+        )
         r = requests.post(f"{self.api_base}/api/articles",
                           json=payload, headers=self.headers, timeout=30)
         r.raise_for_status()
@@ -2793,16 +2811,32 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
     print(f"\n▶ 기사 처리 시작: {article['title'][:40]}...")
     source_published_at = article.get("source_published_at")
     published_at = now_kst()
-    media_plan: Dict[str, Dict[str, Any]] = {
-        prefix: {"enabled": True, "mode": "default", "reason": ""}
-        for prefix in MEDIA_PREFIXES
-    }
-    cb_mode, cb_reason = assess_cb_article_fit(article)
-    media_plan["CB_"] = {
-        "enabled": cb_mode != "skip",
-        "mode": cb_mode,
-        "reason": cb_reason,
-    }
+    if ONE_SOURCE_ONE_SITE:
+        from erum_pipeline.routing_vnext import build_one_site_media_plan, route_primary
+        assigned = route_primary(article)
+        media_plan = build_one_site_media_plan(
+            assigned,
+            {"IJ": ENABLE_SITE_IJ, "NN": ENABLE_SITE_NN, "CB": ENABLE_SITE_CB},
+        )
+        if assigned == "CB" and media_plan.get("CB_", {}).get("enabled"):
+            cb_mode, cb_reason = assess_cb_article_fit(article)
+            if cb_mode == "skip":
+                media_plan["CB_"] = {"enabled": False, "mode": "skip", "reason": cb_reason}
+    else:
+        media_plan: Dict[str, Dict[str, Any]] = {
+            prefix: {"enabled": True, "mode": "default", "reason": ""}
+            for prefix in MEDIA_PREFIXES
+        }
+        if not ENABLE_SITE_IJ:
+            media_plan["IJ_"] = {"enabled": False, "mode": "skip", "reason": "feature-flag-off"}
+        if not ENABLE_SITE_NN:
+            media_plan["NN_"] = {"enabled": False, "mode": "skip", "reason": "feature-flag-off"}
+        cb_mode, cb_reason = assess_cb_article_fit(article)
+        media_plan["CB_"] = {
+            "enabled": cb_mode != "skip" and ENABLE_SITE_CB,
+            "mode": cb_mode,
+            "reason": cb_reason,
+        }
     expected_media_count = sum(1 for prefix in MEDIA_PREFIXES if media_plan.get(prefix, {}).get("enabled", True))
     review_record = {
         "source_title": article.get("title", ""),
@@ -3193,13 +3227,15 @@ def run():
                     continue
                 success_media = result.get("success_media", [])
                 media_value = ",".join(success_media) if success_media else "ALL"
-                db_record_success(
-                    article["url_id"],
-                    article["title"],
-                    media_value,
-                    source_published_at=article.get("source_published_at"),
-                    published_at=now_kst(),
-                )
+                # DRAFT must not finalize source as published success.
+                if PUBLISH_STATUS == "PUBLISHED":
+                    db_record_success(
+                        article["url_id"],
+                        article["title"],
+                        media_value,
+                        source_published_at=article.get("source_published_at"),
+                        published_at=now_kst(),
+                    )
                 db_store_attempt_state(
                     article["url_id"],
                     article["title"],
