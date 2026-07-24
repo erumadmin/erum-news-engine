@@ -80,6 +80,11 @@ UPSTAGE_API_KEY = os.environ.get("UPSTAGE_API_KEY", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
 from erum_pipeline.staging_guards import assert_required_engine_env, resolve_r2_key, resolve_erum_env
+from erum_pipeline.publish_limits import (
+    all_enabled_sites_at_capacity,
+    apply_per_site_run_limit,
+    require_positive_int_env,
+)
 
 _engine_env = assert_required_engine_env()
 DB_HOST = _engine_env["DB_HOST"]
@@ -187,8 +192,10 @@ RETRYABLE_FAILURE_CODES = {
     "PUBLISH_API_ERROR",
 }
 
-DAILY_PUBLISH_LIMIT = 50
-PER_RUN_LIMIT = 15  # 1회 실행당 최대 발행 수
+DAILY_PUBLISH_LIMIT = require_positive_int_env("DAILY_PUBLISH_LIMIT")
+PER_RUN_LIMIT = require_positive_int_env("PER_RUN_LIMIT")
+# Max DRAFTs/publishes per media site within a single engine run (W8: 1).
+PER_SITE_PER_RUN_LIMIT = require_positive_int_env("PER_SITE_PER_RUN_LIMIT")
 RETRY_DAYS = int(os.environ.get('RETRY_DAYS', '3'))  # 0=당일만, N=N일 전까지 재시도
 REVIEW_ONLY = os.environ.get("REVIEW_ONLY", "0") == "1"
 HIDDEN_PUBLISH_TEST = os.environ.get("HIDDEN_PUBLISH_TEST", "0") == "1"
@@ -2899,7 +2906,11 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
             "mode": cb_mode,
             "reason": cb_reason,
         }
+    apply_per_site_run_limit(media_plan, upload_counts, PER_SITE_PER_RUN_LIMIT)
     expected_media_count = sum(1 for prefix in MEDIA_PREFIXES if media_plan.get(prefix, {}).get("enabled", True))
+    if expected_media_count == 0:
+        print("   ⏭️ 매체별 실행 한도 도달 — 이 원문 스킵.")
+        return None
     review_record = {
         "source_title": article.get("title", ""),
         "source_url": article.get("url", ""),
@@ -3322,6 +3333,13 @@ def run():
     hidden_publish_results: List[dict] = []
     for article in articles:
         if published >= remaining:
+            break
+        if all_enabled_sites_at_capacity(
+            upload_counts,
+            {"IJ": ENABLE_SITE_IJ, "NN": ENABLE_SITE_NN, "CB": ENABLE_SITE_CB},
+            PER_SITE_PER_RUN_LIMIT,
+        ):
+            print("🛑 매체별 실행 한도(전 매체) 도달. 종료.")
             break
         try:
             result = process_article(article, upload_counts, review_mode=REVIEW_ONLY)
