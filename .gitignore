@@ -3,5 +3,8 @@ __pycache__/
 .env
 *.json
 !prompts/
+!tests/golden/*.json
 venv/
 .venv/
+
+.venv-e1/

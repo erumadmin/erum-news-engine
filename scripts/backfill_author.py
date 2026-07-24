@@ -15,7 +15,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-API_BASE = os.environ.get("API_BASE", "https://erum-one.com")
+API_BASE = (os.environ.get("API_BASE") or os.environ.get("ERUM_API_BASE") or "").strip().rstrip("/")
+if not API_BASE:
+    raise RuntimeError("API_BASE 또는 ERUM_API_BASE 환경변수가 필요합니다 (production fallback 금지).")
 API_KEY  = os.environ.get("ERUM_API_KEY") or os.environ.get("ADMIN_API_KEY")
 if not API_KEY:
     raise RuntimeError("ERUM_API_KEY 또는 ADMIN_API_KEY 환경변수가 필요합니다.")

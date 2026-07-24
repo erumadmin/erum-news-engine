@@ -38,6 +38,16 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 import nh3
 
+def _explicit_env_only() -> bool:
+    """W8 runner mode: never load cwd .env, shell profiles, or ~/.env.erum_infra."""
+    return (os.environ.get("ERUM_EXPLICIT_ENV_ONLY") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def _load_env_file(path: str) -> None:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -53,40 +63,54 @@ def _load_env_file(path: str) -> None:
     except Exception:
         pass
 
-try:
-    from dotenv import load_dotenv
-except Exception:
-    load_dotenv = None
-else:
-    try:
-        load_dotenv()
-    except Exception:
-        pass
-    local_env_path = os.path.expanduser("~/.env.erum_infra")
-    if os.path.exists(local_env_path):
-        try:
-            load_dotenv(local_env_path, override=False)
-        except Exception:
-            _load_env_file(local_env_path)
 
-if load_dotenv is None:
-    local_env_path = os.path.expanduser("~/.env.erum_infra")
-    if os.path.exists(local_env_path):
-        _load_env_file(local_env_path)
+if not _explicit_env_only():
+    _dotenv = None
+    try:
+        from dotenv import load_dotenv as _dotenv
+    except Exception:
+        _dotenv = None
+    if _dotenv is not None:
+        try:
+            _dotenv()
+        except Exception:
+            pass
+        local_env_path = os.path.expanduser("~/.env.erum_infra")
+        if os.path.exists(local_env_path):
+            try:
+                _dotenv(local_env_path, override=False)
+            except Exception:
+                _load_env_file(local_env_path)
+    else:
+        local_env_path = os.path.expanduser("~/.env.erum_infra")
+        if os.path.exists(local_env_path):
+            _load_env_file(local_env_path)
+# else: Explicit-env-only — ENGINE_ENV_FILE already applied by scripts/w8_run_engine.py.
+# Never read cwd .env, ~/.env.erum_infra, or any supplemental file.
 
 # ========================= [1. 환경변수 로드] =========================
 
 UPSTAGE_API_KEY = os.environ.get("UPSTAGE_API_KEY", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-DB_HOST = os.environ["DB_HOST"]
+
+from erum_pipeline.staging_guards import assert_required_engine_env, resolve_r2_key, resolve_erum_env
+from erum_pipeline.publish_limits import (
+    all_enabled_sites_at_capacity,
+    apply_per_site_run_limit,
+    compute_run_remaining,
+    require_positive_int_env,
+)
+
+_engine_env = assert_required_engine_env()
+DB_HOST = _engine_env["DB_HOST"]
 DB_USER = os.environ["DB_USER"]
 DB_PASSWORD = os.environ["DB_PASSWORD"]
-DB_NAME = os.environ["DB_NAME"]
+DB_NAME = _engine_env["DB_NAME"]
+ERUM_ENV = _engine_env["ERUM_ENV"]
+ERUM_API_BASE = _engine_env["ERUM_API_BASE"]
 
-WP_CFG = {}  # WP 발행 완전 폐기 — 전 사이트 erum-one.com API 사용
+WP_CFG = {}  # WP 발행 완전 폐기 — Erum central API만 사용
 
-# 전 사이트 erum-one.com API로 발행
-ERUM_API_BASE = "https://erum-one.com"
 # 배포 환경 호환:
 # 1) ERUM_API_KEY
 # 2) ADMIN_API_KEY
@@ -95,17 +119,37 @@ ERUM_API_KEY = os.environ.get("ERUM_API_KEY") or os.environ.get("ADMIN_API_KEY")
 if not ERUM_API_KEY:
     raise RuntimeError("ERUM_API_KEY 또는 ADMIN_API_KEY 환경변수가 필요합니다.")
 ERUM_CFG = {
-    "IJ_": {"site": "IJ", "gsc_site": "sc-domain:impactjournal.kr", "sitemap": "https://impactjournal.kr/sitemap-news.xml"},
-    "NN_": {"site": "NN", "gsc_site": "sc-domain:neighbornews.kr", "sitemap": "https://neighbornews.kr/sitemap-news.xml"},
-    "CB_": {"site": "CB", "gsc_site": "sc-domain:csrbriefing.kr", "sitemap": "https://csrbriefing.kr/sitemap-news.xml"},
+    "IJ_": {
+        "site": "IJ",
+        "gsc_site": os.environ.get("IJ_GSC_SITE", "sc-domain:impactjournal.kr"),
+        "sitemap": os.environ.get("IJ_SITEMAP_URL", "https://impactjournal.kr/sitemap-news.xml"),
+    },
+    "NN_": {
+        "site": "NN",
+        "gsc_site": os.environ.get("NN_GSC_SITE", "sc-domain:neighbornews.kr"),
+        "sitemap": os.environ.get("NN_SITEMAP_URL", "https://neighbornews.kr/sitemap-news.xml"),
+    },
+    "CB_": {
+        "site": "CB",
+        "gsc_site": os.environ.get("CB_GSC_SITE", "sc-domain:csrbriefing.kr"),
+        "sitemap": os.environ.get("CB_SITEMAP_URL", "https://csrbriefing.kr/sitemap-news.xml"),
+    },
 }
+if ERUM_ENV == "staging":
+    # Staging / canary runner: never submit GSC for production properties.
+    for _cfg in ERUM_CFG.values():
+        _cfg["gsc_site"] = None
+        _cfg["sitemap"] = None
 
-# Cloudflare R2
+# Cloudflare R2 — no silent production bucket/public URL defaults
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
-R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "erum-news-images")
-R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "https://pub-dd677a54d7cf4d8cabd2c3238f4558c9.r2.dev")
+R2_BUCKET_NAME = (os.environ.get("R2_BUCKET_NAME") or "").strip()
+R2_PUBLIC_URL = (os.environ.get("R2_PUBLIC_URL") or "").strip().rstrip("/")
+if not R2_BUCKET_NAME or not R2_PUBLIC_URL:
+    # Allow missing R2 only when uploads are unused; upload_to_r2 will fail closed.
+    pass
 # [모델 설정]
 UPSTAGE_API_BASE = os.environ.get("UPSTAGE_API_BASE", "https://api.upstage.ai/v1")
 UPSTAGE_API_URL = os.environ.get("UPSTAGE_API_URL", f"{UPSTAGE_API_BASE.rstrip('/')}/chat/completions")
@@ -134,7 +178,7 @@ OPENROUTER_REWRITE_FALLBACK_MODELS = [
     for x in os.environ.get("OPENROUTER_REWRITE_FALLBACK_MODELS", "deepseek/deepseek-v3.2").split(",")
     if x.strip()
 ]
-OPENROUTER_REFERER = os.environ.get("OPENROUTER_REFERER", "https://erum-one.com")
+OPENROUTER_REFERER = os.environ.get("OPENROUTER_REFERER", ERUM_API_BASE)
 OPENROUTER_TITLE = os.environ.get("OPENROUTER_TITLE", "erum-news-engine")
 REWRITE_SOURCE_MAX_CHARS = int(os.environ.get("REWRITE_SOURCE_MAX_CHARS", "4000"))
 MIN_REWRITTEN_BODY_CHARS = int(os.environ.get("MIN_REWRITTEN_BODY_CHARS", "300"))
@@ -163,8 +207,10 @@ RETRYABLE_FAILURE_CODES = {
     "PUBLISH_API_ERROR",
 }
 
-DAILY_PUBLISH_LIMIT = 50
-PER_RUN_LIMIT = 15  # 1회 실행당 최대 발행 수
+DAILY_PUBLISH_LIMIT = require_positive_int_env("DAILY_PUBLISH_LIMIT")
+PER_RUN_LIMIT = require_positive_int_env("PER_RUN_LIMIT")
+# Max DRAFTs/publishes per media site within a single engine run (W8: 1).
+PER_SITE_PER_RUN_LIMIT = require_positive_int_env("PER_SITE_PER_RUN_LIMIT")
 RETRY_DAYS = int(os.environ.get('RETRY_DAYS', '3'))  # 0=당일만, N=N일 전까지 재시도
 REVIEW_ONLY = os.environ.get("REVIEW_ONLY", "0") == "1"
 HIDDEN_PUBLISH_TEST = os.environ.get("HIDDEN_PUBLISH_TEST", "0") == "1"
@@ -178,11 +224,18 @@ KOREA_POLICY_NEWS_ENABLED = os.environ.get("KOREA_POLICY_NEWS_ENABLED", "0") == 
 KOREA_CRAWLER_MAX_PAGES = max(1, int(os.environ.get("KOREA_CRAWLER_MAX_PAGES", "2")))
 KOREA_ATTACHMENT_PDF_ENABLED = os.environ.get("KOREA_ATTACHMENT_PDF_ENABLED", "1") != "0"
 KOREA_CRAWLER_TIMEOUT = int(os.environ.get("KOREA_CRAWLER_TIMEOUT", "20"))
-PUBLISH_STATUS = (os.environ.get("PUBLISH_STATUS", "PUBLISHED").strip() or "PUBLISHED").upper()
+_publish_status_raw = (os.environ.get("PUBLISH_STATUS") or "").strip().upper()
+if not _publish_status_raw:
+    raise RuntimeError("PUBLISH_STATUS 환경변수가 필요합니다 (PUBLISHED|DRAFT). 암묵적 PUBLISHED 기본값은 금지됩니다.")
+PUBLISH_STATUS = _publish_status_raw
 if PUBLISH_STATUS not in {"PUBLISHED", "DRAFT"}:
     raise RuntimeError("PUBLISH_STATUS는 PUBLISHED 또는 DRAFT만 허용됩니다.")
 if HIDDEN_PUBLISH_TEST:
     PUBLISH_STATUS = "DRAFT"
+ONE_SOURCE_ONE_SITE = os.environ.get("ONE_SOURCE_ONE_SITE", "1") == "1"
+ENABLE_SITE_IJ = os.environ.get("ENABLE_SITE_IJ", "1") != "0"
+ENABLE_SITE_NN = os.environ.get("ENABLE_SITE_NN", "1") != "0"
+ENABLE_SITE_CB = os.environ.get("ENABLE_SITE_CB", "1") != "0"
 if (LLM_PROVIDER == "gemini" or REWRITE_PROVIDER == "gemini" or QA_PROVIDER == "gemini") and not GEMINI_API_KEY:
     raise RuntimeError("Gemini provider 사용에는 GEMINI_API_KEY가 필요합니다.")
 if (LLM_PROVIDER == "openrouter" or REWRITE_PROVIDER == "openrouter" or QA_PROVIDER == "openrouter") and not OPENROUTER_API_KEY:
@@ -663,14 +716,25 @@ def db_get_retry_blocked_ids() -> set:
         conn.close()
 
 def db_get_today_count() -> int:
+    """Unique auto_news_drafts in KST [today 00:00, tomorrow 00:00), including later-PUBLISHED rows."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT COUNT(*) AS cnt FROM published_articles WHERE DATE(published_at) = %s AND COALESCE(media, '') <> 'FAILED'",
-                (now_kst().date(),),
-            )
-            return cur.fetchone()["cnt"]
+            from erum_pipeline.draft_lifecycle import count_unique_drafts_in_kst_day
+
+            return count_unique_drafts_in_kst_day(cur, now_kst())
+    finally:
+        conn.close()
+
+
+def db_get_auto_news_draft_url_ids() -> set:
+    """url_ids already tracked as engine drafts — exclude from future collection."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            from erum_pipeline.draft_lifecycle import list_tracked_draft_url_ids
+
+            return list_tracked_draft_url_ids(cur)
     finally:
         conn.close()
 
@@ -809,6 +873,35 @@ def db_record_success(url_id: str, title: str, media: str, source_published_at: 
     finally:
         conn.close()
 
+
+def promote_auto_news_draft(url_id: str, content_hash: str) -> dict:
+    """Approve + publish the DRAFT Article previously created for this source url_id."""
+    from erum_pipeline.draft_lifecycle import (
+        lookup_draft_by_source,
+        mark_draft_published,
+        promote_article_to_published,
+    )
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            row = lookup_draft_by_source(cur, url_id)
+            if not row:
+                raise RuntimeError(f"draft mapping not found for url_id={url_id}")
+            article_id = int(row["article_id"])
+        published = promote_article_to_published(
+            api_base=ERUM_API_BASE,
+            api_key=ERUM_API_KEY,
+            article_id=article_id,
+            content_hash=content_hash,
+        )
+        with conn.cursor() as cur:
+            mark_draft_published(cur, url_id)
+        conn.commit()
+        return published
+    finally:
+        conn.close()
+
 def db_ensure_table():
     conn = get_db_connection()
     try:
@@ -890,6 +983,8 @@ def db_ensure_table():
                 )
                 if not cur.fetchone()["cnt"]:
                     cur.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")
+            from erum_pipeline.draft_lifecycle import ensure_draft_tracking_table
+            ensure_draft_tracking_table(cur)
         conn.commit()
     finally:
         conn.close()
@@ -1751,7 +1846,7 @@ class Site:
 
 def upload_to_r2(img_bytes: bytes, filename: str, content_type: str) -> Optional[str]:
     """이미지를 WebP로 변환 후 Cloudflare R2에 업로드하고 퍼블릭 URL 반환. 실패 시 None."""
-    if not R2_ACCOUNT_ID or not R2_ACCESS_KEY_ID or not R2_SECRET_ACCESS_KEY:
+    if not R2_ACCOUNT_ID or not R2_ACCESS_KEY_ID or not R2_SECRET_ACCESS_KEY or not R2_BUCKET_NAME or not R2_PUBLIC_URL:
         print("\n      ⚠️ [R2 업로드 불가]: R2 환경변수 누락")
         return None
     variants: Dict[str, Tuple[bytes, str, str]]
@@ -1771,8 +1866,9 @@ def upload_to_r2(img_bytes: bytes, filename: str, content_type: str) -> Optional
             region_name="auto",
         )
         uploaded_urls: Dict[str, str] = {}
+        yyyymm = now_kst().strftime("%Y/%m")
         for variant_name, (variant_bytes, variant_content_type, variant_filename) in variants.items():
-            key = f"news/{now_kst().strftime('%Y/%m')}/{variant_filename}"
+            key = resolve_r2_key(variant_filename, yyyymm)
             s3.put_object(Bucket=R2_BUCKET_NAME, Key=key, Body=variant_bytes, ContentType=variant_content_type)
             uploaded_urls[variant_name] = f"{R2_PUBLIC_URL}/{key}"
         return uploaded_urls.get("master")
@@ -1782,11 +1878,15 @@ def upload_to_r2(img_bytes: bytes, filename: str, content_type: str) -> Optional
 
 
 class ErumSite:
-    """erum-one.com REST API를 통해 NN/CB 기사를 발행"""
+    """Erum central Article API를 통해 기사를 발행"""
     def __init__(self, site_code: str):
+        from erum_pipeline.vercel_bypass import merge_portal_headers
+
         self.site_code = site_code
         self.api_base = ERUM_API_BASE
-        self.headers = {"x-api-key": ERUM_API_KEY, "Content-Type": "application/json"}
+        self.headers = merge_portal_headers(
+            {"x-api-key": ERUM_API_KEY, "Content-Type": "application/json"}
+        )
 
     def get_cat_id(self, name: str) -> Optional[int]:
         if not name: return None
@@ -1802,21 +1902,34 @@ class ErumSite:
 
     def get_tag_ids(self, tags): return []
 
-    def create_post(self, title, body, cat_id, tag_ids, img_url=None, excerpt="", author=None, published_at: Optional[datetime] = None, source_published_at: Optional[datetime] = None):
+    def create_post(self, title, body, cat_id, tag_ids, img_url=None, excerpt="", author=None, published_at: Optional[datetime] = None, source_published_at: Optional[datetime] = None, author_slug=None, image_caption=None, image_credit=None, image_source=None, image_rights_basis=None, image_is_fallback=None, source_url=None, idempotency_key=None, engine_commit=None, prompt_version=None, normalized_source_id=None, status=None):
+        from erum_pipeline.publish_contract import build_article_payload
         publish_dt = to_kst(published_at) or now_kst()
-        payload = {
-            "site": self.site_code,
-            "title": title,
-            "content": body,
-            "excerpt": excerpt or "",
-            "status": PUBLISH_STATUS,
-            "categoryId": cat_id,
-            "featuredImageUrl": img_url,
-            "publishedAt": to_kst_iso(publish_dt),
-            "sourcePublishedAt": to_kst_iso(source_published_at) if source_published_at else None,
-        }
-        if payload["sourcePublishedAt"] is None:
-            payload.pop("sourcePublishedAt")
+        # Auto-news always creates DRAFT; promotion to PUBLISHED is a separate approve+publish step.
+        create_status = status or "DRAFT"
+        payload = build_article_payload(
+            site_code=self.site_code,
+            title=title,
+            body=body,
+            cat_id=cat_id,
+            status=create_status,
+            img_url=img_url,
+            excerpt=excerpt or "",
+            author=author,
+            author_slug=author_slug,
+            image_caption=image_caption,
+            image_credit=image_credit,
+            image_source=image_source,
+            image_rights_basis=image_rights_basis,
+            image_is_fallback=image_is_fallback if image_is_fallback is not None else (False if img_url else True),
+            source_url=source_url,
+            published_at=to_kst_iso(publish_dt),
+            source_published_at=to_kst_iso(source_published_at) if source_published_at else None,
+            idempotency_key=idempotency_key,
+            engine_commit=engine_commit,
+            prompt_version=prompt_version,
+            normalized_source_id=normalized_source_id,
+        )
         r = requests.post(f"{self.api_base}/api/articles",
                           json=payload, headers=self.headers, timeout=30)
         r.raise_for_status()
@@ -2793,17 +2906,37 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
     print(f"\n▶ 기사 처리 시작: {article['title'][:40]}...")
     source_published_at = article.get("source_published_at")
     published_at = now_kst()
-    media_plan: Dict[str, Dict[str, Any]] = {
-        prefix: {"enabled": True, "mode": "default", "reason": ""}
-        for prefix in MEDIA_PREFIXES
-    }
-    cb_mode, cb_reason = assess_cb_article_fit(article)
-    media_plan["CB_"] = {
-        "enabled": cb_mode != "skip",
-        "mode": cb_mode,
-        "reason": cb_reason,
-    }
+    if ONE_SOURCE_ONE_SITE:
+        from erum_pipeline.routing_vnext import build_one_site_media_plan, route_primary
+        assigned = route_primary(article)
+        media_plan = build_one_site_media_plan(
+            assigned,
+            {"IJ": ENABLE_SITE_IJ, "NN": ENABLE_SITE_NN, "CB": ENABLE_SITE_CB},
+        )
+        if assigned == "CB" and media_plan.get("CB_", {}).get("enabled"):
+            cb_mode, cb_reason = assess_cb_article_fit(article)
+            if cb_mode == "skip":
+                media_plan["CB_"] = {"enabled": False, "mode": "skip", "reason": cb_reason}
+    else:
+        media_plan: Dict[str, Dict[str, Any]] = {
+            prefix: {"enabled": True, "mode": "default", "reason": ""}
+            for prefix in MEDIA_PREFIXES
+        }
+        if not ENABLE_SITE_IJ:
+            media_plan["IJ_"] = {"enabled": False, "mode": "skip", "reason": "feature-flag-off"}
+        if not ENABLE_SITE_NN:
+            media_plan["NN_"] = {"enabled": False, "mode": "skip", "reason": "feature-flag-off"}
+        cb_mode, cb_reason = assess_cb_article_fit(article)
+        media_plan["CB_"] = {
+            "enabled": cb_mode != "skip" and ENABLE_SITE_CB,
+            "mode": cb_mode,
+            "reason": cb_reason,
+        }
+    apply_per_site_run_limit(media_plan, upload_counts, PER_SITE_PER_RUN_LIMIT)
     expected_media_count = sum(1 for prefix in MEDIA_PREFIXES if media_plan.get(prefix, {}).get("enabled", True))
+    if expected_media_count == 0:
+        print("   ⏭️ 매체별 실행 한도 도달 — 이 원문 스킵.")
+        return None
     review_record = {
         "source_title": article.get("title", ""),
         "source_url": article.get("url", ""),
@@ -2977,16 +3110,70 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
                     mid, _ = site.upload_image_bytes(img_bytes, fn, img_content_type, rw["title"], best_cap)
                     if not mid:
                         raise PipelineFailure("publish", "IMAGE_UPLOAD_FAIL", "이미지 업로드 실패", retryable=True)
-                pid = site.create_post(
-                    rw["title"],
-                    rw["body"],
-                    site.get_cat_id(rw["cat"]),
-                    site.get_tag_ids(rw["tags"]),
-                    mid,
-                    excerpt=rw.get("excerpt", ""),
-                    published_at=published_at,
-                    source_published_at=source_published_at,
-                )
+                if is_erum:
+                    from erum_pipeline.draft_lifecycle import (
+                        engine_commit_sha,
+                        normalize_source_id,
+                        record_draft_mapping,
+                        resolve_author_for_site,
+                    )
+                    site_code = ERUM_CFG.get(prefix, {}).get("site", prefix.rstrip("_"))
+                    author_name, author_slug = resolve_author_for_site(site_code, rw.get("cat"))
+                    norm_source = normalize_source_id(str(article.get("url_id") or ""))
+                    commit_sha = engine_commit_sha()
+                    prompt_ver = os.environ.get("PROMPT_VERSION", "vnext-1")
+                    image_credit = (article.get("image_credit") or article.get("credit") or best_cap or None)
+                    pid = site.create_post(
+                        rw["title"],
+                        rw["body"],
+                        site.get_cat_id(rw["cat"]),
+                        site.get_tag_ids(rw["tags"]),
+                        mid,
+                        excerpt=rw.get("excerpt", ""),
+                        published_at=published_at,
+                        source_published_at=source_published_at,
+                        author=author_name,
+                        author_slug=author_slug,
+                        image_caption=best_cap,
+                        image_credit=image_credit,
+                        image_source=article.get("image_source") or article.get("url") or article.get("link"),
+                        image_rights_basis="PROVIDER" if mid else None,
+                        image_is_fallback=False if mid else True,
+                        source_url=article.get("url") or article.get("link"),
+                        idempotency_key=f"AUTO:{norm_source}",
+                        engine_commit=commit_sha,
+                        prompt_version=prompt_ver,
+                        normalized_source_id=norm_source,
+                        status="DRAFT",
+                    )
+                    conn = get_db_connection()
+                    try:
+                        with conn.cursor() as cur:
+                            record_draft_mapping(
+                                cur,
+                                url_id=norm_source,
+                                site=site_code,
+                                article_id=int(pid),
+                                content_hash=None,
+                                engine_commit=commit_sha,
+                                prompt_version=prompt_ver,
+                            )
+                        conn.commit()
+                    finally:
+                        conn.close()
+                    article_status = "DRAFT"
+                else:
+                    pid = site.create_post(
+                        rw["title"],
+                        rw["body"],
+                        site.get_cat_id(rw["cat"]),
+                        site.get_tag_ids(rw["tags"]),
+                        mid,
+                        excerpt=rw.get("excerpt", ""),
+                        published_at=published_at,
+                        source_published_at=source_published_at,
+                    )
+                    article_status = PUBLISH_STATUS
                 upload_counts[prefix] += 1
                 published_prefixes.append(prefix)
                 published_items.append({
@@ -2994,7 +3181,7 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
                     "site": ERUM_CFG.get(prefix, {}).get("site", prefix.rstrip("_")),
                     "id": pid,
                     "title": rw["title"],
-                    "status": PUBLISH_STATUS,
+                    "status": article_status,
                     "preview_url": f"{ERUM_API_BASE}/preview/articles/{pid}",
                 })
                 variant_review["publish_id"] = pid
@@ -3131,19 +3318,27 @@ def run():
         # 테이블 자동 생성 (없을 경우)
         db_ensure_table()
 
-        # 오늘 발행 건수 확인
+        # 오늘 엔진이 생성한 고유 DRAFT 수 (created_at 기준; 이후 PUBLISHED 포함)
         today_count = db_get_today_count()
-        remaining = min(DAILY_PUBLISH_LIMIT - today_count, PER_RUN_LIMIT)
-        print(f"📊 금일 발행 현황: {today_count}/{DAILY_PUBLISH_LIMIT}건 (잔여: {remaining}건)")
+        remaining = compute_run_remaining(today_count, DAILY_PUBLISH_LIMIT, PER_RUN_LIMIT)
+        print(
+            f"📊 금일 엔진 DRAFT 생성: {today_count}/{DAILY_PUBLISH_LIMIT}건 "
+            f"(이번 실행 한도: {remaining}건, PER_RUN_LIMIT={PER_RUN_LIMIT})"
+        )
 
         if remaining <= 0:
-            print("🛑 금일 목표 달성. 종료.")
+            print("🛑 금일 DRAFT 생성 한도 달성. 종료.")
             return
 
-        # DB에서 기존 발행 URL/제목 로드
-        print("   ⏳ DB에서 기발행 데이터 로드 중...", end="", flush=True)
-        ex_ids, ex_titles = db_get_existing_ids_and_titles()
-        print(f" 완료 (URL {len(ex_ids)}건, 제목 {len(ex_titles)}개)")
+        # DB에서 기존 발행 URL/제목 + 이미 엔진이 만든 DRAFT/PUBLISHED 원문 제외
+        print("   ⏳ DB에서 기발행·기DRAFT 원문 로드 중...", end="", flush=True)
+        published_ids, ex_titles = db_get_existing_ids_and_titles()
+        draft_ids = db_get_auto_news_draft_url_ids()
+        ex_ids = published_ids | draft_ids
+        print(
+            f" 완료 (published URL {len(published_ids)}건 + tracked drafts {len(draft_ids)}건, "
+            f"제목 {len(ex_titles)}개)"
+        )
 
         blocked_ids = db_get_retry_blocked_ids()
         article_rules = db_get_active_article_rules()
@@ -3173,6 +3368,13 @@ def run():
     for article in articles:
         if published >= remaining:
             break
+        if all_enabled_sites_at_capacity(
+            upload_counts,
+            {"IJ": ENABLE_SITE_IJ, "NN": ENABLE_SITE_NN, "CB": ENABLE_SITE_CB},
+            PER_SITE_PER_RUN_LIMIT,
+        ):
+            print("🛑 매체별 실행 한도(전 매체) 도달. 종료.")
+            break
         try:
             result = process_article(article, upload_counts, review_mode=REVIEW_ONLY)
             if result:
@@ -3193,13 +3395,16 @@ def run():
                     continue
                 success_media = result.get("success_media", [])
                 media_value = ",".join(success_media) if success_media else "ALL"
-                db_record_success(
-                    article["url_id"],
-                    article["title"],
-                    media_value,
-                    source_published_at=article.get("source_published_at"),
-                    published_at=now_kst(),
-                )
+                # Only finalize source as published when every created article is PUBLISHED.
+                item_statuses = [item.get("status") for item in result.get("published_items", [])]
+                if item_statuses and all(status == "PUBLISHED" for status in item_statuses):
+                    db_record_success(
+                        article["url_id"],
+                        article["title"],
+                        media_value,
+                        source_published_at=article.get("source_published_at"),
+                        published_at=now_kst(),
+                    )
                 db_store_attempt_state(
                     article["url_id"],
                     article["title"],

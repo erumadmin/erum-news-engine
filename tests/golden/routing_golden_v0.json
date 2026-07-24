@@ -1,0 +1,34 @@
+{
+  "fixture_version": "fixtures-v0.1",
+  "description": "Golden routing expectations for merge-blocking tests (no live LLM).",
+  "cases": [
+    {
+      "id": "policy-statute-ij",
+      "title": "고용보험법 일부개정법률안 국회 통과",
+      "expected_site": "IJ",
+      "expected_action": "ROUTE",
+      "notes": "Pure statute/policy structure → IJ"
+    },
+    {
+      "id": "household-benefit-nn",
+      "title": "에너지 바우처 지원 대상 확대…가구 부담 완화",
+      "expected_site": "NN",
+      "expected_action": "ROUTE",
+      "notes": "Citizen/household impact → NN"
+    },
+    {
+      "id": "esg-disclosure-cb",
+      "title": "상장사 지속가능경영보고서 공시 의무 강화",
+      "expected_site": "CB",
+      "expected_action": "ROUTE",
+      "notes": "Disclosure/ESG business impact → CB"
+    },
+    {
+      "id": "gossip-drop",
+      "title": "연예인 A씨 열애설",
+      "expected_site": null,
+      "expected_action": "DROP",
+      "notes": "Unfit for all desks"
+    }
+  ]
+}
