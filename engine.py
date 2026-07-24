@@ -38,6 +38,16 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 import nh3
 
+def _explicit_env_only() -> bool:
+    """W8 runner mode: never load cwd .env, shell profiles, or ~/.env.erum_infra."""
+    return (os.environ.get("ERUM_EXPLICIT_ENV_ONLY") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def _load_env_file(path: str) -> None:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -53,26 +63,30 @@ def _load_env_file(path: str) -> None:
     except Exception:
         pass
 
-try:
-    from dotenv import load_dotenv
-except Exception:
-    load_dotenv = None
-else:
-    try:
-        load_dotenv()
-    except Exception:
-        pass
-    local_env_path = os.path.expanduser("~/.env.erum_infra")
-    if os.path.exists(local_env_path):
-        try:
-            load_dotenv(local_env_path, override=False)
-        except Exception:
-            _load_env_file(local_env_path)
 
-if load_dotenv is None:
-    local_env_path = os.path.expanduser("~/.env.erum_infra")
-    if os.path.exists(local_env_path):
-        _load_env_file(local_env_path)
+if not _explicit_env_only():
+    _dotenv = None
+    try:
+        from dotenv import load_dotenv as _dotenv
+    except Exception:
+        _dotenv = None
+    if _dotenv is not None:
+        try:
+            _dotenv()
+        except Exception:
+            pass
+        local_env_path = os.path.expanduser("~/.env.erum_infra")
+        if os.path.exists(local_env_path):
+            try:
+                _dotenv(local_env_path, override=False)
+            except Exception:
+                _load_env_file(local_env_path)
+    else:
+        local_env_path = os.path.expanduser("~/.env.erum_infra")
+        if os.path.exists(local_env_path):
+            _load_env_file(local_env_path)
+# else: Explicit-env-only — ENGINE_ENV_FILE already applied by scripts/w8_run_engine.py.
+# Never read cwd .env, ~/.env.erum_infra, or any supplemental file.
 
 # ========================= [1. 환경변수 로드] =========================
 
@@ -702,13 +716,13 @@ def db_get_retry_blocked_ids() -> set:
         conn.close()
 
 def db_get_today_count() -> int:
-    """Unique auto_news_drafts created today (KST date), including later-PUBLISHED rows."""
+    """Unique auto_news_drafts in KST [today 00:00, tomorrow 00:00), including later-PUBLISHED rows."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            from erum_pipeline.draft_lifecycle import count_unique_drafts_created_on_date
+            from erum_pipeline.draft_lifecycle import count_unique_drafts_in_kst_day
 
-            return count_unique_drafts_created_on_date(cur, now_kst().date())
+            return count_unique_drafts_in_kst_day(cur, now_kst())
     finally:
         conn.close()
 

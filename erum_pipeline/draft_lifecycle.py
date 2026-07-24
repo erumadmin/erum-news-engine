@@ -100,19 +100,25 @@ def ensure_draft_tracking_table(cursor) -> None:
         pass
 
 
-def count_unique_drafts_created_on_date(cursor, day) -> int:
+def count_unique_drafts_in_kst_day(cursor, now=None) -> int:
     """
-    Count unique source url_ids whose auto_news_drafts.created_at falls on ``day`` (KST date).
-    Includes rows later promoted to PUBLISHED — daily engine creation volume, not live PUBLISHED count.
+    Count unique url_ids with created_at in KST half-open window [today 00:00, tomorrow 00:00).
+
+    Uses naive KST wall-clock bounds against DATETIME columns that store KST-naive timestamps.
+    Does not use DATE(created_at) or the DB session timezone.
+    Includes rows later promoted to PUBLISHED.
     """
+    from erum_pipeline.kst_time import kst_naive_day_window
+
     ensure_draft_tracking_table(cursor)
+    start, end = kst_naive_day_window(now)
     cursor.execute(
         """
         SELECT COUNT(DISTINCT url_id) AS cnt
         FROM auto_news_drafts
-        WHERE DATE(created_at) = %s
+        WHERE created_at >= %s AND created_at < %s
         """,
-        (day,),
+        (start, end),
     )
     row = cursor.fetchone()
     if row is None:
@@ -120,6 +126,18 @@ def count_unique_drafts_created_on_date(cursor, day) -> int:
     if isinstance(row, dict):
         return int(row.get("cnt") or 0)
     return int(row[0] or 0)
+
+
+def count_unique_drafts_created_on_date(cursor, day) -> int:
+    """
+    Count unique url_ids for a KST calendar ``day`` via the same half-open window policy.
+    """
+    from datetime import datetime, time
+
+    from erum_pipeline.kst_time import KST
+
+    noon = datetime.combine(day, time(12, 0), tzinfo=KST)
+    return count_unique_drafts_in_kst_day(cursor, noon)
 
 
 def list_tracked_draft_url_ids(cursor) -> set[str]:
@@ -147,13 +165,21 @@ def record_draft_mapping(
     content_hash: Optional[str] = None,
     engine_commit: Optional[str] = None,
     prompt_version: Optional[str] = None,
+    created_at=None,
 ) -> None:
+    """
+    Insert draft mapping with explicit KST-naive ``created_at`` (same policy as daily limits).
+    ON DUPLICATE KEY UPDATE must not rewrite ``created_at``.
+    """
+    from erum_pipeline.kst_time import now_kst_naive
+
     ensure_draft_tracking_table(cursor)
+    ts = created_at if created_at is not None else now_kst_naive()
     cursor.execute(
         """
         INSERT INTO auto_news_drafts
-          (url_id, site, article_id, content_hash, status, engine_commit, prompt_version)
-        VALUES (%s, %s, %s, %s, 'DRAFT', %s, %s)
+          (url_id, site, article_id, content_hash, status, engine_commit, prompt_version, created_at)
+        VALUES (%s, %s, %s, %s, 'DRAFT', %s, %s, %s)
         ON DUPLICATE KEY UPDATE
           site=VALUES(site),
           article_id=VALUES(article_id),
@@ -162,7 +188,7 @@ def record_draft_mapping(
           engine_commit=VALUES(engine_commit),
           prompt_version=VALUES(prompt_version)
         """,
-        (url_id, site, article_id, content_hash, engine_commit, prompt_version),
+        (url_id, site, article_id, content_hash, engine_commit, prompt_version, ts),
     )
 
 

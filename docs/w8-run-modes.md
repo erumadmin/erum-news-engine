@@ -4,11 +4,20 @@
 
 ## Daily limit semantics (blocking fix)
 
-`DAILY_PUBLISH_LIMIT` counts **unique `auto_news_drafts.url_id` created today** (`DATE(created_at)` in KST day), including rows later marked `PUBLISHED`. It does **not** count live Portal PUBLISHED volume.
+`DAILY_PUBLISH_LIMIT` counts **unique `auto_news_drafts.url_id`** whose `created_at` falls in the KST half-open window **`[today 00:00, tomorrow 00:00)`**. Query uses `created_at >= start AND created_at < end` — **not** `DATE(created_at)` and **not** the DB session timezone. Rows later marked `PUBLISHED` still count.
+
+`record_draft_mapping` writes an explicit **KST-naive** `created_at` (same policy). `ON DUPLICATE KEY UPDATE` does **not** rewrite `created_at`.
 
 Any `url_id` present in `auto_news_drafts` (DRAFT or PUBLISHED) is excluded from the next collection set to prevent reprocessing / duplicate R2 uploads.
 
-`scripts/w8-cron-runner.sh` holds `flock` for the entire SHA check → env load → `engine.py` (which reads today-count then creates drafts).
+`scripts/w8-cron-runner.sh` holds `flock` for the entire SHA check → Python env load → `engine.py` (today-count then creates drafts). **No shell `source` of `.env.w8`.**
+
+## Env loading (ops stability)
+
+1. Bash runner only checks `APPROVED_ENGINE_SHA` + flock, then runs `python3 scripts/w8_run_engine.py`.
+2. Python parses `ENGINE_ENV_FILE` (mode 600, owner check, exact 3/9/1 + production hosts), builds an env mapping, sets `ERUM_EXPLICIT_ENV_ONLY=1`, and runs `engine.py` via `subprocess` **without shell**.
+3. With `ERUM_EXPLICIT_ENV_ONLY=1`, `engine.py` **never** reads cwd `.env`, `~/.env.erum_infra`, or other supplemental files. Missing keys are **not** filled from elsewhere — fail-closed.
+4. Staging/preview/empty production values in `.env.w8` → abort. Secret values are never logged.
 
 ## A. Dry-run / review (no writes)
 
@@ -39,7 +48,7 @@ export ENGINE_ENV_FILE=/root/erum-news-engine-w8/.env.w8
 ./scripts/w8-cron-runner.sh
 ```
 
-Exact keys required in `.env.w8` (any other value → abort):
+Exact keys required in `.env.w8` (see `configs/w8.env.example` / `erum_pipeline/w8_runner_env.py`):
 
 ```
 PUBLISH_STATUS=DRAFT
@@ -49,8 +58,12 @@ PER_RUN_LIMIT=3
 DAILY_PUBLISH_LIMIT=9
 PER_SITE_PER_RUN_LIMIT=1
 ONE_SOURCE_ONE_SITE=1
+ERUM_ENV=production
+ERUM_API_BASE=https://erum-one.com
 REVALIDATE_FAILURE_WEBHOOK_CONFIGURED=1
 ```
+
+Plus non-empty: `ERUM_API_KEY` or `ADMIN_API_KEY`, `DB_HOST`/`DB_PORT`/`DB_USER`/`DB_PASSWORD`/`DB_NAME`, R2 set, and LLM key for the chosen provider.
 
 | System | Change |
 |--------|--------|
