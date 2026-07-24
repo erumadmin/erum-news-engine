@@ -1847,9 +1847,13 @@ def upload_to_r2(img_bytes: bytes, filename: str, content_type: str) -> Optional
 class ErumSite:
     """Erum central Article API를 통해 기사를 발행"""
     def __init__(self, site_code: str):
+        from erum_pipeline.vercel_bypass import merge_portal_headers
+
         self.site_code = site_code
         self.api_base = ERUM_API_BASE
-        self.headers = {"x-api-key": ERUM_API_KEY, "Content-Type": "application/json"}
+        self.headers = merge_portal_headers(
+            {"x-api-key": ERUM_API_KEY, "Content-Type": "application/json"}
+        )
 
     def get_cat_id(self, name: str) -> Optional[int]:
         if not name: return None

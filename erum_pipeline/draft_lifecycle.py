@@ -130,7 +130,9 @@ def promote_article_to_published(
     timeout: int = 30,
 ) -> dict[str, Any]:
     """Approve then publish the same Article ID."""
-    headers = {"x-api-key": api_key, "Content-Type": "application/json"}
+    from erum_pipeline.vercel_bypass import merge_portal_headers
+
+    headers = merge_portal_headers({"x-api-key": api_key, "Content-Type": "application/json"})
     approve = requests.post(
         f"{api_base}/api/articles/{article_id}/approve",
         json={"contentHash": content_hash},
