@@ -2,12 +2,12 @@
 # W8 / production Engine cron runner (Vultr).
 #
 # - NEVER git pull
-# - Run only from a fixed checkout whose HEAD matches APPROVED_ENGINE_SHA
-# - flock against duplicate runs
-# - Fail closed on missing env / wrong SHA
+# - NEVER rely on shell profile or implicit cwd .env
+# - Load ONLY ENGINE_ENV_FILE (mode 600, owner=runner uid, exact W8 values)
+# - flock wraps SHA check + env load + today-count + engine.py
+# - Fail closed on missing/bad env file or wrong SHA
 #
-# This script does NOT install or modify crontab. Ops installs one crontab line
-# that calls this script after backup + approval.
+# This script does NOT install or modify crontab.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -16,6 +16,7 @@ cd "$ROOT"
 LOCK_FILE="${ENGINE_CRON_LOCK_FILE:-/var/lock/erum-news-engine.w8.lock}"
 LOG_FILE="${ENGINE_CRON_LOG_FILE:-$ROOT/cron.w8.log}"
 APPROVED_SHA="${APPROVED_ENGINE_SHA:-}"
+ENGINE_ENV_FILE="${ENGINE_ENV_FILE:-}"
 
 ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
@@ -29,6 +30,8 @@ die() {
 }
 
 # --- flock (non-blocking): exit 0 if another run holds the lock ---
+# Holds through env validation, daily DRAFT count (inside engine.py), and execution.
+mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || true
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
   log "SKIP: another engine run holds $LOCK_FILE"
@@ -37,44 +40,47 @@ fi
 
 log "START root=$ROOT"
 
-# --- SHA pin ---
 [[ -n "$APPROVED_SHA" ]] || die "APPROVED_ENGINE_SHA is required"
+[[ -n "$ENGINE_ENV_FILE" ]] || die "ENGINE_ENV_FILE is required (explicit path; no implicit .env)"
+
 HEAD="$(git rev-parse HEAD)"
-# Accept full SHA equality or approved short SHA as unique prefix of HEAD.
 if [[ "$HEAD" != "$APPROVED_SHA" && "$HEAD" != "$APPROVED_SHA"* ]]; then
   die "HEAD $HEAD != APPROVED_ENGINE_SHA $APPROVED_SHA (refusing to run; no git pull)"
 fi
 log "SHA_OK head=$HEAD approved=$APPROVED_SHA"
 
-# --- Required env (fail closed) ---
-require_env() {
-  local k="$1"
-  [[ -n "${!k:-}" ]] || die "missing required env: $k"
-}
+# Load + validate ENGINE_ENV_FILE (mode 600, owner, exact 3/9/1 contract).
+# Prints KEY=VALUE lines for eval; never reads ~/.profile or cwd .env.
+EVAL_FILE="$(mktemp)"
+cleanup() { rm -f "$EVAL_FILE"; }
+trap cleanup EXIT
 
-require_env PUBLISH_STATUS
-require_env PER_RUN_LIMIT
-require_env DAILY_PUBLISH_LIMIT
-require_env PER_SITE_PER_RUN_LIMIT
-require_env ERUM_API_BASE
-require_env ONE_SOURCE_ONE_SITE
+python3 - "$ENGINE_ENV_FILE" "$EVAL_FILE" <<'PY' || die "ENGINE_ENV_FILE validation failed (fail-closed)"
+import sys
+from pathlib import Path
+from erum_pipeline.w8_runner_env import load_w8_env_file
 
-[[ "${PUBLISH_STATUS}" == "DRAFT" ]] || die "PUBLISH_STATUS must be DRAFT for W8 cron (got ${PUBLISH_STATUS})"
-[[ "${ONE_SOURCE_ONE_SITE}" == "1" ]] || die "ONE_SOURCE_ONE_SITE must be 1 (customer 3-media fanout forbidden)"
-[[ "${REVIEW_ONLY:-0}" == "0" ]] || die "REVIEW_ONLY must be 0 for operational DRAFT cron (use separate dry-run)"
-[[ "${HIDDEN_PUBLISH_TEST:-0}" == "0" ]] || die "HIDDEN_PUBLISH_TEST must be 0 for operational DRAFT cron"
+env_path, out_path = sys.argv[1], sys.argv[2]
+loaded = load_w8_env_file(env_path)
+# Webhook gate must be explicit in the same file (or already exact-checked above).
+if (loaded.get("REVALIDATE_FAILURE_WEBHOOK_CONFIGURED") or "").strip() != "1":
+    raise SystemExit("REVALIDATE_FAILURE_WEBHOOK_CONFIGURED must be 1 in ENGINE_ENV_FILE → BLOCKED")
+lines = [f"{k}={v}" for k, v in loaded.items()]
+Path(out_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+print(f"loaded {len(loaded)} keys from {env_path}", flush=True)
+PY
 
-# Portal-side gate mirrored as ops flag: cron must not start without webhook configured.
-[[ "${REVALIDATE_FAILURE_WEBHOOK_CONFIGURED:-}" == "1" ]] \
-  || die "REVALIDATE_FAILURE_WEBHOOK_CONFIGURED!=1 (set Portal REVALIDATE_FAILURE_WEBHOOK_URL first) → BLOCKED"
+set -a
+# shellcheck disable=SC1090
+source "$EVAL_FILE"
+set +a
 
-# Staging/prod API guard (Python also enforces)
+log "ENV_FILE_OK path=$ENGINE_ENV_FILE PUBLISH_STATUS=$PUBLISH_STATUS PER_RUN_LIMIT=$PER_RUN_LIMIT DAILY_PUBLISH_LIMIT=$DAILY_PUBLISH_LIMIT PER_SITE_PER_RUN_LIMIT=$PER_SITE_PER_RUN_LIMIT"
+
 python3 - <<'PY'
 from erum_pipeline.staging_guards import assert_required_engine_env
 print(assert_required_engine_env())
 PY
-
-log "ENV_OK PUBLISH_STATUS=$PUBLISH_STATUS PER_RUN_LIMIT=$PER_RUN_LIMIT DAILY_PUBLISH_LIMIT=$DAILY_PUBLISH_LIMIT PER_SITE_PER_RUN_LIMIT=$PER_SITE_PER_RUN_LIMIT"
 
 set +e
 python3 engine.py >>"$LOG_FILE" 2>&1

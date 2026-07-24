@@ -83,6 +83,7 @@ from erum_pipeline.staging_guards import assert_required_engine_env, resolve_r2_
 from erum_pipeline.publish_limits import (
     all_enabled_sites_at_capacity,
     apply_per_site_run_limit,
+    compute_run_remaining,
     require_positive_int_env,
 )
 
@@ -701,14 +702,25 @@ def db_get_retry_blocked_ids() -> set:
         conn.close()
 
 def db_get_today_count() -> int:
+    """Unique auto_news_drafts created today (KST date), including later-PUBLISHED rows."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT COUNT(*) AS cnt FROM published_articles WHERE DATE(published_at) = %s AND COALESCE(media, '') <> 'FAILED'",
-                (now_kst().date(),),
-            )
-            return cur.fetchone()["cnt"]
+            from erum_pipeline.draft_lifecycle import count_unique_drafts_created_on_date
+
+            return count_unique_drafts_created_on_date(cur, now_kst().date())
+    finally:
+        conn.close()
+
+
+def db_get_auto_news_draft_url_ids() -> set:
+    """url_ids already tracked as engine drafts — exclude from future collection."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            from erum_pipeline.draft_lifecycle import list_tracked_draft_url_ids
+
+            return list_tracked_draft_url_ids(cur)
     finally:
         conn.close()
 
@@ -3292,19 +3304,27 @@ def run():
         # 테이블 자동 생성 (없을 경우)
         db_ensure_table()
 
-        # 오늘 발행 건수 확인
+        # 오늘 엔진이 생성한 고유 DRAFT 수 (created_at 기준; 이후 PUBLISHED 포함)
         today_count = db_get_today_count()
-        remaining = min(DAILY_PUBLISH_LIMIT - today_count, PER_RUN_LIMIT)
-        print(f"📊 금일 발행 현황: {today_count}/{DAILY_PUBLISH_LIMIT}건 (잔여: {remaining}건)")
+        remaining = compute_run_remaining(today_count, DAILY_PUBLISH_LIMIT, PER_RUN_LIMIT)
+        print(
+            f"📊 금일 엔진 DRAFT 생성: {today_count}/{DAILY_PUBLISH_LIMIT}건 "
+            f"(이번 실행 한도: {remaining}건, PER_RUN_LIMIT={PER_RUN_LIMIT})"
+        )
 
         if remaining <= 0:
-            print("🛑 금일 목표 달성. 종료.")
+            print("🛑 금일 DRAFT 생성 한도 달성. 종료.")
             return
 
-        # DB에서 기존 발행 URL/제목 로드
-        print("   ⏳ DB에서 기발행 데이터 로드 중...", end="", flush=True)
-        ex_ids, ex_titles = db_get_existing_ids_and_titles()
-        print(f" 완료 (URL {len(ex_ids)}건, 제목 {len(ex_titles)}개)")
+        # DB에서 기존 발행 URL/제목 + 이미 엔진이 만든 DRAFT/PUBLISHED 원문 제외
+        print("   ⏳ DB에서 기발행·기DRAFT 원문 로드 중...", end="", flush=True)
+        published_ids, ex_titles = db_get_existing_ids_and_titles()
+        draft_ids = db_get_auto_news_draft_url_ids()
+        ex_ids = published_ids | draft_ids
+        print(
+            f" 완료 (published URL {len(published_ids)}건 + tracked drafts {len(draft_ids)}건, "
+            f"제목 {len(ex_titles)}개)"
+        )
 
         blocked_ids = db_get_retry_blocked_ids()
         article_rules = db_get_active_article_rules()

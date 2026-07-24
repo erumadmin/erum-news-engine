@@ -3,6 +3,7 @@ import pytest
 from erum_pipeline.publish_limits import (
     all_enabled_sites_at_capacity,
     apply_per_site_run_limit,
+    compute_run_remaining,
     require_positive_int_env,
 )
 
@@ -54,3 +55,9 @@ def test_all_enabled_sites_at_capacity():
         )
         is False
     )
+
+
+def test_compute_run_remaining():
+    assert compute_run_remaining(9, 9, 3) == 0
+    assert compute_run_remaining(8, 9, 3) == 1
+    assert compute_run_remaining(0, 9, 3) == 3

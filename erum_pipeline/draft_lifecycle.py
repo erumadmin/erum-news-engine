@@ -75,10 +75,67 @@ def ensure_draft_tracking_table(cursor) -> None:
           created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
           updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
           UNIQUE KEY uq_auto_news_drafts_url (url_id),
-          KEY idx_auto_news_drafts_article (article_id)
+          KEY idx_auto_news_drafts_article (article_id),
+          KEY idx_auto_news_drafts_created (created_at)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """
     )
+    # Existing installs created without created_at index — add if missing.
+    try:
+        cursor.execute(
+            """
+            SELECT 1 FROM information_schema.statistics
+            WHERE table_schema = DATABASE()
+              AND table_name = 'auto_news_drafts'
+              AND index_name = 'idx_auto_news_drafts_created'
+            LIMIT 1
+            """
+        )
+        if cursor.fetchone() is None:
+            cursor.execute(
+                "ALTER TABLE auto_news_drafts ADD KEY idx_auto_news_drafts_created (created_at)"
+            )
+    except Exception:
+        # Best-effort; COUNT still works without the index.
+        pass
+
+
+def count_unique_drafts_created_on_date(cursor, day) -> int:
+    """
+    Count unique source url_ids whose auto_news_drafts.created_at falls on ``day`` (KST date).
+    Includes rows later promoted to PUBLISHED — daily engine creation volume, not live PUBLISHED count.
+    """
+    ensure_draft_tracking_table(cursor)
+    cursor.execute(
+        """
+        SELECT COUNT(DISTINCT url_id) AS cnt
+        FROM auto_news_drafts
+        WHERE DATE(created_at) = %s
+        """,
+        (day,),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return 0
+    if isinstance(row, dict):
+        return int(row.get("cnt") or 0)
+    return int(row[0] or 0)
+
+
+def list_tracked_draft_url_ids(cursor) -> set[str]:
+    """All url_ids ever recorded in auto_news_drafts (DRAFT or PUBLISHED)."""
+    ensure_draft_tracking_table(cursor)
+    cursor.execute("SELECT url_id FROM auto_news_drafts")
+    rows = cursor.fetchall() or []
+    out: set[str] = set()
+    for row in rows:
+        if isinstance(row, dict):
+            uid = row.get("url_id")
+        else:
+            uid = row[0]
+        if uid:
+            out.add(str(uid))
+    return out
 
 
 def record_draft_mapping(

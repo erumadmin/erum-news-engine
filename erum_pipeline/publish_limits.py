@@ -57,3 +57,11 @@ def all_enabled_sites_at_capacity(
     if not enabled_prefixes:
         return True
     return all(int(upload_counts.get(prefix, 0)) >= per_site_limit for prefix in enabled_prefixes)
+
+
+def compute_run_remaining(today_draft_count: int, daily_limit: int, per_run_limit: int) -> int:
+    """How many new drafts this run may create given daily + per-run caps."""
+    left = int(daily_limit) - int(today_draft_count)
+    if left <= 0:
+        return 0
+    return min(int(per_run_limit), left)
