@@ -4,7 +4,9 @@ __pycache__/
 *.json
 !prompts/
 !tests/fixtures/**/*.json
+!tests/golden/*.json
 venv/
 .venv/
 .venv
+.venv-e1/
 review_outputs/

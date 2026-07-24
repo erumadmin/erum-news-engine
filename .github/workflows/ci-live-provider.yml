@@ -1,0 +1,36 @@
+name: Live provider tests (non-blocking)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 15 * * 1' # weekly Monday 15:00 UTC
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install deps
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run live-provider tests if present
+        env:
+          UPSTAGE_API_KEY: ${{ secrets.UPSTAGE_API_KEY }}
+          REVIEW_ONLY: '1'
+          PUBLISH_STATUS: DRAFT
+        run: |
+          if [ -d tests/live ]; then
+            python -m pytest tests/live -q
+          else
+            echo "No tests/live yet — placeholder job OK"
+          fi
