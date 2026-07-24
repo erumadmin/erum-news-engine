@@ -8,43 +8,13 @@ from typing import Any, Optional
 import requests
 
 
-AUTHOR_SLUG_BY_SITE_CAT = {
-    "IJ": {
-        "politics": ("오지현", "oh-jihyun"),
-        "economy": ("이성민", "lee-sungmin"),
-        "society": ("윤성민", "yun-sungmin"),
-        "it-science": ("장예린", "jang-yerin"),
-        "culture-life": ("한재원", "han-jaewon"),
-        "international": ("서민준", "seo-minjun"),
-        "environment": ("나혜진", "na-hyejin"),
-    },
-    "NN": {
-        "politics": ("최지훈", "choi-jihun"),
-        "economy": ("윤재원", "yun-jaewon"),
-        "society": ("박서연", "park-seoyeon"),
-        "it-science": ("임태양", "im-taeyang"),
-        "culture-life": ("강미래", "kang-mirae"),
-        "international": ("송현아", "song-hyuna"),
-        "environment": ("김도현", "kim-dohyun"),
-    },
-    "CB": {
-        "politics": ("김민서", "kim-minseo"),
-        "economy": ("이준혁", "lee-junhyuk"),
-        "society": ("박지은", "park-jieun"),
-        "it-science": ("최현우", "choi-hyunwoo"),
-        "culture-life": ("정수빈", "jeong-subin"),
-        "international": ("한다영", "han-dayoung"),
-        "environment": ("오태준", "oh-taejun"),
-    },
-}
-
-
-def resolve_author_for_site(site: str, category_slug: str | None) -> tuple[Optional[str], Optional[str]]:
-    table = AUTHOR_SLUG_BY_SITE_CAT.get(site, {})
-    if category_slug and category_slug in table:
-        return table[category_slug]
-    return None, None
-
+# Re-export canonical roster (single module: erum_pipeline.reporter_roster).
+from erum_pipeline.reporter_roster import (  # noqa: E402
+    AUTHOR_SLUG_BY_SITE_CAT,
+    DESK_BY_SITE,
+    resolve_author,
+    resolve_author_for_site,
+)
 
 def engine_commit_sha() -> str:
     env = os.environ.get("ENGINE_COMMIT") or os.environ.get("GIT_COMMIT")

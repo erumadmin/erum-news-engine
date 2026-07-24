@@ -1101,6 +1101,12 @@ def validate_content_quality(title, body):
             return False, f"라벨 잔재 발견({label})"
     if re.search(r'<p>\s*(배경|과제|전망|솔루션|문제|해결책|임팩트|해석)\s*</p>', body, flags=re.IGNORECASE):
         return False, "라벨 잔재 발견(단독 소제목)"
+    # Review/meta bracket labels must never reach reader body (hard fail; not naive strip).
+    from erum_pipeline.body_quality import evaluate_reader_body
+
+    gate = evaluate_reader_body(title=title or "", excerpt="", body=body or "")
+    if not gate["publish_ready"]:
+        return False, f"본문 품질 하드게이트({';'.join(gate['hard_fails'][:3])})"
 
     # 포맷 오염
     if "**" in body or "##" in body:
@@ -3076,6 +3082,31 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
             rw = {"title": p['title'], "excerpt": p.get('excerpt', ''), "body": p['body'], "cat": cat, "tags": tags}
             rewritten[prefix] = rw
 
+            # Hard reader-body gate (meta labels / repetition / media codes). Soft score cannot override.
+            from erum_pipeline.body_quality import append_sources_footer_html, evaluate_reader_body
+
+            source_plain = " ".join(
+                [
+                    article.get("title", ""),
+                    strip_html_tags(article.get("body", "")),
+                    article.get("list_text", ""),
+                ]
+            )
+            body_gate = evaluate_reader_body(
+                title=rw["title"],
+                excerpt=rw.get("excerpt", ""),
+                body=rw["body"],
+                source_text=source_plain,
+                soft_score=float(score) if score is not None else None,
+            )
+            if not body_gate["publish_ready"]:
+                raise PipelineFailure(
+                    "qa",
+                    "READER_BODY_HARD_FAIL",
+                    f"publish_ready=false ({';'.join(body_gate['hard_fails'][:4])})",
+                    retryable=False,
+                )
+
             variant_review = {
                 "prefix": prefix,
                 "status": "SUCCESS",
@@ -3088,6 +3119,7 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
                 "body": rw["body"],
                 "cat": rw["cat"],
                 "tags": rw["tags"],
+                "publish_ready": True,
             }
 
             if review_mode:
@@ -3115,17 +3147,29 @@ def process_article(article: dict, upload_counts: dict, review_mode: bool = REVI
                         engine_commit_sha,
                         normalize_source_id,
                         record_draft_mapping,
-                        resolve_author_for_site,
                     )
+                    from erum_pipeline.reporter_roster import resolve_author
+
                     site_code = ERUM_CFG.get(prefix, {}).get("site", prefix.rstrip("_"))
-                    author_name, author_slug = resolve_author_for_site(site_code, rw.get("cat"))
+                    author = resolve_author(site_code, rw.get("cat"), allow_desk_fallback=True)
+                    if author.is_person:
+                        author_name, author_slug = author.name, author.slug
+                    else:
+                        # Fail-closed Organization desk only when category mapping is impossible.
+                        author_name, author_slug = author.name, None
+                        print(f" ⚠️ [{prefix}] author map miss → desk fallback ({author_name})", flush=True)
+                    publish_body = append_sources_footer_html(
+                        rw["body"],
+                        article.get("url") or article.get("link"),
+                        section_class=f"{site_code.lower()}-sources-footer",
+                    )
                     norm_source = normalize_source_id(str(article.get("url_id") or ""))
                     commit_sha = engine_commit_sha()
-                    prompt_ver = os.environ.get("PROMPT_VERSION", "vnext-1")
+                    prompt_ver = os.environ.get("PROMPT_VERSION", "vnext-byline-1")
                     image_credit = (article.get("image_credit") or article.get("credit") or best_cap or None)
                     pid = site.create_post(
                         rw["title"],
-                        rw["body"],
+                        publish_body,
                         site.get_cat_id(rw["cat"]),
                         site.get_tag_ids(rw["tags"]),
                         mid,

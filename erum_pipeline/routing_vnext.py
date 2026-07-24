@@ -31,15 +31,31 @@ def route_primary(article: dict) -> Optional[str]:
         return None
     winners = [k for k, v in scores.items() if v == best]
     if len(winners) == 1:
-        return winners[0]
-    # tie-break: statute/policy -> IJ; enterprise/ESG -> CB; household -> NN
-    if any(c in text for c in ["법률", "개정", "시행령", "제도"]):
-        return "IJ"
-    if any(c in text for c in ["ESG", "공시", "공급망", "상장"]):
-        return "CB"
-    if any(c in text for c in ["가구", "시민", "이용자", "바우처"]):
-        return "NN"
-    return "IJ"
+        candidate = winners[0]
+    elif any(c in text for c in ["법률", "개정", "시행령", "제도"]):
+        candidate = "IJ"
+    elif any(c in text for c in ["ESG", "공시", "공급망", "상장"]):
+        candidate = "CB"
+    elif any(c in text for c in ["가구", "시민", "이용자", "바우처"]):
+        candidate = "NN"
+    else:
+        candidate = "IJ"
+
+    # Hard media-fit gate (selective port from desk_fit).
+    from erum_pipeline.desk_fit import media_fit_gate
+
+    ok, reason = media_fit_gate(candidate, {"title": title, "body": body})
+    if not ok:
+        # Try next-best site that passes fit; else DROP.
+        ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+        for site, sc in ranked:
+            if sc <= 0 or site == candidate:
+                continue
+            ok2, _ = media_fit_gate(site, {"title": title, "body": body})
+            if ok2:
+                return site
+        return None
+    return candidate
 
 
 def build_one_site_media_plan(assigned_site: Optional[str], enable_flags: dict | None = None) -> dict:
